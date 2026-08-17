@@ -13,3 +13,10 @@ wheels/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+
+# Dashboard front end. The build output under
+# src/polymarket/dashboard/static/ IS committed -- installing the package must
+# not require a Node toolchain -- but nothing that produces it is.
+frontend/node_modules/
+frontend/.vite/
+*.tsbuildinfo

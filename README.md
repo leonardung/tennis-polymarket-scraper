@@ -75,6 +75,20 @@ minutes has finished, not stalled, so it moves to **Past**. A scheduled match
 stays in **Upcoming** past its start time — tennis start times are "not before"
 times — but not indefinitely.
 
+The charts are [TradingView Lightweight Charts](https://www.tradingview.com/lightweight-charts/),
+so they pan and zoom; the crosshair reads every series at once, with the score at
+that moment underneath.
+
+One thing worth knowing about them: Lightweight Charts spaces points by **index**,
+not by time. That is right for daily bars and wrong for this data, which is
+sampled every 10 seconds while a match is being played and every 5 minutes while
+it is not — fed the rows as stored, nine quiet hours take as much width as ten
+live minutes. The dashboard therefore resamples onto an evenly spaced time grid
+before charting, carrying the last reading forward. That is not smoothing: the
+capture only writes when the book moves, so a slot with no row means the previous
+book still stood. A stored NULL carries forward as a gap, because that is an
+absence of quotes rather than an absence of data.
+
 The last-trade line is inferred, and the chart says so. Polymarket reports one
 last-traded price per match oriented to whichever side traded last (see
 `market_last_trade` below), and nothing in the record says which side that was.
@@ -231,3 +245,26 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
 ```bash
 uv run python tests/test_offline.py   # 201 checks, no network needed
 ```
+
+## Working on the dashboard front end
+
+The dashboard is React + TypeScript, built with Vite, in `frontend/`. The build
+output lands in `src/polymarket/dashboard/static/` and **is committed**, so
+`uv run polymarket dashboard` works without a Node toolchain. Rebuild it after
+changing anything under `frontend/src`:
+
+```bash
+cd frontend
+npm install          # once
+npm run build        # typechecks, then writes into the Python package
+npm run dev          # hot reload on :5173, proxying /api to :8787
+```
+
+`npm run dev` expects a dashboard already serving the real database alongside it
+(`uv run polymarket dashboard --no-open`), so the front end reloads on save while
+reading live capture data.
+
+The Python side owns the data: everything the browser shows comes from the four
+endpoints in `src/polymarket/dashboard/app.py`, and the reconstructions that
+depend on how the capture writes — forward fill, last-trade orientation — happen
+in `queries.py` rather than in the browser.

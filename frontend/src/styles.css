@@ -276,8 +276,18 @@ main { padding: 20px 24px 56px; }
 .seg button[aria-pressed="true"] { background: var(--surface-1); color: var(--text-primary); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
 
 .chart-wrap { position: relative; width: 100%; }
-.chart-wrap svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart-canvas { position: absolute; inset: 0; }
 .chart-empty { color: var(--text-muted); font-size: 12.5px; padding: 28px 0; text-align: center; }
+
+/* Tooltip lives inside the chart box and never takes the pointer, so the
+   crosshair keeps tracking underneath it. */
+.chart-tooltip {
+  position: absolute; z-index: 5; pointer-events: none;
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);
+  font-size: 12px; min-width: 150px; max-width: 260px;
+}
 
 /* ---------------------------------------------------------------- ladder */
 

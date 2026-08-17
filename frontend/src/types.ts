@@ -1,0 +1,135 @@
+/** Shapes returned by the FastAPI layer in src/polymarket/dashboard/queries.py.
+ *
+ * A missing quote is `null`, never a stand-in number: the capture stores NULL
+ * when a side of the book has no offers, which is real information about a
+ * market rather than an absent reading. Every price field is therefore nullable
+ * and the UI has to say "no quote" rather than draw a zero.
+ */
+
+export type MatchState = "live" | "upcoming" | "past";
+
+export interface PriceSummary {
+  ts: number;
+  bid: number | null;
+  ask: number | null;
+  mid: number | null;
+  spread: number | null;
+}
+
+/** The per-match last traded price, re-expressed as outcome 0. See `_orient`. */
+export interface LastTrade {
+  raw: number | null;
+  p0: number | null;
+  /** False when there was no mid to infer the orientation from. */
+  certain: boolean;
+}
+
+export interface MatchSummary {
+  condition_id: string;
+  question: string;
+  tournament: string | null;
+  tier: string | null;
+  market_type: string | null;
+  players: [string, string];
+  feed_state: string | null;
+  state: MatchState;
+  period: string | null;
+  score: string | null;
+  start_time: string | null;
+  start_epoch: number | null;
+  last_seen: number | null;
+  prices: [PriceSummary | null, PriceSummary | null];
+  last_trade: LastTrade | null;
+  snapshots: number;
+  first_ts: number | null;
+  last_ts: number | null;
+  spark: (number | null)[];
+  move: number | null;
+}
+
+export interface Overview {
+  generated_at: number;
+  last_tick: number | null;
+  capturing: boolean;
+  counts: Record<MatchState, number>;
+  tournaments: string[];
+  matches: MatchSummary[];
+}
+
+export interface BookLevel {
+  price: number | null;
+  size: number | null;
+}
+
+export interface Ladder {
+  ts: number;
+  outcome: string;
+  bid: number | null;
+  ask: number | null;
+  mid: number | null;
+  spread: number | null;
+  bids: BookLevel[];
+  asks: BookLevel[];
+  bid_depth: number | null;
+  ask_depth: number | null;
+}
+
+export interface ScoreEvent {
+  ts: number;
+  state: string | null;
+  period: string | null;
+  score: string | null;
+}
+
+export interface MatchDetail {
+  condition_id: string;
+  question: string;
+  tournament: string | null;
+  tier: string | null;
+  market_type: string | null;
+  slug: string | null;
+  event_slug: string | null;
+  players: [string, string];
+  feed_state: string | null;
+  state: MatchState;
+  period: string | null;
+  score: string | null;
+  start_time: string | null;
+  start_epoch: number | null;
+  last_seen: number | null;
+  snapshots: number;
+  first_ts: number | null;
+  last_ts: number | null;
+  depth: number;
+  books: [Ladder | null, Ladder | null];
+  last_trade: LastTrade | null;
+  score_events: ScoreEvent[];
+}
+
+export interface OutcomeSeries {
+  index: number;
+  name: string;
+  mid: (number | null)[];
+  bid: (number | null)[];
+  ask: (number | null)[];
+  spread: (number | null)[];
+  bid_depth: (number | null)[];
+  ask_depth: (number | null)[];
+}
+
+export interface MatchSeries {
+  condition_id: string;
+  ts: number[];
+  outcomes: [OutcomeSeries, OutcomeSeries];
+  last_trade: (number | null)[];
+  last_trade_raw: (number | null)[];
+  score_events: ScoreEvent[];
+  points: number;
+  total_points: number;
+  decimated: boolean;
+}
+
+export interface Pulse {
+  last_ts: number | null;
+  rows: number;
+}
