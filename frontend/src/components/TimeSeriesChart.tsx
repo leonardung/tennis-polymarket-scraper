@@ -46,6 +46,10 @@ export interface TimeSeriesChartProps {
   annotate?: (ts: number) => string | null;
   refLine?: { price: number; label: string };
   scale?: ScaleHint;
+  /** Refit the viewport whenever this changes; leave it alone when it does not.
+   *  Pass something identifying the window being shown, not the window that was
+   *  last requested -- see the fit effect. */
+  fitKey?: string;
   emptyText?: string;
   ariaLabel?: string;
 }
@@ -189,6 +193,7 @@ export function TimeSeriesChart({
   annotate,
   refLine,
   scale,
+  fitKey = "",
   emptyText = "No snapshots in this window yet.",
   ariaLabel,
 }: TimeSeriesChartProps) {
@@ -291,6 +296,7 @@ export function TimeSeriesChart({
       },
     });
     chartRef.current = chart;
+    fittedKey.current = null; // a new chart starts unfitted, whatever came before
 
     const onMove = (param: MouseEventParams<Time>) => {
       if (!param.point || param.time == null) {
@@ -366,19 +372,21 @@ export function TimeSeriesChart({
   }, [series, precision, minMove, format]);
 
   /* ---- data ---- */
-  const hasFitted = useRef(false);
+  const fittedKey = useRef<string | null>(null);
   useEffect(() => {
     series.forEach((definition, index) => {
       const column = uniform.values[index];
       if (column) seriesRef.current.get(definition.key)?.setData(toLineData(uniform.grid, column));
     });
-    // A fresh chart should show the whole window; later updates must not yank
-    // the view back while the reader is looking at part of it.
-    if (chartRef.current && !hasFitted.current) {
+    // Fit on the first data, and again whenever the window itself changes --
+    // picking a new range should put the reader back at a full view even if
+    // they had panned away. A poll that appends to the same window leaves
+    // fitKey alone, so it never yanks the view out from under them.
+    if (chartRef.current && fittedKey.current !== fitKey) {
       chartRef.current.timeScale().fitContent();
-      hasFitted.current = true;
+      fittedKey.current = fitKey;
     }
-  }, [uniform, series]);
+  }, [uniform, series, fitKey]);
 
   /* ---- score markers ---- */
   useEffect(() => {

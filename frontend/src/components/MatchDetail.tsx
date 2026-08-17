@@ -38,9 +38,18 @@ export function MatchDetail({
   onBack: () => void;
 }) {
   // Null until the reader picks one, so the default can follow the match.
-  const [chosenRange, setRange] = useState<RangeKey | null>(null);
+  const [chosenRange, setChosenRange] = useState<RangeKey | null>(null);
   const [depthOutcome, setDepthOutcome] = useState(0);
   const [showTable, setShowTable] = useState(false);
+  // Bumped on every press of the range control, including a press of the range
+  // already selected: that fetches nothing, so without it there would be no
+  // change for the charts to notice and the press would appear to do nothing.
+  const [resetNonce, setResetNonce] = useState(0);
+
+  const pickRange = (next: RangeKey) => {
+    setChosenRange(next);
+    setResetNonce((n) => n + 1);
+  };
 
   const detail = useAsync((signal) => fetchMatch(conditionId, signal), [conditionId, version]);
 
@@ -56,11 +65,16 @@ export function MatchDetail({
   const since = window != null && lastTs != null ? lastTs - window : null;
 
   const series = useAsync(
-    (signal) =>
-      detail.data
-        ? fetchSeries(conditionId, { points: 900, since }, signal)
-        : Promise.resolve(null),
-    [conditionId, version, since, detail.data != null],
+    async (signal) => {
+      if (!detail.data) return null;
+      const payload = await fetchSeries(conditionId, { points: 900, since }, signal);
+      // The range is recorded as it was when the request went out, so the charts
+      // can tell whether what they are showing is the window now selected. Fit
+      // on the arriving data, not on the click: at click time the previous
+      // window is still on screen.
+      return { payload, range };
+    },
+    [conditionId, version, since, range, detail.data != null],
   );
 
   const colors = [palette["--series-1"], palette["--series-2"]] as const;
@@ -81,7 +95,11 @@ export function MatchDetail({
   }
 
   const match = detail.data;
-  const data = series.data;
+  const data = series.data?.payload ?? null;
+  // Identifies the window on screen. Changes when the reader picks a different
+  // range or opens a different match -- both of which should reset the
+  // viewport -- and not when a poll appends to the window already shown.
+  const fitKey = data ? `${data.condition_id}:${series.data?.range}:${resetNonce}` : "";
   const widest = Math.max(...match.books.map((book) => book?.spread ?? 0));
 
   return (
@@ -139,7 +157,7 @@ export function MatchDetail({
               <Segmented
                 label="Time range"
                 value={range}
-                onChange={setRange}
+                onChange={pickRange}
                 options={RANGES.map((r) => ({ value: r.value, label: r.label }))}
               />
             }
@@ -173,6 +191,7 @@ export function MatchDetail({
               refLine={{ price: 0.5, label: "even" }}
               scale={{ minSpan: 0.08, clamp: [0, 1] }}
               ariaLabel={`Price history for ${match.question}`}
+              fitKey={fitKey}
               series={[
                 ...data.outcomes.map((outcome, i) => ({
                   key: `mid-${outcome.index}`,
@@ -213,6 +232,7 @@ export function MatchDetail({
               markers={markers}
               annotate={annotate}
               ariaLabel={`Spread over time for ${match.question}`}
+              fitKey={fitKey}
               scale={{ zeroBased: true, minSpan: 0.02 }}
               series={data.outcomes.map((outcome, i) => ({
                 key: `spread-${outcome.index}`,
@@ -254,6 +274,7 @@ export function MatchDetail({
               markers={markers}
               annotate={annotate}
               ariaLabel={`Order book depth over time for ${match.players[depthOutcome]}`}
+              fitKey={fitKey}
               scale={{ zeroBased: true }}
               series={[
                 {
