@@ -35,7 +35,7 @@ it finishes — so it can stay running across a whole tournament unattended.
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
-| `--score-interval N` | `10` | seconds between score-feed polls; `0` disables |
+| `--score-interval N` | `10` | seconds between per-match score reads; `0` disables |
 | `--dns MODE` | `auto` | see [DNS.md](DNS.md) |
 | `-v` | off | verbose logging |
 
@@ -106,32 +106,72 @@ excluded.
 `run` captures **only matches currently being played**. A finished match keeps
 trading on Polymarket for hours or days until it's resolved, so "still tradeable"
 is not the same as "still playing" — the match state comes from the live score
-feed instead. Matches are picked up as they start (including late starts, which
-are the norm) and dropped once they end. Pass `--include-upcoming` to also poll
-matches that haven't started.
+feed instead (see below — it is Flashscore's, not Polymarket's). Matches are
+picked up as they start (including late starts, which are the norm) and dropped
+once they end. Pass `--include-upcoming` to also poll matches that haven't
+started.
 
 ## The score feed
 
-The score is read on the book cadence, not the market-list one — every
-`--score-interval` seconds (10 by default), against only the matches whose score
-can actually change: those in play, and those within 15 minutes of their slot.
-Each change lands in `score_events`, so a price move can be read against the game
-that caused it. At refresh-rate sampling a whole service game fits between two
-readings; at 10 seconds none do.
+Scores come from **Flashscore**, not from Polymarket. Polymarket's own event
+payload carries `live`, `period` and `score`, but Gamma has no endpoint that
+returns them without the event's entire market list attached and no parameter
+trims it — about 60 KB to re-read one score, or 50 KB/s at ten-second resolution
+with eight matches on court. Flashscore's per-match feed answers the same
+question in about 200 bytes.
 
-Two things follow from it beyond the score itself:
+Which is what makes the cadence affordable. The score is read on the book
+cadence, not the market-list one — every `--score-interval` seconds (10 by
+default), against only the matches whose score can actually change: those in
+play, and those within 15 minutes of their slot. Each change lands in
+`score_events`, so a price move can be read against the game that caused it. At
+refresh-rate sampling a whole service game fits between two readings; at 10
+seconds none do.
 
-- **A match starting or finishing is noticed within a tick**, not at the next
-  refresh. `run` reacts by refreshing early, so a finished match stops being
-  captured in seconds rather than minutes. Rate-limited to one triggered refresh
-  a minute — the feed's `live` flag is known to flicker, and a refresh pages the
-  whole tennis catalog.
-- **It costs bandwidth.** Gamma has no endpoint that returns a score without the
-  event's entire market list, and no parameter trims it, so each match costs about
-  60 KB per poll — roughly 25 KB/s with four matches in play, 50 KB/s with eight.
-  Raise `--score-interval` to trade resolution for traffic (30s still resolves
-  every game), or pass `0` to switch it off and fall back to whatever the
-  market-list refresh happens to catch.
+Two feeds are involved, and the split matters:
+
+- **The day card** (`f_2_<day>_<tz>_en_1`) lists every match Flashscore has for a
+  day. It is read on the market-list refresh, and it is what turns a Polymarket
+  market into a Flashscore id. Three days are read — a night session lands on
+  either side of the local date boundary — for about 750 KB every 5 minutes.
+  It sits behind an edge cache that says `no-store` and then answers with an
+  `Age` of one to four minutes, so it can identify matches but cannot follow one.
+- **The per-match feed** (`df_sur_2_<id>`) is one match's status and set-by-set
+  score, about 200 bytes. This is what the tick cadence reads. It is also edge
+  cached, but briefly: measured against matches in play, `Age` climbs to roughly
+  two minutes and resets, and a set change was observed arriving 15 seconds after
+  it happened.
+
+Raise `--score-interval` to trade resolution for traffic, or pass `0` to switch
+the per-match reads off and take whatever the 5-minute day card happens to catch.
+
+**A match starting or finishing is noticed within a tick**, not at the next
+refresh. `run` reacts by refreshing early, so a finished match stops being
+captured in seconds rather than minutes. Rate-limited to one triggered refresh a
+minute, since a refresh pages the whole tennis catalog.
+
+Pairing a market to a Flashscore match is by tournament and by **both** players
+at once. Polymarket writes "Alex de Minaur" where Flashscore writes "De Minaur
+A." and `de-minaur-alex`, so names are compared as folded token sets, ignoring
+initials and bare particles — every Dutch player shares a "van". Requiring both
+sides to agree is what makes a wrong pairing cost two coincidences rather than
+one; two candidates that fit equally well are refused rather than guessed
+between. Since Flashscore also reports which player is at home and Polymarket
+does not, the score is stored in the order the market lists the players.
+
+A match that cannot be paired is logged and falls back to a guess: not started
+before its slot, assumed in play for six hours after it, finished past that.
+Capturing a finished match for a few hours costs disk; calling a live one
+finished loses the only copy of its book that will ever exist.
+
+One status is worth knowing about: `INT`, a match stopped for rain or bad light.
+Flashscore reports its coarse stage as "finished" while that lasts, but the match
+has not ended and the book keeps trading — often hard, since a delay is news — so
+it counts as live and stays captured.
+
+The feed is undocumented. The `x-fsign` header is a constant lifted from the site
+and the keys are single letters, so if scores start coming back empty, check the
+key tables at the top of `src/polymarket/scores.py` first.
 
 `discover` shows everything with its state; `discover --live-only` shows exactly
 what `run` would capture:
@@ -160,7 +200,9 @@ and the raw API response.
 
 Also `state` (live / upcoming / ended), `start_time`, and `period` + `score` from
 the score feed (`S2`, `6-3, 4-2`). These are refreshed as the match progresses, so
-they hold the latest known state rather than a per-tick history.
+they hold the latest known state rather than a per-tick history. `score` reads in
+the same order as `outcome_0` and `outcome_1`, and a set won on a tiebreak carries
+the loser's points — `6-7(3)`.
 
 **`books`** — one row per player per 10-second tick:
 
@@ -243,7 +285,7 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 201 checks, no network needed
+uv run python tests/test_offline.py   # 250 checks, no network needed
 ```
 
 ## Working on the dashboard front end

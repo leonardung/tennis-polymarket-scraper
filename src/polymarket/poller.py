@@ -6,7 +6,6 @@ import logging
 import signal
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 import httpx
 
@@ -23,8 +22,9 @@ from .config import (
     SCORE_LEAD,
     START_GRACE,
 )
-from .discovery import discover, markets_from_event
-from .store import Store
+from .discovery import discover, seconds_from_now
+from .scores import Flashscore, Paired, ScoreBoard
+from .store import ScoreRow, Store
 
 log = logging.getLogger(__name__)
 
@@ -39,31 +39,12 @@ class Tracked:
 
 @dataclass(frozen=True)
 class Watched:
-    """A match whose score feed can be re-read without a catalog page."""
+    """A match whose score can be re-read from its own Flashscore feed."""
 
     condition_id: str
-    event_slug: str
+    pairing: Paired
     start_time: str | None
     question: str
-
-
-def _seconds_from_now(iso: str | None) -> float | None:
-    """Signed seconds from now to an ISO timestamp; negative if past, None if unusable."""
-    if not iso:
-        return None
-    try:
-        when = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return (when - datetime.now(timezone.utc)).total_seconds()
-
-
-def _seconds_until(iso: str | None) -> float | None:
-    """Seconds until a future ISO timestamp, or None if unusable or already past."""
-    delta = _seconds_from_now(iso)
-    return delta if delta is not None and delta > 0 else None
 
 
 def _fingerprint(snap: Snapshot) -> tuple:
@@ -91,9 +72,12 @@ class Poller:
         only_changes: bool = True,
         heartbeat: float = HEARTBEAT,
         score_interval: float = SCORE_INTERVAL,
+        scores: Flashscore | None = None,
     ) -> None:
         self.api = api
         self.store = store
+        self.scores = scores if scores is not None else Flashscore()
+        self.board = ScoreBoard()
         self.interval = interval
         self.refresh_interval = refresh_interval
         self.all_markets = all_markets
@@ -123,8 +107,18 @@ class Poller:
         signal.signal(signal.SIGTERM, handler)
 
     def refresh(self) -> None:
+        # The day card is what turns a market into a Flashscore id, so it is
+        # read here rather than on the tick. A board that cannot be loaded at
+        # all keeps the previous one: stale ids still point at the right
+        # per-match feeds, and those are what the score poll actually reads.
+        try:
+            self.board = self.scores.board()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("score board unavailable (%s), reusing the previous one", exc)
+
         kept, skipped = discover(
             self.api,
+            self.board,
             all_markets=self.all_markets,
             include_qualifying=self.include_qualifying,
             live_only=self.live_only,
@@ -149,21 +143,23 @@ class Poller:
 
         # discover() has just read the score feed for everything it returned, so
         # its verdict is the authority here -- overwrite rather than merge, and
-        # forget matches that are no longer being followed.
+        # forget matches that are no longer being followed. A match the board
+        # could not identify has no feed of its own to poll, so it is left out.
         self.watched = {
             market.condition_id: Watched(
                 condition_id=market.condition_id,
-                event_slug=market.event_slug,
+                pairing=market.pairing,
                 start_time=market.start_time,
                 question=market.question,
             )
             for market in kept
+            if market.pairing
         }
         self._state = {m.condition_id: m.state for m in kept}
         self._state_changed = False
 
         self.store.upsert_markets(kept)
-        self.store.record_score_events(kept)
+        self.store.record_score_events(ScoreRow.of(m) for m in kept)
         self._schedule_next_start(skipped)
 
         # Only say "live" when that is what is being tracked; with
@@ -201,7 +197,7 @@ class Poller:
         for skip in skipped:
             if skip.reason != "upcoming":
                 continue
-            delta = _seconds_from_now(getattr(skip, "start_time", None))
+            delta = seconds_from_now(getattr(skip, "start_time", None))
             if delta is None:
                 continue
             if delta > 0:
@@ -221,60 +217,66 @@ class Poller:
 
     # ---------------- score feed ----------------
 
-    def _score_slugs(self) -> list[str]:
-        """Which matches are worth re-reading the score feed for right now.
+    def _score_targets(self) -> list[Watched]:
+        """Which matches are worth re-reading the score for right now.
 
-        Every event comes back with its whole market list attached and there is
-        no parameter to trim it, so the request costs roughly half a megabyte per
-        eight matches. Asking only for matches whose score can actually move --
-        those in play, and those close enough to their slot to start at any
-        moment -- keeps a 10-second poll proportionate to what is on court
-        rather than to how much of the draw happens to be in the database.
+        Each read is one small request, so this is aimed at the matches whose
+        score can actually move: those in play, and those close enough to their
+        slot to start at any moment. For everything else the day card has
+        already said all there is to say, and the next refresh re-reads it.
         """
-        slugs = []
+        targets = []
         for condition_id, watched in self.watched.items():
             state = self._state.get(condition_id, "upcoming")
             if state == "live":
-                slugs.append(watched.event_slug)
+                targets.append(watched)
                 continue
             if state == "ended":
                 continue
-            delta = _seconds_from_now(watched.start_time)
-            if delta is None:
-                slugs.append(watched.event_slug)  # no scheduled time: keep watching
-            elif -OVERDUE_WINDOW <= delta <= SCORE_LEAD:
-                slugs.append(watched.event_slug)
-        return sorted(set(slugs))
+            delta = seconds_from_now(watched.start_time)
+            # No scheduled time means no way to rule it out: keep watching.
+            if delta is None or -OVERDUE_WINDOW <= delta <= SCORE_LEAD:
+                targets.append(watched)
+        return targets
 
     def poll_scores(self) -> int:
-        """Re-read the score feed for the matches in play. Returns rows written."""
-        slugs = self._score_slugs()
-        if not slugs:
+        """Re-read the score for the matches in play. Returns rows written."""
+        targets = self._score_targets()
+        if not targets:
             return 0
 
-        readings = []
-        for event in self.api.events_by_slug(slugs):
-            found, _ = markets_from_event(
-                event,
-                all_markets=self.all_markets,
-                include_qualifying=self.include_qualifying,
-                # Never live_only: the whole point is to catch a match the moment
-                # it leaves that state, which filtering it out would hide.
-                live_only=False,
+        # With --all-markets a match's derivatives share its Flashscore id, so
+        # the feed is read once and applied to each market that wants it.
+        readings = self.scores.readings(sorted({w.pairing.id for w in targets}))
+
+        rows = []
+        for watched in targets:
+            reading = readings.get(watched.pairing.id)
+            # No reading is not the same as a blank one: a match that has not
+            # started, and one settled without play, both answer with nothing.
+            # Keep what the board last said rather than inventing a state.
+            if reading is None:
+                continue
+            rows.append(
+                ScoreRow(
+                    condition_id=watched.condition_id,
+                    state=reading.state,
+                    period=reading.period,
+                    score=watched.pairing.render(reading),
+                )
             )
-            readings.extend(found)
-        if not readings:
+        if not rows:
             return 0
 
-        self.store.update_scores(readings)
-        written = self.store.record_score_events(readings)
+        self.store.update_scores(rows)
+        written = self.store.record_score_events(rows)
 
         moved = []
-        for market in readings:
-            previous = self._state.get(market.condition_id)
-            if previous is not None and previous != market.state:
-                moved.append((market.question, previous, market.state))
-            self._state[market.condition_id] = market.state
+        for row in rows:
+            previous = self._state.get(row.condition_id)
+            if previous is not None and previous != row.state:
+                moved.append((self.watched[row.condition_id].question, previous, row.state))
+            self._state[row.condition_id] = row.state
         for question, before, after in moved:
             log.info("score feed: %s is now %s (was %s)", question, after, before)
         if moved:
@@ -282,13 +284,13 @@ class Poller:
 
         # Quiet on the common case -- most polls of a live match find the same
         # game still in progress -- but say so when the score actually moves.
-        live = [m for m in readings if m.state == "live"]
+        live = [r for r in rows if r.state == "live"]
         log.log(
             logging.INFO if written else logging.DEBUG,
             "score: %d match(es) polled, %d change(s)%s",
-            len(slugs),
+            len(targets),
             written,
-            "".join(f" | {m.period} {m.score}" for m in live) if written and live else "",
+            "".join(f" | {r.period} {r.score}" for r in live) if written and live else "",
         )
         return written
 

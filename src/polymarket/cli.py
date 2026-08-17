@@ -18,6 +18,7 @@ from .api import Polymarket
 from .config import (
     BOOK_DEPTH,
     CLOB,
+    FLASHSCORE_HOST,
     GAMMA,
     HEARTBEAT,
     POLL_INTERVAL,
@@ -26,6 +27,7 @@ from .config import (
 )
 from .discovery import discover
 from .poller import Poller
+from .scores import Flashscore
 from .store import Store
 
 DEFAULT_DB = "data/tennis.db"
@@ -41,9 +43,10 @@ def _setup_logging(verbose: bool) -> None:
 
 
 def cmd_discover(args: argparse.Namespace) -> int:
-    with Polymarket() as api:
+    with Polymarket() as api, Flashscore() as scores:
         kept, skipped = discover(
             api,
+            scores.board(),
             all_markets=args.all_markets,
             include_qualifying=args.include_qualifying,
             live_only=args.live_only,
@@ -90,10 +93,11 @@ def _as_dict(market: object) -> dict[str, object]:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    with Polymarket() as api, Store(args.db) as store:
+    with Polymarket() as api, Flashscore() as scores, Store(args.db) as store:
         poller = Poller(
             api,
             store,
+            scores=scores,
             interval=args.interval,
             refresh_interval=args.refresh,
             all_markets=args.all_markets,
@@ -301,7 +305,12 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(args.verbose)
     if args.needs_network:
         resolver.ensure(
-            [urlparse(GAMMA).hostname or "", urlparse(CLOB).hostname or ""], args.dns
+            [
+                urlparse(GAMMA).hostname or "",
+                urlparse(CLOB).hostname or "",
+                urlparse(FLASHSCORE_HOST).hostname or "",
+            ],
+            args.dns,
         )
     try:
         return int(args.func(args))

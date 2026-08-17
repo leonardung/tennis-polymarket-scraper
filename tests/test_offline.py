@@ -127,7 +127,6 @@ class FakeAPI:
 
     def __init__(self, events: list[dict]) -> None:
         self._events = events
-        self.slug_calls: list[list[str]] = []
 
     def tag_id(self, slug: str) -> str | None:
         return "864"
@@ -135,34 +134,80 @@ class FakeAPI:
     def events(self, **_params: object):
         return iter(self._events)
 
-    def events_by_slug(self, slugs):
-        """Targeted fetch, as Gamma's repeated ?slug= gives us."""
-        wanted = list(slugs)
-        self.slug_calls.append(wanted)
-        return [e for e in self._events if e.get("slug") in set(wanted)]
+
+class FakeFlashscore:
+    """Stands in for the score feed. `readings` is what the tick cadence hits."""
+
+    def __init__(self, board=None, readings: dict | None = None) -> None:
+        from polymarket.scores import ScoreBoard
+
+        self._board = board if board is not None else ScoreBoard()
+        self.readings_by_id = readings or {}
+        self.calls: list[list[str]] = []
+
+    def board(self):
+        return self._board
+
+    def readings(self, match_ids):
+        wanted = list(match_ids)
+        self.calls.append(wanted)
+        return {i: self.readings_by_id[i] for i in wanted if i in self.readings_by_id}
+
+
+def _board(*matches: tuple) -> object:
+    """Build a ScoreBoard the way parse_board would, from (players, status, sets).
+
+    Each entry is ``(home, away, status_code, [(games, games), ...])`` with the
+    status code Flashscore's `AC` key uses -- 17 for "set 1 in play", 3 for
+    finished, and so on.
+    """
+    from polymarket.scores import BoardMatch, Reading, ScoreBoard, SetScore, name_tokens
+    from polymarket.scores import _STATUS
+    from polymarket.config import match_tournament
+
+    built = []
+    for index, (home, away, status, sets) in enumerate(matches):
+        state, period = _STATUS[str(status)]
+        built.append(
+            BoardMatch(
+                id=f"fs{index}",
+                tournament=match_tournament("Cincinnati Open"),
+                home=home,
+                away=away,
+                home_tokens=name_tokens(home),
+                away_tokens=name_tokens(away),
+                starts_at=None,
+                reading=Reading(state, period, tuple(SetScore(*s) for s in sets)),
+            )
+        )
+    return ScoreBoard(built)
+
+
+# The pair discovery's fixture event is about, as Flashscore would name them.
+_ZANDSCHULP = ("Van de Zandschulp B.", "Griekspoor T.")
+
+
+def _live_board(sets=((6, 3), (3, 1)), status: int = 18) -> object:
+    return _board((*_ZANDSCHULP, status, sets))
 
 
 def _event(
     title: str,
     slug: str,
     markets: list[tuple[str, list[str], bool]],
-    state: str = "live",
     start_time: str = "2026-08-16T18:30:00Z",
 ) -> dict:
-    """Build an event in the live shape: generic tags, several markets per match."""
-    feed = {
-        "live": {"live": True, "ended": False, "period": "S2", "score": "6-3, 3-1"},
-        "upcoming": {"live": None, "ended": None, "period": None, "score": None},
-        "ended": {"live": False, "ended": True, "period": "FT", "score": "4-6, 2-6"},
-        "cancelled": {"live": False, "ended": True, "period": "CAN", "score": "0-0"},
-    }[state]
+    """Build an event in the live shape: generic tags, several markets per match.
+
+    Nothing here says whether the match is being played: that comes from the
+    score board, which is why these carry no score fields at all.
+    """
     return {
         "title": title,
         "slug": slug,
         "tags": [{"slug": t} for t in ("tennis", "sports", "games")],
         "startDate": "2026-08-16T10:00:00Z",
         "startTime": start_time,
-        **feed,
         "markets": [
             {
                 "conditionId": "0x%08x" % (abs(hash(question)) & 0xFFFFFFFF),
@@ -239,7 +284,7 @@ def test_discovery() -> None:
         ),
     ]
 
-    kept, _ = discover(FakeAPI(events))
+    kept, _ = discover(FakeAPI(events), _live_board())
     check("only the ATP moneyline kept", len(kept) == 1)
     check("right match", kept[0].question.startswith("Cincinnati Open: Botic"))
     check("tournament", kept[0].tournament == "Cincinnati Open")
@@ -253,7 +298,7 @@ def test_discovery() -> None:
     check("itf excluded", not any("ITF" in m.question for m in kept))
     check("outright excluded", not any("Will Carlos" in m.question for m in kept))
 
-    everything, _ = discover(FakeAPI(events), all_markets=True)
+    everything, _ = discover(FakeAPI(events), _live_board(), all_markets=True)
     check("all-markets picks up derivatives", len(everything) == 3)
     check(
         "derivatives typed",
@@ -274,40 +319,37 @@ def test_discovery() -> None:
     check("qualifying excluded by default", discover(FakeAPI([qual]))[0] == [])
     check(
         "qualifying opt-in works",
-        len(discover(FakeAPI([qual]), include_qualifying=True)[0]) == 1,
+        len(discover(FakeAPI([qual]), None, include_qualifying=True)[0]) == 1,
     )
 
 
 def test_live_filter() -> None:
     print("\nlive-match filter")
-    from polymarket.discovery import match_state
 
-    check("live flag", match_state({"live": True}) == "live")
-    check("ended flag beats live", match_state({"live": True, "ended": True}) == "ended")
-    check("full time", match_state({"period": "FT"}) == "ended")
-    check("cancelled", match_state({"period": "CAN"}) == "ended")
-    check("retired", match_state({"period": "RET"}) == "ended")
-    check("set in progress", match_state({"period": "S3"}) == "live")
-    check("set marker survives a live flicker", match_state({"live": False, "period": "S1"}) == "live")
-    check("nothing yet", match_state({}) == "upcoming")
-    check("nulls mean upcoming", match_state({"live": None, "ended": None}) == "upcoming")
-
-    def match(title, slug, state, start="2026-08-16T20:15:00Z"):
-        return _event(title, slug, [(title, ["A", "B"], True)], state, start)
+    def match(a, b, slug, start="2026-08-16T20:15:00Z"):
+        title = f"Cincinnati Open: {a} vs {b}"
+        return _event(title, slug, [(title, [a, b], True)], start)
 
     events = [
-        match("Cincinnati Open: Playing Now", "atp-aaa-bbb-2026-08-16", "live"),
-        match("Cincinnati Open: Later Today", "atp-ccc-ddd-2026-08-16", "upcoming"),
-        match("Cincinnati Open: Already Done", "atp-eee-fff-2026-08-16", "ended"),
-        match("Cincinnati Open: Called Off", "atp-ggg-hhh-2026-08-14", "cancelled"),
+        match("Playing Now", "Opponent One", "atp-aaa-bbb-2026-08-16"),
+        match("Later Today", "Opponent Two", "atp-ccc-ddd-2026-08-16", "2099-01-01T00:00:00Z"),
+        match("Already Done", "Opponent Three", "atp-eee-fff-2026-08-16"),
+        match("Called Off", "Opponent Four", "atp-ggg-hhh-2026-08-14"),
     ]
+    board = _board(
+        ("Now P.", "One O.", 18, [(6, 3), (3, 1)]),
+        ("Today L.", "Two O.", 1, []),
+        ("Done A.", "Three O.", 3, [(4, 6), (2, 6)]),
+        ("Off C.", "Four O.", 5, []),
+    )
 
-    everything, _ = discover(FakeAPI(events))
+    everything, _ = discover(FakeAPI(events), board)
     check("without live_only, all four are returned", len(everything) == 4)
+    check("every one of them was paired", all(m.pairing for m in everything))
 
-    live, skipped = discover(FakeAPI(events), live_only=True)
+    live, skipped = discover(FakeAPI(events), board, live_only=True)
     check("live_only keeps just the live match", len(live) == 1)
-    check("and it is the right one", live[0].question.endswith("Playing Now"))
+    check("and it is the right one", live[0].question.endswith("Opponent One"))
     check("state recorded", live[0].state == "live")
     check("period recorded", live[0].period == "S2")
     check("score recorded", live[0].score == "6-3, 3-1")
@@ -326,6 +368,22 @@ def test_live_filter() -> None:
         any(s.reason == "upcoming" and s.start_time for s in skipped),
     )
 
+    # A match the board has never heard of has to be guessed at, and the guess
+    # is bounded by how long a tennis match can credibly last.
+    from polymarket.discovery import unpaired_state
+
+    check("before its slot, not started", unpaired_state(_iso(600)) == "upcoming")
+    check("no start time at all, not started", unpaired_state(None) == "upcoming")
+    check("just past its slot, assumed in play", unpaired_state(_iso(-1800)) == "live")
+    check("still assumed in play hours later", unpaired_state(_iso(-5 * 3600)) == "live")
+    check("but not a day later", unpaired_state(_iso(-24 * 3600)) == "ended")
+
+    unknown = [match("Nobody Knows", "This Match", "atp-nnn-kkk-2026-08-16")]
+    guessed, _ = discover(FakeAPI(unknown), board)
+    check("an unpaired match still comes back", len(guessed) == 1)
+    check("with no feed id", guessed[0].pairing is None)
+    check("and no invented score", guessed[0].score is None and guessed[0].period is None)
+
 
 # --------------------------------------------------------------------------
 # storage round-trip
@@ -334,7 +392,7 @@ def test_live_filter() -> None:
 
 def test_store() -> None:
     print("\nstorage")
-    kept, _ = discover(FakeAPI([_cincinnati_atp()]))
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]), _live_board())
     market = kept[0]
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -435,7 +493,7 @@ def test_migration() -> None:
             ).fetchone()[0] == 1)
 
             # and a real insert must now work
-            kept, _ = discover(FakeAPI([_cincinnati_atp()]))
+            kept, _ = discover(FakeAPI([_cincinnati_atp()]), _live_board())
             check("insert works after migration", store.upsert_markets(kept) == 1)
             snap = parse_book(kept[0].tokens[0], BOOK)
             check("snapshot insert works after migration",
@@ -514,15 +572,16 @@ def _overdue_reschedules() -> bool:
 
 def test_poller() -> None:
     print("\npoller")
-    from polymarket.poller import Poller, _seconds_until
+    from polymarket.poller import Poller
 
     api = FakeAPI([_cincinnati_atp()])
+    feed = FakeFlashscore(_live_board())
     book = dict(BOOK)
     api.books = lambda token_ids: {tid: dict(book, asset_id=tid) for tid in token_ids}
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "p.db") as store:
-            poller = Poller(api, store, interval=10.0)
+            poller = Poller(api, store, scores=feed, interval=10.0)
             check("deduplication is on by default", poller.only_changes is True)
             check("live-only is on by default", poller.live_only is True)
 
@@ -549,7 +608,7 @@ def test_poller() -> None:
         with Store(Path(tmp) / "h.db") as store:
             steady = dict(BOOK)
             api.books = lambda token_ids: {tid: dict(steady, asset_id=tid) for tid in token_ids}
-            poller = Poller(api, store, heartbeat=0.0)
+            poller = Poller(api, store, scores=feed, heartbeat=0.0)
             poller.refresh()
             check("heartbeat 0 writes every tick", poller.tick() == 2 and poller.tick() == 2)
 
@@ -562,7 +621,7 @@ def test_poller() -> None:
     # --every-tick disables deduplication entirely
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "e.db") as store:
-            poller = Poller(api, store, only_changes=False)
+            poller = Poller(api, store, scores=feed, only_changes=False)
             poller.refresh()
             check("every-tick writes regardless", poller.tick() == 2 and poller.tick() == 2)
 
@@ -572,19 +631,20 @@ def test_poller() -> None:
             upcoming = _event(
                 "Cincinnati Open: Not Started vs Yet",
                 "atp-nnn-yyy-2026-08-16",
-                [("Cincinnati Open: Not Started vs Yet", ["N", "Y"], True)],
-                "upcoming",
+                [("Cincinnati Open: Not Started vs Yet", ["Not Started", "Yet Waiting"], True)],
                 "2099-01-01T00:00:00Z",
             )
             quiet = FakeAPI([upcoming])
             quiet.books = lambda token_ids: {}
-            poller = Poller(quiet, store)
+            waiting = FakeFlashscore(_board(("Started N.", "Waiting Y.", 1, [])))
+            poller = Poller(quiet, store, scores=waiting)
             poller.refresh()
             check("upcoming match is not tracked", poller.tracked == {})
             check("tick with nothing tracked is a no-op", poller.tick() == 0)
             check("next refresh is scheduled for the start time", poller._next_start is not None)
 
             quiet._events = [_cincinnati_atp()]
+            poller.scores = feed
             poller.refresh()
             check("match is picked up once it goes live", len(poller.tracked) == 2)
 
@@ -593,12 +653,245 @@ def test_poller() -> None:
             check("finished match stops being tracked", poller.tracked == {})
 
     print("\nstart-time scheduling")
-    check("past times are ignored", _seconds_until("2020-01-01T00:00:00Z") is None)
+    from polymarket.discovery import parse_iso, seconds_from_now
+
+    check("past times parse as past", seconds_from_now("2020-01-01T00:00:00Z") < 0)
     check("overdue match reschedules a quick re-check", _overdue_reschedules())
-    check("garbage is ignored", _seconds_until("not a time") is None)
-    check("missing is ignored", _seconds_until(None) is None)
-    future = _seconds_until("2099-01-01T00:00:00Z")
-    check("future times parse", future is not None and future > 0)
+    check("garbage is ignored", seconds_from_now("not a time") is None)
+    check("missing is ignored", seconds_from_now(None) is None)
+    check("future times parse", seconds_from_now("2099-01-01T00:00:00Z") > 0)
+    check("naive timestamps are read as UTC", parse_iso("2026-08-16T18:30:00") == parse_iso("2026-08-16T18:30:00Z"))
+
+
+# --------------------------------------------------------------------------
+# the Flashscore feed: parsing and pairing
+# --------------------------------------------------------------------------
+
+# Captured from the live feeds. The day card is one block per match with a
+# tournament header before it; the per-match feed is one block per set.
+DAY_FEED = (
+    "ZA÷ATP - SINGLES: Cincinnati (USA), hard¬~"
+    "AA÷Qi0f7iu1¬AD÷1786969800¬AB÷3¬AC÷3¬"
+    "AE÷Lehecka J.¬WU÷lehecka-jiri¬AF÷Berrettini M.¬WV÷berrettini-matteo¬"
+    "BA÷6¬BB÷4¬BC÷6¬DC÷3¬BD÷7¬DD÷7¬BE÷6¬BF÷3¬~"
+    "AA÷Iy42aBeE¬AD÷1786989600¬AB÷3¬AC÷36¬"
+    "AE÷Fery A.¬WU÷fery-arthur¬AF÷De Minaur A.¬WV÷de-minaur-alex¬"
+    "BA÷5¬BB÷7¬BC÷0¬BD÷0¬~"
+    "ZA÷CHALLENGER MEN - SINGLES: Sion (Sui), hard¬~"
+    "AA÷chal1234¬AD÷1786989600¬AB÷2¬AC÷17¬"
+    "AE÷Lehecka J.¬WU÷lehecka-jiri¬AF÷Berrettini M.¬WV÷berrettini-matteo¬BA÷1¬BB÷0¬~"
+    "ZA÷WTA - SINGLES: Cincinnati (USA), hard¬~"
+    "AA÷wta12345¬AD÷1786989600¬AB÷2¬AC÷17¬"
+    "AE÷Bouzkova M.¬WU÷bouzkova-marie¬AF÷Stefanini L.¬WV÷stefanini-lucrezia¬BA÷2¬BB÷1¬~"
+)
+
+MATCH_FEED = "AC÷3¬BA÷6¬BB÷4¬RC÷0:38¬~BC÷6¬DC÷3¬BD÷7¬DD÷7¬RD÷0:58¬~BE÷6¬BF÷3¬RE÷0:48¬~RB÷2:24¬~"
+
+# What a match that has not been played answers with: TV listings, no status.
+EMPTY_FEED = "PSPH÷12¬PSPA÷22¬TA÷Arena Premium 5 (Srb)¬A1÷¬~"
+
+
+def test_score_feed() -> None:
+    print("\nscore feed parsing")
+    from polymarket.scores import Reading, SetScore, parse_board, parse_reading
+
+    board = parse_board(DAY_FEED)
+    check("only tour-level singles is read", len(board) == 2)
+    check("a challenger with the same players is skipped", all(m.id != "chal1234" for m in board))
+    check("the wta draw at the same event is skipped", all(m.id != "wta12345" for m in board))
+
+    finished, interrupted = board
+    check("id read", finished.id == "Qi0f7iu1")
+    check("players read", (finished.home, finished.away) == ("Lehecka J.", "Berrettini M."))
+    check("tournament resolved to the ATP calendar", finished.tournament.name == "Cincinnati Open")
+    check("start time read", finished.starts_at == 1786969800.0)
+    check("finished match is ended", finished.reading.state == "ended")
+    check("with full time as its period", finished.reading.period == "FT")
+    check("sets in order", finished.reading.line() == "6-4, 6-7(3), 6-3")
+
+    # The stage says 3, which on its own reads as finished. A match stopped for
+    # rain has not finished, and its book is still trading.
+    check("an interruption is still live", interrupted.reading.state == "live")
+    check("and says so", interrupted.reading.period == "INT")
+    check("score so far", interrupted.reading.line() == "5-7, 0-0")
+
+    reading = parse_reading(MATCH_FEED)
+    check("per-match feed reads one set per block", reading.line() == "6-4, 6-7(3), 6-3")
+    check("and its status", (reading.state, reading.period) == ("ended", "FT"))
+    check("a match with nothing to say reads as nothing", parse_reading(EMPTY_FEED) is None)
+    check("an empty response too", parse_reading("") is None)
+
+    # The score is stored in the order Polymarket lists the players, which is
+    # not always the order Flashscore does.
+    check("flipped score is mirrored", reading.line(flip=True) == "4-6, 7-6(3), 3-6")
+    check("a set with no tiebreak is untouched", SetScore(6, 4).render() == "6-4")
+    check("the loser's tiebreak points are shown", SetScore(7, 6, 7, 4).render() == "7-6(4)")
+    check("a tiebreak in progress is not annotated", SetScore(6, 6, 5, 4).render() == "6-6")
+    check("no sets means no score line", Reading("upcoming", None).line() is None)
+
+    # Every status has to land somewhere: an unknown one falls back to the
+    # coarse stage rather than being dropped.
+    from polymarket.scores import _read_status
+
+    check("unknown detail falls back to the stage", _read_status({"AC": "999", "AB": "2"}) == ("live", None))
+    check("no status at all is no reading", _read_status({}) is None)
+    check("a tiebreak is still that set", _read_status({"AC": "48"}) == ("live", "S2"))
+    check("retired is over", _read_status({"AC": "8"}) == ("ended", "RET"))
+    check("postponed is still to come", _read_status({"AC": "4"}) == ("upcoming", "POST"))
+
+    # A day with no tour matches on it and a feed that cannot be reached must
+    # not look the same: one is an answer, the other is the absence of one.
+    import httpx
+
+    from polymarket.scores import Flashscore
+
+    quiet = Flashscore(days=(0,))
+    quiet._get = lambda feed: "ZA÷WTA - SINGLES: Monterrey (Mex), hard¬~"
+    check("a card with no tour matches is an empty board", len(quiet.board()) == 0)
+
+    down = Flashscore(days=(0, 1))
+
+    def unreachable(_feed):
+        raise httpx.ConnectError("no route")
+
+    down._get = unreachable
+    try:
+        down.board()
+        raised = False
+    except httpx.HTTPError:
+        raised = True
+    check("losing every day card raises instead", raised)
+
+    half = Flashscore(days=(0, 1))
+    seen = []
+
+    def flaky(feed):
+        seen.append(feed)
+        if len(seen) == 1:
+            raise httpx.ConnectError("no route")
+        return DAY_FEED
+
+    half._get = flaky
+    check("one bad day still yields the others", len(half.board()) == 2)
+    quiet.close(), down.close(), half.close()
+
+
+def test_score_pairing() -> None:
+    """Matching a Polymarket market to a Flashscore one, by tournament and both players."""
+    print("\nscore pairing")
+    from polymarket.scores import parse_board, ScoreBoard
+
+    board = ScoreBoard(parse_board(DAY_FEED))
+
+    # Polymarket spells names out in full; Flashscore abbreviates the first name
+    # in the display name and reverses it in the slug.
+    hit = board.pair("Cincinnati Open", ["Arthur Fery", "Alex de Minaur"])
+    check("full names match abbreviated ones", hit is not None and hit.id == "Iy42aBeE")
+    check("same order needs no flip", hit.flip is False)
+    check("score comes out in that order", hit.score == "5-7, 0-0")
+
+    flipped = board.pair("Cincinnati Open", ["Alex de Minaur", "Arthur Fery"])
+    check("the reverse order pairs too", flipped is not None and flipped.id == "Iy42aBeE")
+    check("and is flagged as flipped", flipped.flip is True)
+    check("so the score is mirrored", flipped.score == "7-5, 0-0")
+
+    check(
+        "one player agreeing is not enough",
+        board.pair("Cincinnati Open", ["Arthur Fery", "Somebody Else"]) is None,
+    )
+    check(
+        "the right players at the wrong tournament do not pair",
+        board.pair("Wimbledon", ["Arthur Fery", "Alex de Minaur"]) is None,
+    )
+    check(
+        "a match the board has never seen does not pair",
+        board.pair("Cincinnati Open", ["Nobody Here", "Nor Here"]) is None,
+    )
+    check("an empty board pairs nothing", ScoreBoard().pair("Cincinnati Open", ["A B", "C D"]) is None)
+
+    # Names that are only particles must not be read as agreement: every Dutch
+    # player shares "van", and "de Minaur" and "de Jong" are different people.
+    from polymarket.scores import name_tokens
+
+    check("initials are dropped", "a" not in name_tokens("Fery A."))
+    check("accents are folded", name_tokens("Cerúndolo") == name_tokens("Cerundolo"))
+    check("hyphens split", name_tokens("Auger-Aliassime") == {"auger", "aliassime"})
+    check("apostrophes are dropped", name_tokens("O'Connell") == {"connell"})
+
+    from polymarket.scores import BoardMatch, Reading
+    from polymarket.config import match_tournament
+
+    def entry(mid, home, away):
+        return BoardMatch(
+            id=mid,
+            tournament=match_tournament("Cincinnati Open"),
+            home=home,
+            away=away,
+            home_tokens=name_tokens(home),
+            away_tokens=name_tokens(away),
+            starts_at=None,
+            reading=Reading("live", "S1", ()),
+        )
+
+    particles = ScoreBoard([entry("a", "De Jong J.", "Van Rijthoven T.")])
+    check(
+        "sharing only a particle is not a pairing",
+        particles.pair("Cincinnati Open", ["Alex de Minaur", "Botic van de Zandschulp"]) is None,
+    )
+
+    # Two matches that fit equally well is not a coin toss to be won; refusing
+    # leaves the market on the fallback, which is at least honest.
+    twins = ScoreBoard([entry("x", "Smith J.", "Jones A."), entry("y", "Smith J.", "Jones A.")])
+    check("a genuine tie is refused", twins.pair("Cincinnati Open", ["John Smith", "Alan Jones"]) is None)
+
+    # The same fixture on two adjacent day cards is one match, not two.
+    same = ScoreBoard([entry("x", "Smith J.", "Jones A."), entry("x", "Smith J.", "Jones A.")])
+    check("the day cards overlap harmlessly", same.pair("Cincinnati Open", ["John Smith", "Alan Jones"]).id == "x")
+
+    # Two brothers across the net: the surname fits either side, so which way
+    # round the score goes cannot be read off the names.
+    from polymarket.scores import Reading as R, SetScore as S
+
+    brothers = ScoreBoard(
+        [
+            BoardMatch(
+                id="sib",
+                tournament=match_tournament("Cincinnati Open"),
+                home="Cerundolo F.",
+                away="Cerundolo J. M.",
+                home_tokens=name_tokens("Cerundolo F."),
+                away_tokens=name_tokens("Cerundolo J. M."),
+                starts_at=None,
+                reading=R("live", "S1", (S(4, 2),)),
+            )
+        ]
+    )
+    sib = brothers.pair("Cincinnati Open", ["Francisco Cerundolo", "Juan Manuel Cerundolo"])
+    check("the match is still identified", sib is not None and sib.id == "sib")
+    check("but flagged as un-orientable", sib.oriented is False)
+    check("so no score is claimed", sib.score is None)
+    check("while the state still comes through", sib.reading.state == "live")
+    check("and a later reading is dropped too", sib.render(R("live", "S1", (S(5, 2),))) is None)
+
+    # First names on the feed side are what resolve it, and Flashscore's slugs
+    # carry them even where the display name is an initial.
+    told_apart = ScoreBoard(
+        [
+            BoardMatch(
+                id="sib",
+                tournament=match_tournament("Cincinnati Open"),
+                home="Cerundolo F.",
+                away="Cerundolo J. M.",
+                home_tokens=name_tokens("Cerundolo F. cerundolo-francisco"),
+                away_tokens=name_tokens("Cerundolo J. M. cerundolo-juan-manuel"),
+                starts_at=None,
+                reading=R("live", "S1", (S(4, 2),)),
+            )
+        ]
+    )
+    solved = told_apart.pair("Cincinnati Open", ["Juan Manuel Cerundolo", "Francisco Cerundolo"])
+    check("first names settle it", solved.oriented is True)
+    check("and the score comes out the market's way round", solved.score == "2-4")
 
 
 # --------------------------------------------------------------------------
@@ -614,16 +907,17 @@ def _iso(offset_seconds: float) -> str:
 
 
 def test_score_poll_targeting() -> None:
-    """Which matches the poll asks about -- each event costs ~60 KB to re-read."""
+    """Which matches the poll asks about -- one request each, on every tick."""
     print("\nscore poll targeting")
     from polymarket.poller import Poller, Watched
+    from polymarket.scores import Paired, Reading
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "t.db") as store:
-            poller = Poller(FakeAPI([]), store)
+            poller = Poller(FakeAPI([]), store, scores=FakeFlashscore())
 
             def watch(cid: str, state: str, start: str | None) -> None:
-                poller.watched[cid] = Watched(cid, f"slug-{cid}", start, f"Match {cid}")
+                poller.watched[cid] = Watched(cid, Paired(f"fs-{cid}", False, Reading("live", None), "x"), start, f"Match {cid}")
                 poller._state[cid] = state
 
             watch("live", "live", _iso(-3600))
@@ -634,42 +928,49 @@ def test_score_poll_targeting() -> None:
             watch("abandoned", "upcoming", _iso(-9 * 3600))  # long past
             watch("undated", "upcoming", None)
 
-            slugs = set(poller._score_slugs())
-            check("a match in play is polled", "slug-live" in slugs)
-            check("a finished match is not", "slug-ended" not in slugs)
-            check("one about to start is polled", "slug-soon" in slugs)
-            check("one hours away is not", "slug-later" not in slugs)
-            check("an overdue match is still polled", "slug-overdue" in slugs)
-            check("one long past its slot is dropped", "slug-abandoned" not in slugs)
-            check("an undated match is polled", "slug-undated" in slugs)
+            ids = {w.pairing.id for w in poller._score_targets()}
+            check("a match in play is polled", "fs-live" in ids)
+            check("a finished match is not", "fs-ended" not in ids)
+            check("one about to start is polled", "fs-soon" in ids)
+            check("one hours away is not", "fs-later" not in ids)
+            check("an overdue match is still polled", "fs-overdue" in ids)
+            check("one long past its slot is dropped", "fs-abandoned" not in ids)
+            check("an undated match is polled", "fs-undated" in ids)
 
 
 def test_score_poll() -> None:
     print("\nscore poll")
     from polymarket.poller import Poller
+    from polymarket.scores import Reading, SetScore
 
-    live = _cincinnati_atp()
-    api = FakeAPI([live])
+    api = FakeAPI([_cincinnati_atp()])
     api.books = lambda token_ids: {}
+    feed = FakeFlashscore(_live_board())
+
+    def says(status: int, *sets: tuple) -> None:
+        from polymarket.scores import _STATUS
+
+        state, period = _STATUS[str(status)]
+        feed.readings_by_id["fs0"] = Reading(state, period, tuple(SetScore(*s) for s in sets))
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "s.db") as store:
-            poller = Poller(api, store, score_interval=10.0)
+            poller = Poller(api, store, scores=feed, score_interval=10.0)
             poller.refresh()
             check("a live match is watched", len(poller.watched) == 1)
             check("refresh seeds the known state", set(poller._state.values()) == {"live"})
 
             # refresh already recorded the opening reading, so a poll that sees
             # the same score must not write it again.
+            says(18, (6, 3), (3, 1))
             check("an unchanged score writes nothing", poller.poll_scores() == 0)
-            check("the poll asked only about the live match", api.slug_calls[-1] == [live["slug"]])
+            check("the poll asked only about the live match", feed.calls[-1] == ["fs0"])
 
-            live["score"] = "6-3, 4-1"
+            says(18, (6, 3), (4, 1))
             check("a game going by is recorded", poller.poll_scores() == 1)
             check("and only once", poller.poll_scores() == 0)
 
-            live["period"] = "S3"
-            live["score"] = "6-3, 6-4, 1-0"
+            says(19, (6, 3), (6, 4), (1, 0))
             check("a set change is recorded", poller.poll_scores() == 1)
 
             row = store.conn.execute(
@@ -685,9 +986,19 @@ def test_score_poll() -> None:
             check("first entry is where refresh found it", history[0][1] == "6-3, 3-1")
             check("last entry is the newest", history[-1][0] == "S3")
 
+            # A feed that answers with nothing is not a score of nothing: a
+            # walkover reports no status at all, and the last one must stand.
+            del feed.readings_by_id["fs0"]
+            check("a silent feed writes nothing", poller.poll_scores() == 0)
+            still = store.conn.execute(
+                "SELECT period FROM markets WHERE condition_id = ?",
+                (next(iter(poller.watched)),),
+            ).fetchone()
+            check("and leaves the last reading in place", still[0] == "S3")
+
             # The match finishing is what should cut the capture short.
             check("no refresh pending yet", poller._state_changed is False)
-            live["live"], live["ended"], live["period"] = False, True, "FT"
+            says(3, (6, 3), (6, 4), (6, 2))
             poller.poll_scores()
             check("the end of a match is noticed", poller._state_changed is True)
             check("but not acted on instantly", poller._refresh_due(time.monotonic() - 5) is False)
@@ -705,7 +1016,7 @@ def test_score_cadence() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "c.db") as store:
-            p = Poller(FakeAPI([]), store, interval=10.0, score_interval=10.0)
+            p = Poller(FakeAPI([]), store, scores=FakeFlashscore(), interval=10.0, score_interval=10.0)
             check("polls on the very first tick", p._score_due() is True)
 
             now = time.monotonic()
@@ -719,7 +1030,7 @@ def test_score_cadence() -> None:
             p._last_score = now - 4.0
             check("but not one arriving far too early", p._score_due() is False)
 
-            slow = Poller(FakeAPI([]), store, interval=10.0, score_interval=30.0)
+            slow = Poller(FakeAPI([]), store, scores=FakeFlashscore(), interval=10.0, score_interval=30.0)
             slow._last_score = time.monotonic() - 10.0
             check("a longer interval makes ticks wait", slow._score_due() is False)
             slow._last_score = time.monotonic() - 29.0
@@ -731,19 +1042,19 @@ def test_score_poll_isolation() -> None:
     print("\nscore poll isolation")
     from polymarket.poller import Poller
 
-    live = _cincinnati_atp()
-    api = FakeAPI([live])
+    api = FakeAPI([_cincinnati_atp()])
     api.books = lambda token_ids: {tid: dict(BOOK, asset_id=tid) for tid in token_ids}
+    feed = FakeFlashscore(_live_board())
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "i.db") as store:
-            poller = Poller(api, store)
+            poller = Poller(api, store, scores=feed)
             poller.refresh()
 
-            def explode(_slugs):
+            def explode(_ids):
                 raise RuntimeError("score feed is down")
 
-            api.events_by_slug = explode
+            feed.readings = explode
             try:
                 poller.poll_scores()
                 raised = False
@@ -753,19 +1064,36 @@ def test_score_poll_isolation() -> None:
             # ...and the run loop is what swallows it, so books keep being written.
             check("books are unaffected", poller.tick() == 2)
 
-            check("scores can be turned off entirely", Poller(api, store, score_interval=0)._score_due() is False)
+            # A board that will not load must not stop the capture either: the
+            # ids it already handed out are what the score poll actually uses.
+            def no_board():
+                import httpx
+
+                raise httpx.ConnectError("flashscore is down")
+
+            before = len(poller.board)
+            feed.board = no_board
+            poller.refresh()
+            check("a dead board keeps the previous one", len(poller.board) == before)
+            check("and the match stays tracked", len(poller.tracked) == 2)
+
+            off = Poller(api, store, scores=feed, score_interval=0)
+            check("scores can be turned off entirely", off._score_due() is False)
 
 
 def test_update_scores() -> None:
     print("\nscore updates")
-    kept, _ = discover(FakeAPI([_cincinnati_atp()]))
+    from polymarket.store import ScoreRow
+
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]), _live_board())
     market = kept[0]
+    reading = [ScoreRow.of(market)]
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "u.db") as store:
             # A match the poll sees before discovery inserted it is a no-op, not
             # a half-built row.
-            store.update_scores(kept)
+            store.update_scores(reading)
             check("no row is invented", store.conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0] == 0)
 
             store.upsert_markets(kept)
@@ -773,8 +1101,7 @@ def test_update_scores() -> None:
                 "SELECT raw, question FROM markets WHERE condition_id = ?", (market.condition_id,)
             ).fetchone()
 
-            market.period, market.score, market.state = "S5", "7-6", "live"
-            store.update_scores(kept)
+            store.update_scores([ScoreRow(market.condition_id, "live", "S5", "7-6")])
             after = store.conn.execute(
                 "SELECT period, score, state, raw, question FROM markets WHERE condition_id = ?",
                 (market.condition_id,),
@@ -791,19 +1118,21 @@ def test_update_scores() -> None:
 
 def test_score_events() -> None:
     print("\nscore history")
-    kept, _ = discover(FakeAPI([_cincinnati_atp()]))
+    from polymarket.store import ScoreRow
+
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]), _live_board())
     market = kept[0]
+    cid = market.condition_id
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "t.db") as store:
-            check("first reading recorded", store.record_score_events(kept) == 1)
-            check("unchanged reading not repeated", store.record_score_events(kept) == 0)
+            opening = [ScoreRow.of(market)]
+            check("first reading recorded", store.record_score_events(opening) == 1)
+            check("unchanged reading not repeated", store.record_score_events(opening) == 0)
 
-            market.score = "6-3, 4-1"
-            check("changed score recorded", store.record_score_events(kept) == 1)
-            market.period = "FT"
-            market.state = "ended"
-            check("changed period recorded", store.record_score_events(kept) == 1)
+            moved = [ScoreRow(cid, "live", "S2", "6-3, 4-1")]
+            check("changed score recorded", store.record_score_events(moved) == 1)
+            check("changed period recorded", store.record_score_events([ScoreRow(cid, "ended", "FT", "6-3, 4-1")]) == 1)
 
             rows = store.conn.execute(
                 "SELECT period, score FROM score_events WHERE condition_id = ? ORDER BY ts",
@@ -859,7 +1188,7 @@ def test_dashboard_series() -> None:
     print("\ndashboard series")
     from polymarket.dashboard import queries
 
-    kept, _ = discover(FakeAPI([_cincinnati_atp()]))
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]), _live_board())
     market = kept[0]
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -940,6 +1269,8 @@ if __name__ == "__main__":
     test_migration()
     test_encoded_fields()
     test_poller()
+    test_score_feed()
+    test_score_pairing()
     test_score_events()
     test_score_poll_targeting()
     test_score_poll()

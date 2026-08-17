@@ -5,12 +5,32 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
 from .book import Snapshot
 from .config import BOOK_DEPTH
 from .discovery import TennisMarket
+
+
+@dataclass(frozen=True)
+class ScoreRow:
+    """One match's score as the tables want it written.
+
+    The score poll no longer reads a Polymarket event, so it has no
+    ``TennisMarket`` to hand over -- just a condition id and what the score feed
+    said about it.
+    """
+
+    condition_id: str
+    state: str
+    period: str | None
+    score: str | None
+
+    @classmethod
+    def of(cls, market: TennisMarket) -> "ScoreRow":
+        return cls(market.condition_id, market.state, market.period, market.score)
 
 
 def _depth_columns(depth: int) -> list[str]:
@@ -229,7 +249,7 @@ class Store:
         )
         return len(rows)
 
-    def update_scores(self, markets: Iterable[TennisMarket]) -> int:
+    def update_scores(self, scores: Iterable[ScoreRow]) -> int:
         """Refresh only the score fields on rows that already exist.
 
         The score poll runs on the tick cadence, so it wants the cheapest write
@@ -239,7 +259,7 @@ class Store:
         the next refresh puts it in.
         """
         now = time.time()
-        rows = [(m.state, m.period, m.score, now, m.condition_id) for m in markets]
+        rows = [(s.state, s.period, s.score, now, s.condition_id) for s in scores]
         self.conn.executemany(
             "UPDATE markets SET state = ?, period = ?, score = ?, last_seen = ? "
             "WHERE condition_id = ?",
@@ -247,7 +267,7 @@ class Store:
         )
         return len(rows)
 
-    def record_score_events(self, markets: Iterable[TennisMarket]) -> int:
+    def record_score_events(self, scores: Iterable[ScoreRow]) -> int:
         """Append a row for every match whose state, period or score has moved.
 
         Only changes are stored: the score feed is re-read on every poll, so
@@ -258,16 +278,16 @@ class Store:
         """
         now = time.time()
         rows = []
-        for market in markets:
-            current = (market.state, market.period, market.score)
+        for entry in scores:
+            current = (entry.state, entry.period, entry.score)
             previous = self.conn.execute(
                 "SELECT state, period, score FROM score_events "
                 "WHERE condition_id = ? ORDER BY ts DESC LIMIT 1",
-                (market.condition_id,),
+                (entry.condition_id,),
             ).fetchone()
             if previous is not None and tuple(previous) == current:
                 continue
-            rows.append((now, market.condition_id, *current))
+            rows.append((now, entry.condition_id, *current))
 
         if rows:
             self.conn.executemany(
