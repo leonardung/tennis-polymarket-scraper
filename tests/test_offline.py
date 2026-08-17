@@ -135,13 +135,27 @@ class FakeAPI:
         return iter(self._events)
 
 
-def _event(title: str, slug: str, markets: list[tuple[str, list[str], bool]]) -> dict:
+def _event(
+    title: str,
+    slug: str,
+    markets: list[tuple[str, list[str], bool]],
+    state: str = "live",
+    start_time: str = "2026-08-16T18:30:00Z",
+) -> dict:
     """Build an event in the live shape: generic tags, several markets per match."""
+    feed = {
+        "live": {"live": True, "ended": False, "period": "S2", "score": "6-3, 3-1"},
+        "upcoming": {"live": None, "ended": None, "period": None, "score": None},
+        "ended": {"live": False, "ended": True, "period": "FT", "score": "4-6, 2-6"},
+        "cancelled": {"live": False, "ended": True, "period": "CAN", "score": "0-0"},
+    }[state]
     return {
         "title": title,
         "slug": slug,
         "tags": [{"slug": t} for t in ("tennis", "sports", "games")],
         "startDate": "2026-08-16T10:00:00Z",
+        "startTime": start_time,
+        **feed,
         "markets": [
             {
                 "conditionId": "0x%08x" % (abs(hash(question)) & 0xFFFFFFFF),
@@ -257,6 +271,55 @@ def test_discovery() -> None:
     )
 
 
+def test_live_filter() -> None:
+    print("\nlive-match filter")
+    from polymarket.discovery import match_state
+
+    check("live flag", match_state({"live": True}) == "live")
+    check("ended flag beats live", match_state({"live": True, "ended": True}) == "ended")
+    check("full time", match_state({"period": "FT"}) == "ended")
+    check("cancelled", match_state({"period": "CAN"}) == "ended")
+    check("retired", match_state({"period": "RET"}) == "ended")
+    check("set in progress", match_state({"period": "S3"}) == "live")
+    check("set marker survives a live flicker", match_state({"live": False, "period": "S1"}) == "live")
+    check("nothing yet", match_state({}) == "upcoming")
+    check("nulls mean upcoming", match_state({"live": None, "ended": None}) == "upcoming")
+
+    def match(title, slug, state, start="2026-08-16T20:15:00Z"):
+        return _event(title, slug, [(title, ["A", "B"], True)], state, start)
+
+    events = [
+        match("Cincinnati Open: Playing Now", "atp-aaa-bbb-2026-08-16", "live"),
+        match("Cincinnati Open: Later Today", "atp-ccc-ddd-2026-08-16", "upcoming"),
+        match("Cincinnati Open: Already Done", "atp-eee-fff-2026-08-16", "ended"),
+        match("Cincinnati Open: Called Off", "atp-ggg-hhh-2026-08-14", "cancelled"),
+    ]
+
+    everything, _ = discover(FakeAPI(events))
+    check("without live_only, all four are returned", len(everything) == 4)
+
+    live, skipped = discover(FakeAPI(events), live_only=True)
+    check("live_only keeps just the live match", len(live) == 1)
+    check("and it is the right one", live[0].question.endswith("Playing Now"))
+    check("state recorded", live[0].state == "live")
+    check("period recorded", live[0].period == "S2")
+    check("score recorded", live[0].score == "6-3, 3-1")
+    reasons = sorted({s.reason for s in skipped})
+    check("skips are labelled by state", reasons == ["ended", "upcoming"])
+    check(
+        "finished match is not polled",
+        not any("Already Done" in m.question for m in live),
+    )
+    check(
+        "cancelled match is not polled",
+        not any("Called Off" in m.question for m in live),
+    )
+    check(
+        "upcoming carries its start time for scheduling",
+        any(s.reason == "upcoming" and s.start_time for s in skipped),
+    )
+
+
 # --------------------------------------------------------------------------
 # storage round-trip
 # --------------------------------------------------------------------------
@@ -286,7 +349,7 @@ def test_store() -> None:
 
             row = store.conn.execute(
                 "SELECT best_bid, best_ask, bid_px_1, bid_sz_1, ask_px_3, ask_sz_3, outcome,"
-                " last_trade_price FROM books WHERE token_id = ?",
+                " market_last_trade FROM books WHERE token_id = ?",
                 (market.tokens[0],),
             ).fetchone()
             check("best bid stored", row[0] == 0.55)
@@ -294,7 +357,15 @@ def test_store() -> None:
             check("depth level 1 stored", (row[2], row[3]) == (0.55, 100.0))
             check("depth level 3 stored", (row[4], row[5]) == (0.62, 300.0))
             check("outcome label stored", row[6] == "Botic van de Zandschulp")
-            check("last trade price stored", row[7] == 0.56)
+            check("market last trade stored", row[7] == 0.56)
+            # The API reports one last-trade price per market on BOTH tokens,
+            # oriented to whichever side traded last -- so it must never be read
+            # as "this outcome's" price. Verified against live Cincinnati books.
+            both = store.conn.execute(
+                "SELECT DISTINCT market_last_trade FROM books WHERE condition_id = ?",
+                (market.condition_id,),
+            ).fetchall()
+            check("last trade is per-market, identical on both tokens", both == [(0.56,)])
 
             quote = store.conn.execute(
                 "SELECT buy_price, sell_price, question, tournament, match_date"
@@ -327,7 +398,7 @@ def test_migration() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "old.db"
         # a v1 database: markets without match_date/market_type, books without
-        # last_trade_price, and a stale column that no longer exists in the code
+        # market_last_trade, and a stale column that no longer exists in the code
         conn = sqlite3.connect(path)
         conn.executescript(
             """
@@ -389,40 +460,145 @@ def test_encoded_fields() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_poller() -> None:
-    print("\npoller")
+def _overdue_reschedules() -> bool:
+    """A match past its start time but not yet live must be re-checked soon.
+
+    Timestamps are built relative to now, so this cannot rot with the calendar.
+    """
+    import tempfile as _tf
+    from datetime import datetime, timedelta, timezone
+
     from polymarket.poller import Poller
 
+    def ago(**kw):
+        return (datetime.now(timezone.utc) - timedelta(**kw)).isoformat().replace("+00:00", "Z")
+
+    def skip(start_time):
+        return type("S", (), {"reason": "upcoming", "start_time": start_time})()
+
+    api = FakeAPI([])
+    api.books = lambda token_ids: {}
+    with _tf.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "late.db") as store:
+            poller = Poller(api, store)
+
+            # scheduled an hour ago and still not under way -> check again soon
+            poller._schedule_next_start([skip(ago(hours=1))])
+            soon = (
+                poller._next_start is not None
+                and poller._next_start - time.monotonic() <= 61
+            )
+
+            # abandoned long ago -> stop expecting it, fall back to the normal interval
+            poller._schedule_next_start([skip(ago(days=10))])
+            long_past_ignored = poller._next_start is None
+
+            # a genuine future start wins over an overdue one
+            future = (
+                datetime.now(timezone.utc) + timedelta(minutes=30)
+            ).isoformat().replace("+00:00", "Z")
+            poller._schedule_next_start([skip(ago(hours=1)), skip(future)])
+            prefers_future = (
+                poller._next_start is not None
+                and poller._next_start - time.monotonic() > 1000
+            )
+    return soon and long_past_ignored and prefers_future
+
+
+def test_poller() -> None:
+    print("\npoller")
+    from polymarket.poller import Poller, _seconds_until
+
     api = FakeAPI([_cincinnati_atp()])
-    api.books = lambda token_ids: {tid: dict(BOOK, asset_id=tid) for tid in token_ids}
+    book = dict(BOOK)
+    api.books = lambda token_ids: {tid: dict(book, asset_id=tid) for tid in token_ids}
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "p.db") as store:
             poller = Poller(api, store, interval=10.0)
+            check("deduplication is on by default", poller.only_changes is True)
+            check("live-only is on by default", poller.live_only is True)
+
             poller.refresh()
             check("refresh tracks both sides of the match", len(poller.tracked) == 2)
             check("first tick writes both sides", poller.tick() == 2)
-            check("second tick writes again", poller.tick() == 2)
+            check("unchanged book writes nothing", poller.tick() == 0)
+            check("still nothing on a third identical tick", poller.tick() == 0)
 
-            poller.only_changes = True
-            poller._last_hash.clear()
-            check("only-changes writes once", poller.tick() == 2)
-            check("only-changes suppresses repeat", poller.tick() == 0)
+            # a real move must come through immediately
+            book["bids"] = [{"price": "0.56", "size": "10"}] + BOOK["bids"]
+            check("a changed book is written", poller.tick() == 2)
+            check("and then goes quiet again", poller.tick() == 0)
 
-            rows = store.conn.execute("SELECT COUNT(DISTINCT ts), COUNT(*) FROM books").fetchone()
-            check("one distinct timestamp per tick", rows[0] == 3)
-            check("six rows total", rows[1] == 6)
+            # a trade with no book change still counts as new information
+            book["last_trade_price"] = "0.57"
+            check("a new last-trade price is written", poller.tick() == 2)
 
-            api._events = []
+            rows = store.conn.execute("SELECT COUNT(DISTINCT ts) FROM books").fetchone()[0]
+            check("three ticks produced rows", rows == 3)
+
+    # heartbeat: an unchanged book is still written periodically
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "h.db") as store:
+            steady = dict(BOOK)
+            api.books = lambda token_ids: {tid: dict(steady, asset_id=tid) for tid in token_ids}
+            poller = Poller(api, store, heartbeat=0.0)
+            poller.refresh()
+            check("heartbeat 0 writes every tick", poller.tick() == 2 and poller.tick() == 2)
+
+            poller.heartbeat = 3600.0
+            check("long heartbeat suppresses again", poller.tick() == 0)
+            # pretend the last write was long ago
+            poller._last_write = {t: 0.0 for t in poller.tracked}
+            check("stale token is rewritten even if unchanged", poller.tick() == 2)
+
+    # --every-tick disables deduplication entirely
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "e.db") as store:
+            poller = Poller(api, store, only_changes=False)
+            poller.refresh()
+            check("every-tick writes regardless", poller.tick() == 2 and poller.tick() == 2)
+
+    # live filtering drives what the loop tracks
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "l.db") as store:
+            upcoming = _event(
+                "Cincinnati Open: Not Started vs Yet",
+                "atp-nnn-yyy-2026-08-16",
+                [("Cincinnati Open: Not Started vs Yet", ["N", "Y"], True)],
+                "upcoming",
+                "2099-01-01T00:00:00Z",
+            )
+            quiet = FakeAPI([upcoming])
+            quiet.books = lambda token_ids: {}
+            poller = Poller(quiet, store)
+            poller.refresh()
+            check("upcoming match is not tracked", poller.tracked == {})
+            check("tick with nothing tracked is a no-op", poller.tick() == 0)
+            check("next refresh is scheduled for the start time", poller._next_start is not None)
+
+            quiet._events = [_cincinnati_atp()]
+            poller.refresh()
+            check("match is picked up once it goes live", len(poller.tracked) == 2)
+
+            quiet._events = []
             poller.refresh()
             check("finished match stops being tracked", poller.tracked == {})
-            check("tick with nothing tracked is a no-op", poller.tick() == 0)
+
+    print("\nstart-time scheduling")
+    check("past times are ignored", _seconds_until("2020-01-01T00:00:00Z") is None)
+    check("overdue match reschedules a quick re-check", _overdue_reschedules())
+    check("garbage is ignored", _seconds_until("not a time") is None)
+    check("missing is ignored", _seconds_until(None) is None)
+    future = _seconds_until("2099-01-01T00:00:00Z")
+    check("future times parse", future is not None and future > 0)
 
 
 if __name__ == "__main__":
     test_book()
     test_filters()
     test_discovery()
+    test_live_filter()
     test_store()
     test_migration()
     test_encoded_fields()

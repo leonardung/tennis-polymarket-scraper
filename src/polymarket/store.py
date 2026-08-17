@@ -34,7 +34,10 @@ BOOK_COLUMNS = [
     "mid",
     "spread",
     *DEPTH_COLUMNS,
-    "last_trade_price",
+    # Per-MARKET, not per-outcome: the API reports the same value on both tokens,
+    # oriented to whichever side traded last. Comparing it to this row's own mid
+    # is wrong for one of the two rows. See parse_book.
+    "market_last_trade",
     "book_hash",
 ]
 
@@ -49,6 +52,10 @@ MARKET_COLUMNS = [
     ("tour", "TEXT"),
     ("match_date", "TEXT"),
     ("market_type", "TEXT"),
+    ("state", "TEXT"),
+    ("start_time", "TEXT"),
+    ("period", "TEXT"),
+    ("score", "TEXT"),
     ("outcome_0", "TEXT"),
     ("outcome_1", "TEXT"),
     ("token_0", "TEXT"),
@@ -105,7 +112,7 @@ SELECT
     b.best_bid AS sell_price,  -- price you receive to sell it
     b.mid,
     b.spread,
-    b.last_trade_price,
+    b.market_last_trade,
     b.condition_id,
     b.token_id
 FROM books b
@@ -168,6 +175,10 @@ class Store:
                 m.tour,
                 m.match_date,
                 m.market_type,
+                m.state,
+                m.start_time,
+                m.period,
+                m.score,
                 m.outcomes[0],
                 m.outcomes[1],
                 m.tokens[0],
@@ -188,6 +199,10 @@ class Store:
             ON CONFLICT(condition_id) DO UPDATE SET
                 question=excluded.question,
                 market_type=excluded.market_type,
+                state=excluded.state,
+                start_time=excluded.start_time,
+                period=excluded.period,
+                score=excluded.score,
                 end_date=excluded.end_date,
                 last_seen=excluded.last_seen,
                 raw=excluded.raw
@@ -217,7 +232,7 @@ class Store:
                 for i in range(BOOK_DEPTH):
                     price, size = side[i] if i < len(side) else (None, None)
                     values += [price, size]
-            values += [snap.last_trade_price, snap.book_hash]
+            values += [snap.market_last_trade, snap.book_hash]
             payload.append(tuple(values))
 
         placeholders = ",".join("?" * len(BOOK_COLUMNS))

@@ -27,6 +27,11 @@ from .config import EXCLUDE, MATCH_SLUG, QUALIFYING, TENNIS_TAG_ID, match_tourna
 log = logging.getLogger(__name__)
 
 
+# Values of the event's "period" field once play is over. Anything else that
+# looks like a set marker (S1..S5) means the match is under way.
+FINISHED_PERIODS = {"FT", "CAN", "RET", "WO", "ABD", "POST"}
+
+
 @dataclass
 class TennisMarket:
     condition_id: str
@@ -39,6 +44,10 @@ class TennisMarket:
     tour: str
     match_date: str
     market_type: str  # "moneyline" or "derivative"
+    state: str  # "live", "upcoming" or "ended"
+    start_time: str | None
+    period: str | None
+    score: str | None
     outcomes: list[str]
     tokens: list[str]
     start_date: str | None
@@ -50,11 +59,29 @@ class TennisMarket:
         return f"[{self.tournament}] {self.question}"
 
 
+def match_state(event: dict[str, Any]) -> str:
+    """Classify a match as live / upcoming / ended from the event's score feed.
+
+    A finished match keeps `acceptingOrders` true until it is resolved, sometimes
+    for days, so "still tradeable" is not a usable stand-in for "still playing".
+    """
+    period = str(event.get("period") or "").upper()
+    if event.get("ended") or period in FINISHED_PERIODS:
+        return "ended"
+    if event.get("live"):
+        return "live"
+    # Trust an in-progress set marker even if `live` flickers between polls.
+    if period.startswith("S") and period[1:].isdigit():
+        return "live"
+    return "upcoming"
+
+
 @dataclass
 class Skipped:
     title: str
     slug: str
     reason: str
+    start_time: str | None = None
 
 
 def _tournament_of(title: str) -> str:
@@ -93,12 +120,14 @@ def discover(
     api: Polymarket,
     all_markets: bool = False,
     include_qualifying: bool = False,
+    live_only: bool = False,
     max_pages: int = 60,
 ) -> tuple[list[TennisMarket], list[Skipped]]:
     """Return (markets to capture, notable skips).
 
     ``all_markets`` also captures the per-match derivatives (set winner, total
     sets / games over-under, completed-match) rather than just the moneyline.
+    ``live_only`` keeps only matches that are actually being played.
     """
     kept: list[TennisMarket] = []
     skipped: list[Skipped] = []
@@ -122,6 +151,12 @@ def discover(
             continue
         if QUALIFYING.search(title) and not include_qualifying:
             skipped.append(Skipped(title, slug, "qualifying"))
+            continue
+
+        state = match_state(event)
+        if live_only and state != "live":
+            # start_time rides along so the poller knows when to look again.
+            skipped.append(Skipped(title, slug, state, event.get("startTime")))
             continue
 
         for market in event.get("markets") or []:
@@ -156,6 +191,10 @@ def discover(
                     tour="atp",
                     match_date=parsed.group("date"),
                     market_type="moneyline" if is_moneyline else "derivative",
+                    state=state,
+                    start_time=event.get("startTime"),
+                    period=event.get("period"),
+                    score=event.get("score"),
                     outcomes=outcomes,
                     tokens=token_ids,
                     start_date=market.get("startDate") or event.get("startDate"),

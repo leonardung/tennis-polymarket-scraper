@@ -17,7 +17,7 @@ class Snapshot:
     best_ask: float | None
     bids: list[Level]  # descending price, best first
     asks: list[Level]  # ascending price, best first
-    last_trade_price: float | None
+    market_last_trade: float | None  # per-market, identical on both tokens
     book_hash: str | None
     api_timestamp: str | None
 
@@ -74,7 +74,7 @@ def parse_book(token_id: str, book: dict[str, Any], depth: int = BOOK_DEPTH) -> 
         best_ask=asks[0][0] if asks else None,
         bids=bids,
         asks=asks,
-        last_trade_price=_as_float(book.get("last_trade_price")),
+        market_last_trade=_as_float(book.get("last_trade_price")),
         book_hash=book.get("hash"),
         api_timestamp=book.get("timestamp"),
     )

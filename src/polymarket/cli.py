@@ -5,15 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 
 from . import resolver
 from .api import Polymarket
-from .config import BOOK_DEPTH, CLOB, GAMMA, POLL_INTERVAL, REFRESH_INTERVAL
+from .config import BOOK_DEPTH, CLOB, GAMMA, HEARTBEAT, POLL_INTERVAL, REFRESH_INTERVAL
 from .discovery import discover
 from .poller import Poller
 from .store import Store
@@ -33,7 +35,10 @@ def _setup_logging(verbose: bool) -> None:
 def cmd_discover(args: argparse.Namespace) -> int:
     with Polymarket() as api:
         kept, skipped = discover(
-            api, all_markets=args.all_markets, include_qualifying=args.include_qualifying
+            api,
+            all_markets=args.all_markets,
+            include_qualifying=args.include_qualifying,
+            live_only=args.live_only,
         )
 
     if args.json:
@@ -52,7 +57,9 @@ def cmd_discover(args: argparse.Namespace) -> int:
     for tournament, markets in sorted(by_tournament.items()):
         print(f"  {tournament} ({markets[0].tier}) -- {len(markets)} market(s)")
         for market in markets:
-            print(f"    {market.match_date}  {market.question}")
+            status = market.state.upper() if market.state == "live" else market.state
+            detail = f" {market.period} {market.score}" if market.state == "live" else ""
+            print(f"    [{status}{detail}]  {market.question}")
             print(f"                {market.outcomes[0]}  vs  {market.outcomes[1]}")
         print()
     if skipped:
@@ -83,13 +90,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             refresh_interval=args.refresh,
             all_markets=args.all_markets,
             include_qualifying=args.include_qualifying,
-            only_changes=args.only_changes,
+            live_only=not args.include_upcoming,
+            only_changes=not args.every_tick,
+            heartbeat=args.heartbeat,
         )
         logging.info(
-            "capturing depth-%d books every %.0fs into %s",
+            "capturing depth-%d books every %.0fs into %s (%s matches, %s)",
             BOOK_DEPTH,
             args.interval,
             args.db,
+            "live + upcoming" if args.include_upcoming else "live",
+            "every tick" if args.every_tick else "on change",
         )
         poller.run()
     return 0
@@ -114,6 +125,58 @@ def cmd_stats(args: argparse.Namespace) -> int:
         for tournament, markets, snaps in rows:
             print(f"  {(tournament or '-'):<20} {markets:>8} {snaps:>10}")
     print()
+    return 0
+
+
+LATEST_QUERY = """
+SELECT utc_time, question, outcome, sell_price AS bid, buy_price AS ask, spread
+FROM quotes
+WHERE ts = (SELECT MAX(ts) FROM books)
+ORDER BY question, outcome
+"""
+
+
+def cmd_sql(args: argparse.Namespace) -> int:
+    """Run a query against the database while it is being written to.
+
+    Opened read-only, so this can never interfere with a running capture -- and
+    a typo that happens to be valid SQL cannot damage the recording.
+    """
+    query = args.query or LATEST_QUERY
+    path = Path(args.db)
+    if not path.exists():
+        print(f"no database at {path} -- has `polymarket run` been started?", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        cursor = conn.execute(query)
+        rows = cursor.fetchall()
+        headers = [d[0] for d in cursor.description or []]
+    except sqlite3.Error as exc:
+        print(f"query failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    if not rows:
+        print("(no rows)")
+        return 0
+
+    def cell(value: object) -> str:
+        if isinstance(value, float):
+            value = round(value, 6)
+        text = "NULL" if value is None else str(value)
+        return text[:40]
+
+    table = [headers] + [[cell(v) for v in row] for row in rows]
+    widths = [max(len(r[i]) for r in table) for i in range(len(headers))]
+    print()
+    print("  " + "  ".join(h.ljust(w) for h, w in zip(table[0], widths)))
+    print("  " + "  ".join("-" * w for w in widths))
+    for row in table[1:]:
+        print("  " + "  ".join(v.ljust(w) for v, w in zip(row, widths)))
+    print(f"\n{len(rows)} row(s)\n")
     return 0
 
 
@@ -150,15 +213,31 @@ def main(argv: list[str] | None = None) -> int:
         "discover", parents=[common], help="list the matches that would be captured"
     )
     p_discover.add_argument("--json", action="store_true")
+    p_discover.add_argument(
+        "--live-only",
+        action="store_true",
+        help="show only matches currently being played (what `run` captures)",
+    )
     p_discover.set_defaults(func=cmd_discover, needs_network=True)
 
     p_run = sub.add_parser("run", parents=[common], help="start the capture loop")
     p_run.add_argument("--interval", type=float, default=POLL_INTERVAL)
     p_run.add_argument("--refresh", type=float, default=REFRESH_INTERVAL)
     p_run.add_argument(
-        "--only-changes",
+        "--include-upcoming",
         action="store_true",
-        help="skip writing a snapshot when the book hash is unchanged",
+        help="also poll matches that have not started yet (default: live matches only)",
+    )
+    p_run.add_argument(
+        "--every-tick",
+        action="store_true",
+        help="write a snapshot every tick, including when the book has not moved",
+    )
+    p_run.add_argument(
+        "--heartbeat",
+        type=float,
+        default=HEARTBEAT,
+        help=f"write an unchanged book at least this often, seconds (default {HEARTBEAT:.0f})",
     )
     p_run.set_defaults(func=cmd_run, needs_network=True)
 
@@ -166,6 +245,16 @@ def main(argv: list[str] | None = None) -> int:
         "stats", parents=[common], help="summarize what has been captured"
     )
     p_stats.set_defaults(func=cmd_stats, needs_network=False)
+
+    p_sql = sub.add_parser(
+        "sql", parents=[common], help="query the database (read-only, safe while recording)"
+    )
+    p_sql.add_argument(
+        "query",
+        nargs="?",
+        help="SQL to run; omit to show the most recent quote for every match",
+    )
+    p_sql.set_defaults(func=cmd_sql, needs_network=False)
 
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
