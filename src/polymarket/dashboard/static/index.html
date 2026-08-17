@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ATP order books</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎾</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <h1>ATP order books</h1>
+    <span class="brand-sub">Polymarket capture</span>
+  </div>
+  <div class="topbar-right">
+    <div id="capture-status" class="status" role="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span class="status-text">connecting…</span>
+    </div>
+    <button id="theme-toggle" class="ghost-btn" type="button" aria-label="Switch colour theme">
+      <span aria-hidden="true">◐</span>
+    </button>
+  </div>
+</header>
+
+<!-- One filter row, scoping everything below it. -->
+<div class="filters" role="search">
+  <label class="field">
+    <span class="field-label">Tournament</span>
+    <select id="filter-tournament"><option value="">All</option></select>
+  </label>
+  <label class="field field-grow">
+    <span class="field-label">Player or match</span>
+    <input id="filter-search" type="search" placeholder="e.g. Zverev" autocomplete="off">
+  </label>
+  <label class="field">
+    <span class="field-label">Sort</span>
+    <select id="filter-sort">
+      <option value="natural">Start time</option>
+      <option value="move">Biggest move</option>
+      <option value="snapshots">Most data</option>
+      <option value="spread">Widest spread</option>
+    </select>
+  </label>
+  <div class="filter-note" id="filter-count"></div>
+</div>
+
+<nav class="tabs" role="tablist" aria-label="Match state">
+  <button class="tab" role="tab" data-tab="live" aria-selected="false">
+    <span class="tab-name">Live</span><span class="tab-count" data-count="live">0</span>
+  </button>
+  <button class="tab" role="tab" data-tab="upcoming" aria-selected="false">
+    <span class="tab-name">Upcoming</span><span class="tab-count" data-count="upcoming">0</span>
+  </button>
+  <button class="tab" role="tab" data-tab="past" aria-selected="false">
+    <span class="tab-name">Past</span><span class="tab-count" data-count="past">0</span>
+  </button>
+</nav>
+
+<main id="main">
+  <section id="list-view" class="view">
+    <div id="cards" class="cards"></div>
+    <p id="empty" class="empty" hidden></p>
+  </section>
+
+  <section id="detail-view" class="view" hidden></section>
+</main>
+
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

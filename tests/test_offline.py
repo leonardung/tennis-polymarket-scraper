@@ -123,16 +123,23 @@ def test_filters() -> None:
 
 
 class FakeAPI:
-    """Duck-types the two methods discovery uses."""
+    """Duck-types the methods discovery and the poller use."""
 
     def __init__(self, events: list[dict]) -> None:
         self._events = events
+        self.slug_calls: list[list[str]] = []
 
     def tag_id(self, slug: str) -> str | None:
         return "864"
 
     def events(self, **_params: object):
         return iter(self._events)
+
+    def events_by_slug(self, slugs):
+        """Targeted fetch, as Gamma's repeated ?slug= gives us."""
+        wanted = list(slugs)
+        self.slug_calls.append(wanted)
+        return [e for e in self._events if e.get("slug") in set(wanted)]
 
 
 def _event(
@@ -594,6 +601,336 @@ def test_poller() -> None:
     check("future times parse", future is not None and future > 0)
 
 
+# --------------------------------------------------------------------------
+# score polling on the tick cadence
+# --------------------------------------------------------------------------
+
+
+def _iso(offset_seconds: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    when = datetime.now(timezone.utc) + timedelta(seconds=offset_seconds)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_score_poll_targeting() -> None:
+    """Which matches the poll asks about -- each event costs ~60 KB to re-read."""
+    print("\nscore poll targeting")
+    from polymarket.poller import Poller, Watched
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "t.db") as store:
+            poller = Poller(FakeAPI([]), store)
+
+            def watch(cid: str, state: str, start: str | None) -> None:
+                poller.watched[cid] = Watched(cid, f"slug-{cid}", start, f"Match {cid}")
+                poller._state[cid] = state
+
+            watch("live", "live", _iso(-3600))
+            watch("ended", "ended", _iso(-7200))
+            watch("soon", "upcoming", _iso(300))          # starts in 5 min
+            watch("later", "upcoming", _iso(6 * 3600))    # starts in 6 hours
+            watch("overdue", "upcoming", _iso(-1800))     # 30 min past its slot
+            watch("abandoned", "upcoming", _iso(-9 * 3600))  # long past
+            watch("undated", "upcoming", None)
+
+            slugs = set(poller._score_slugs())
+            check("a match in play is polled", "slug-live" in slugs)
+            check("a finished match is not", "slug-ended" not in slugs)
+            check("one about to start is polled", "slug-soon" in slugs)
+            check("one hours away is not", "slug-later" not in slugs)
+            check("an overdue match is still polled", "slug-overdue" in slugs)
+            check("one long past its slot is dropped", "slug-abandoned" not in slugs)
+            check("an undated match is polled", "slug-undated" in slugs)
+
+
+def test_score_poll() -> None:
+    print("\nscore poll")
+    from polymarket.poller import Poller
+
+    live = _cincinnati_atp()
+    api = FakeAPI([live])
+    api.books = lambda token_ids: {}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "s.db") as store:
+            poller = Poller(api, store, score_interval=10.0)
+            poller.refresh()
+            check("a live match is watched", len(poller.watched) == 1)
+            check("refresh seeds the known state", set(poller._state.values()) == {"live"})
+
+            # refresh already recorded the opening reading, so a poll that sees
+            # the same score must not write it again.
+            check("an unchanged score writes nothing", poller.poll_scores() == 0)
+            check("the poll asked only about the live match", api.slug_calls[-1] == [live["slug"]])
+
+            live["score"] = "6-3, 4-1"
+            check("a game going by is recorded", poller.poll_scores() == 1)
+            check("and only once", poller.poll_scores() == 0)
+
+            live["period"] = "S3"
+            live["score"] = "6-3, 6-4, 1-0"
+            check("a set change is recorded", poller.poll_scores() == 1)
+
+            row = store.conn.execute(
+                "SELECT period, score FROM markets WHERE condition_id = ?",
+                (next(iter(poller.watched)),),
+            ).fetchone()
+            check("markets carries the latest score", tuple(row) == ("S3", "6-3, 6-4, 1-0"))
+
+            history = store.conn.execute(
+                "SELECT period, score FROM score_events ORDER BY ts"
+            ).fetchall()
+            check("history is the sequence of changes", len(history) == 3)
+            check("first entry is where refresh found it", history[0][1] == "6-3, 3-1")
+            check("last entry is the newest", history[-1][0] == "S3")
+
+            # The match finishing is what should cut the capture short.
+            check("no refresh pending yet", poller._state_changed is False)
+            live["live"], live["ended"], live["period"] = False, True, "FT"
+            poller.poll_scores()
+            check("the end of a match is noticed", poller._state_changed is True)
+            check("but not acted on instantly", poller._refresh_due(time.monotonic() - 5) is False)
+            check("acted on once the gap has passed", poller._refresh_due(time.monotonic() - 90) is True)
+            check("a normal refresh still wins", poller._refresh_due(time.monotonic() - 9999) is True)
+
+            poller.refresh()
+            check("refreshing clears the pending flag", poller._state_changed is False)
+
+
+def test_score_cadence() -> None:
+    """The poll only gets to run between ticks, so its deadline must allow for that."""
+    print("\nscore cadence")
+    from polymarket.poller import Poller
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "c.db") as store:
+            p = Poller(FakeAPI([]), store, interval=10.0, score_interval=10.0)
+            check("polls on the very first tick", p._score_due() is True)
+
+            now = time.monotonic()
+            p._last_score = now
+            check("not due again immediately", p._score_due() is False)
+            # Equal intervals: the deadline lands within the same tick that should
+            # serve it. Without slack this waits a whole extra tick and samples
+            # at half the requested rate.
+            p._last_score = now - 9.9
+            check("the tick at the deadline serves it", p._score_due() is True)
+            p._last_score = now - 4.0
+            check("but not one arriving far too early", p._score_due() is False)
+
+            slow = Poller(FakeAPI([]), store, interval=10.0, score_interval=30.0)
+            slow._last_score = time.monotonic() - 10.0
+            check("a longer interval makes ticks wait", slow._score_due() is False)
+            slow._last_score = time.monotonic() - 29.0
+            check("and fires on the tick nearest it", slow._score_due() is True)
+
+
+def test_score_poll_isolation() -> None:
+    """The score poll must never be able to take the capture down with it."""
+    print("\nscore poll isolation")
+    from polymarket.poller import Poller
+
+    live = _cincinnati_atp()
+    api = FakeAPI([live])
+    api.books = lambda token_ids: {tid: dict(BOOK, asset_id=tid) for tid in token_ids}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "i.db") as store:
+            poller = Poller(api, store)
+            poller.refresh()
+
+            def explode(_slugs):
+                raise RuntimeError("score feed is down")
+
+            api.events_by_slug = explode
+            try:
+                poller.poll_scores()
+                raised = False
+            except RuntimeError:
+                raised = True
+            check("poll_scores itself propagates", raised)
+            # ...and the run loop is what swallows it, so books keep being written.
+            check("books are unaffected", poller.tick() == 2)
+
+            check("scores can be turned off entirely", Poller(api, store, score_interval=0)._score_due() is False)
+
+
+def test_update_scores() -> None:
+    print("\nscore updates")
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]))
+    market = kept[0]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "u.db") as store:
+            # A match the poll sees before discovery inserted it is a no-op, not
+            # a half-built row.
+            store.update_scores(kept)
+            check("no row is invented", store.conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0] == 0)
+
+            store.upsert_markets(kept)
+            before = store.conn.execute(
+                "SELECT raw, question FROM markets WHERE condition_id = ?", (market.condition_id,)
+            ).fetchone()
+
+            market.period, market.score, market.state = "S5", "7-6", "live"
+            store.update_scores(kept)
+            after = store.conn.execute(
+                "SELECT period, score, state, raw, question FROM markets WHERE condition_id = ?",
+                (market.condition_id,),
+            ).fetchone()
+            check("score fields updated", tuple(after[:3]) == ("S5", "7-6", "live"))
+            check("the raw payload is left alone", after[3] == before[0])
+            check("identity is left alone", after[4] == before[1])
+
+
+# --------------------------------------------------------------------------
+# dashboard: state classification, last-trade orientation, series reconstruction
+# --------------------------------------------------------------------------
+
+
+def test_score_events() -> None:
+    print("\nscore history")
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]))
+    market = kept[0]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "t.db") as store:
+            check("first reading recorded", store.record_score_events(kept) == 1)
+            check("unchanged reading not repeated", store.record_score_events(kept) == 0)
+
+            market.score = "6-3, 4-1"
+            check("changed score recorded", store.record_score_events(kept) == 1)
+            market.period = "FT"
+            market.state = "ended"
+            check("changed period recorded", store.record_score_events(kept) == 1)
+
+            rows = store.conn.execute(
+                "SELECT period, score FROM score_events WHERE condition_id = ? ORDER BY ts",
+                (market.condition_id,),
+            ).fetchall()
+            check("history kept in order", [r[1] for r in rows] == ["6-3, 3-1", "6-3, 4-1", "6-3, 4-1"])
+            check("final state recorded", rows[-1][0] == "FT")
+
+
+def test_dashboard_state() -> None:
+    print("\ndashboard state")
+    from polymarket.dashboard.queries import classify
+
+    now = 1_800_000_000.0
+    fresh, stale = now - 10, now - 4000
+    soon = "2099-01-01T00:00:00Z"
+
+    check("ended is past", classify("ended", soon, fresh, now) == "past")
+    check("live and fresh is live", classify("live", None, fresh, now) == "live")
+    # A finished capture leaves its last match sitting at "live" forever.
+    check("live but stale is past", classify("live", None, stale, now) == "past")
+    check("upcoming with a future start", classify("upcoming", soon, fresh, now) == "upcoming")
+
+    # Tennis start times are "not before" times: overdue is normal for a while.
+    from datetime import datetime, timezone
+
+    def iso(offset: float) -> str:
+        return datetime.fromtimestamp(now + offset, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    check("recently overdue stays upcoming", classify("upcoming", iso(-1800), fresh, now) == "upcoming")
+    check("long overdue is past", classify("upcoming", iso(-13 * 3600), fresh, now) == "past")
+    check("overdue with no capture is past", classify("upcoming", iso(-1800), stale, now) == "past")
+    check("unknown state, no start time, stale", classify(None, None, stale, now) == "past")
+
+
+def test_last_trade_orientation() -> None:
+    print("\nlast-trade orientation")
+    from polymarket.dashboard.queries import _orient
+
+    # The stored number is the same on both rows; only its distance to a known
+    # mid says which player it priced.
+    check("already this side", _orient(0.80, 0.81) == 0.80)
+    check("opponent's price is flipped back", abs(_orient(0.19, 0.81) - 0.81) < 1e-9)
+    check("underdog side keeps its own price", abs(_orient(0.19, 0.19) - 0.19) < 1e-9)
+    check("missing trade stays missing", _orient(None, 0.5) is None)
+    check("no mid means no inference", _orient(0.19, None) == 0.19)
+    # A coin-flip market is exactly the case the inference cannot resolve; it
+    # must still return a value on the correct scale rather than blowing up.
+    check("even market resolves to something sane", 0.0 <= _orient(0.5, 0.5) <= 1.0)
+
+
+def test_dashboard_series() -> None:
+    print("\ndashboard series")
+    from polymarket.dashboard import queries
+
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]))
+    market = kept[0]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "t.db"
+        with Store(path) as store:
+            store.upsert_markets(kept)
+            base = 1_800_000_000.0
+            book = dict(BOOK, last_trade_price="0.56")
+            # t0: both sides written. t1: only outcome 0 moved, so outcome 1 has
+            # no row -- exactly what "write only on change" produces.
+            store.insert_snapshots(base, [
+                (parse_book(market.tokens[0], book), market.condition_id, 0, market.outcomes[0]),
+                (parse_book(market.tokens[1], book), market.condition_id, 1, market.outcomes[1]),
+            ])
+            moved = dict(book, bids=[{"price": "0.58", "size": "100"}])
+            store.insert_snapshots(base + 10, [
+                (parse_book(market.tokens[0], moved), market.condition_id, 0, market.outcomes[0]),
+            ])
+            # A side with no offers at all is real data, not a missing row.
+            empty = {"bids": [], "asks": [], "last_trade_price": "0.56"}
+            store.insert_snapshots(base + 20, [
+                (parse_book(market.tokens[1], empty), market.condition_id, 1, market.outcomes[1]),
+            ])
+
+        conn = queries.connect(path)
+        series = queries.match_series(conn, market.condition_id)
+
+        check("one row per distinct timestamp", series["ts"] == [base, base + 10, base + 20])
+        check("both outcomes on the shared grid", len(series["outcomes"]) == 2)
+
+        first, second = series["outcomes"][0], series["outcomes"][1]
+        check("outcome 0 moved at t1", first["bid"] == [0.55, 0.58, 0.58])
+        # The gap at t1 means "unchanged", so the previous book carries forward.
+        check("unchanged outcome carried forward", second["bid"][1] == 0.55)
+        # An emptied book is a stored NULL and must stay NULL, not carry forward.
+        check("emptied book reads as no quote", second["bid"][2] is None)
+        check("no mid without both sides", second["mid"][2] is None)
+        check("depth summed across levels", first["bid_depth"][0] == 100.0 + 250.0 + 900.0)
+        check("last trade oriented to outcome 0", abs(series["last_trade"][0] - 0.56) < 1e-9)
+        check("raw last trade preserved", series["last_trade_raw"][0] == 0.56)
+
+        detail = queries.match_detail(conn, market.condition_id)
+        check("detail found", detail is not None)
+        check("detail reports capture depth", detail["depth"] == 3)
+        # The latest outcome-0 book has one bid; the other two slots are stored
+        # NULL padding and must not surface as empty ladder rows.
+        check("ladder drops NULL padding", len(detail["books"][0]["bids"]) == 1)
+        check("ladder keeps every real ask", len(detail["books"][0]["asks"]) == 3)
+        check("emptied book has no levels", detail["books"][1]["bids"] == [])
+        check("missing match returns nothing", queries.match_detail(conn, "0xdead") is None)
+
+        view = queries.overview(conn)
+        check("overview sees the match", len(view["matches"]) == 1)
+        check("overview counts by tab", sum(view["counts"].values()) == 1)
+        check("sparkline carries the mid series", len(view["matches"][0]["spark"]) == 2)
+        conn.close()
+
+
+def test_decimation() -> None:
+    print("\ndecimation")
+    from polymarket.dashboard.queries import _decimate
+
+    grid = [float(i) for i in range(1000)]
+    kept = _decimate(grid, 100)
+    check("thinned to the cap", len(kept) <= 102)
+    check("first point kept", grid[0] in kept)
+    check("last point kept", grid[-1] in kept)
+    check("short grid untouched", _decimate(grid[:50], 100) == set(grid[:50]))
+    check("every kept point is real", kept <= set(grid))
+
+
 if __name__ == "__main__":
     test_book()
     test_filters()
@@ -603,4 +940,14 @@ if __name__ == "__main__":
     test_migration()
     test_encoded_fields()
     test_poller()
+    test_score_events()
+    test_score_poll_targeting()
+    test_score_poll()
+    test_score_cadence()
+    test_score_poll_isolation()
+    test_update_scores()
+    test_dashboard_state()
+    test_last_trade_orientation()
+    test_dashboard_series()
+    test_decimation()
     print(f"\n{PASSED} checks passed\n")

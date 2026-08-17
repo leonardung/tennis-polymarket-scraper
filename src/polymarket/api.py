@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 import httpx
 
-from .config import BOOKS_CHUNK, CLOB, GAMMA
+from .config import BOOKS_CHUNK, CLOB, GAMMA, SCORE_CHUNK
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +73,26 @@ class Polymarket:
 
     def markets(self, **params: Any) -> Iterator[dict[str, Any]]:
         return self.paginate("/markets", **params)
+
+    def events_by_slug(self, slugs: Sequence[str]) -> list[dict[str, Any]]:
+        """Fetch named events in one request each batch.
+
+        Gamma accepts `slug` repeatedly and returns exactly those events, which
+        is what makes a frequent score poll affordable -- the alternative is
+        paging the whole tennis catalog to re-read a handful of scores.
+        """
+        out: list[dict[str, Any]] = []
+        for start in range(0, len(slugs), SCORE_CHUNK):
+            chunk = slugs[start : start + SCORE_CHUNK]
+            resp = self._client.get(
+                f"{GAMMA}/events", params=[("slug", slug) for slug in chunk]
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if isinstance(payload, dict):
+                payload = payload.get("data") or []
+            out.extend(_decode(event) for event in payload if isinstance(event, dict))
+        return out
 
     def tag_id(self, slug: str) -> str | None:
         """Resolve a Gamma tag slug (e.g. 'tennis') to its numeric id."""

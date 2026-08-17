@@ -14,13 +14,16 @@ from .api import Polymarket
 from .book import Snapshot, parse_book
 from .config import (
     HEARTBEAT,
+    MIN_REFRESH_GAP,
     OVERDUE_RECHECK,
     OVERDUE_WINDOW,
     POLL_INTERVAL,
     REFRESH_INTERVAL,
+    SCORE_INTERVAL,
+    SCORE_LEAD,
     START_GRACE,
 )
-from .discovery import discover
+from .discovery import discover, markets_from_event
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -31,6 +34,16 @@ class Tracked:
     condition_id: str
     outcome_index: int
     outcome: str
+    question: str
+
+
+@dataclass(frozen=True)
+class Watched:
+    """A match whose score feed can be re-read without a catalog page."""
+
+    condition_id: str
+    event_slug: str
+    start_time: str | None
     question: str
 
 
@@ -77,6 +90,7 @@ class Poller:
         live_only: bool = True,
         only_changes: bool = True,
         heartbeat: float = HEARTBEAT,
+        score_interval: float = SCORE_INTERVAL,
     ) -> None:
         self.api = api
         self.store = store
@@ -87,10 +101,15 @@ class Poller:
         self.live_only = live_only
         self.only_changes = only_changes
         self.heartbeat = heartbeat
+        self.score_interval = score_interval
         self.tracked: dict[str, Tracked] = {}
+        self.watched: dict[str, Watched] = {}  # by condition_id
+        self._state: dict[str, str] = {}  # last seen live/upcoming/ended
         self._last_fingerprint: dict[str, tuple] = {}
         self._last_write: dict[str, float] = {}
         self._next_start: float | None = None  # monotonic deadline
+        self._last_score: float = 0.0  # monotonic; 0 = poll on the first tick
+        self._state_changed = False
         self._stop = False
 
     # ---------------- lifecycle ----------------
@@ -128,7 +147,23 @@ class Poller:
             self._last_fingerprint.pop(token, None)
             self._last_write.pop(token, None)
 
+        # discover() has just read the score feed for everything it returned, so
+        # its verdict is the authority here -- overwrite rather than merge, and
+        # forget matches that are no longer being followed.
+        self.watched = {
+            market.condition_id: Watched(
+                condition_id=market.condition_id,
+                event_slug=market.event_slug,
+                start_time=market.start_time,
+                question=market.question,
+            )
+            for market in kept
+        }
+        self._state = {m.condition_id: m.state for m in kept}
+        self._state_changed = False
+
         self.store.upsert_markets(kept)
+        self.store.record_score_events(kept)
         self._schedule_next_start(skipped)
 
         # Only say "live" when that is what is being tracked; with
@@ -184,6 +219,92 @@ class Poller:
         else:
             self._next_start = None
 
+    # ---------------- score feed ----------------
+
+    def _score_slugs(self) -> list[str]:
+        """Which matches are worth re-reading the score feed for right now.
+
+        Every event comes back with its whole market list attached and there is
+        no parameter to trim it, so the request costs roughly half a megabyte per
+        eight matches. Asking only for matches whose score can actually move --
+        those in play, and those close enough to their slot to start at any
+        moment -- keeps a 10-second poll proportionate to what is on court
+        rather than to how much of the draw happens to be in the database.
+        """
+        slugs = []
+        for condition_id, watched in self.watched.items():
+            state = self._state.get(condition_id, "upcoming")
+            if state == "live":
+                slugs.append(watched.event_slug)
+                continue
+            if state == "ended":
+                continue
+            delta = _seconds_from_now(watched.start_time)
+            if delta is None:
+                slugs.append(watched.event_slug)  # no scheduled time: keep watching
+            elif -OVERDUE_WINDOW <= delta <= SCORE_LEAD:
+                slugs.append(watched.event_slug)
+        return sorted(set(slugs))
+
+    def poll_scores(self) -> int:
+        """Re-read the score feed for the matches in play. Returns rows written."""
+        slugs = self._score_slugs()
+        if not slugs:
+            return 0
+
+        readings = []
+        for event in self.api.events_by_slug(slugs):
+            found, _ = markets_from_event(
+                event,
+                all_markets=self.all_markets,
+                include_qualifying=self.include_qualifying,
+                # Never live_only: the whole point is to catch a match the moment
+                # it leaves that state, which filtering it out would hide.
+                live_only=False,
+            )
+            readings.extend(found)
+        if not readings:
+            return 0
+
+        self.store.update_scores(readings)
+        written = self.store.record_score_events(readings)
+
+        moved = []
+        for market in readings:
+            previous = self._state.get(market.condition_id)
+            if previous is not None and previous != market.state:
+                moved.append((market.question, previous, market.state))
+            self._state[market.condition_id] = market.state
+        for question, before, after in moved:
+            log.info("score feed: %s is now %s (was %s)", question, after, before)
+        if moved:
+            self._state_changed = True
+
+        # Quiet on the common case -- most polls of a live match find the same
+        # game still in progress -- but say so when the score actually moves.
+        live = [m for m in readings if m.state == "live"]
+        log.log(
+            logging.INFO if written else logging.DEBUG,
+            "score: %d match(es) polled, %d change(s)%s",
+            len(slugs),
+            written,
+            "".join(f" | {m.period} {m.score}" for m in live) if written and live else "",
+        )
+        return written
+
+    def _score_due(self) -> bool:
+        """True when the score feed is due to be re-read.
+
+        The poll can only run between ticks, so a deadline landing a hair after
+        the tick that should have served it would wait out a whole extra tick --
+        with the two intervals equal, that halves the sampling rate. Allowing
+        half a tick of slack takes the nearest tick instead.
+        """
+        if self.score_interval <= 0:
+            return False
+        slack = self.interval / 2
+        return time.monotonic() - self._last_score >= self.score_interval - slack
+
     # ---------------- one snapshot ----------------
 
     def tick(self) -> int:
@@ -235,7 +356,14 @@ class Poller:
     # ---------------- loop ----------------
 
     def _refresh_due(self, last_refresh: float) -> bool:
-        if time.monotonic() - last_refresh >= self.refresh_interval:
+        elapsed = time.monotonic() - last_refresh
+        if elapsed >= self.refresh_interval:
+            return True
+        # A match starting or finishing changes what should be captured, so act
+        # on it rather than waiting out the interval. Rate-limited: `live` is
+        # known to flicker between polls, and a refresh pages the whole tennis
+        # catalog -- a flapping match must not turn that into a loop.
+        if self._state_changed and elapsed >= MIN_REFRESH_GAP:
             return True
         return self._next_start is not None and time.monotonic() >= self._next_start
 
@@ -253,6 +381,17 @@ class Poller:
                 log.error("tick failed (%s), continuing", exc)
             except Exception:  # noqa: BLE001 - a bad tick must not kill the capture
                 log.exception("unexpected error in tick, continuing")
+
+            if self._score_due():
+                # Stamped before the call, not after, so a slow or failing poll
+                # cannot push the next one further and further out.
+                self._last_score = time.monotonic()
+                try:
+                    self.poll_scores()
+                except httpx.HTTPError as exc:
+                    log.warning("score poll failed (%s), continuing", exc)
+                except Exception:  # noqa: BLE001 - the books matter more than the score
+                    log.exception("unexpected error in score poll, continuing")
 
             if self._refresh_due(last_refresh):
                 try:

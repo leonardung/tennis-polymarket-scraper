@@ -90,6 +90,19 @@ CREATE TABLE IF NOT EXISTS books (
     PRIMARY KEY (token_id, ts)
 ) WITHOUT ROWID;
 
+-- markets.period/score hold only the latest value, which says where a match
+-- stands but not when it got there. Reading a price move against the point that
+-- caused it needs the score to carry a timestamp, so every change is appended
+-- here as well.
+CREATE TABLE IF NOT EXISTS score_events (
+    ts            REAL,
+    condition_id  TEXT,
+    state         TEXT,
+    period        TEXT,
+    score         TEXT,
+    PRIMARY KEY (condition_id, ts)
+) WITHOUT ROWID;
+
 """
 
 # Applied after _migrate(): indexes and the view both reference columns that an
@@ -98,6 +111,11 @@ CREATE TABLE IF NOT EXISTS books (
 VIEWS = """
 CREATE INDEX IF NOT EXISTS books_by_market ON books (condition_id, ts);
 CREATE INDEX IF NOT EXISTS books_by_ts ON books (ts);
+CREATE INDEX IF NOT EXISTS score_events_by_market ON score_events (condition_id, ts);
+-- Lets a reader seek straight to one player's latest rows instead of scanning
+-- the table. Without it the dashboard's per-match lookups degrade into a full
+-- scan once a season's worth of ticks has accumulated.
+CREATE INDEX IF NOT EXISTS books_by_outcome ON books (condition_id, outcome_index, ts);
 
 DROP VIEW IF EXISTS quotes;
 CREATE VIEW quotes AS
@@ -209,6 +227,54 @@ class Store:
             """,
             rows,
         )
+        return len(rows)
+
+    def update_scores(self, markets: Iterable[TennisMarket]) -> int:
+        """Refresh only the score fields on rows that already exist.
+
+        The score poll runs on the tick cadence, so it wants the cheapest write
+        that keeps `markets` current -- not upsert_markets, which would also
+        re-serialise the raw API payload every few seconds to store it unchanged.
+        A match the poll sees before discovery has inserted it is simply skipped;
+        the next refresh puts it in.
+        """
+        now = time.time()
+        rows = [(m.state, m.period, m.score, now, m.condition_id) for m in markets]
+        self.conn.executemany(
+            "UPDATE markets SET state = ?, period = ?, score = ?, last_seen = ? "
+            "WHERE condition_id = ?",
+            rows,
+        )
+        return len(rows)
+
+    def record_score_events(self, markets: Iterable[TennisMarket]) -> int:
+        """Append a row for every match whose state, period or score has moved.
+
+        Only changes are stored: the score feed is re-read on every poll, so
+        writing each reading unconditionally would bury the handful of moments
+        that matter under thousands of identical rows. Resolution is therefore
+        the score-poll interval, which tracks the book cadence rather than the
+        market-list refresh -- fine enough to place individual games.
+        """
+        now = time.time()
+        rows = []
+        for market in markets:
+            current = (market.state, market.period, market.score)
+            previous = self.conn.execute(
+                "SELECT state, period, score FROM score_events "
+                "WHERE condition_id = ? ORDER BY ts DESC LIMIT 1",
+                (market.condition_id,),
+            ).fetchone()
+            if previous is not None and tuple(previous) == current:
+                continue
+            rows.append((now, market.condition_id, *current))
+
+        if rows:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO score_events "
+                "(ts, condition_id, state, period, score) VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
         return len(rows)
 
     def insert_snapshots(

@@ -116,6 +116,95 @@ def _events(api: Polymarket, max_pages: int) -> Iterable[dict[str, Any]]:
     return api.events(closed=False, tag_id=tag, max_pages=max_pages)
 
 
+def markets_from_event(
+    event: dict[str, Any],
+    all_markets: bool = False,
+    include_qualifying: bool = False,
+    live_only: bool = False,
+) -> tuple[list[TennisMarket], list[Skipped]]:
+    """Apply the three gates to a single event and build the markets it yields.
+
+    Split out of ``discover`` so the score poller can re-read a known event
+    through exactly the same rules. Sharing it is the point: a second copy of
+    the filter would be free to drift from the one that chose what to capture,
+    and then the scores would describe a different set of matches than the books.
+    """
+    kept: list[TennisMarket] = []
+    skipped: list[Skipped] = []
+
+    title = str(event.get("title") or "")
+    slug = str(event.get("slug") or "")
+
+    parsed = MATCH_SLUG.match(slug)
+    if parsed is None:
+        return kept, skipped  # outright/futures event, not a head-to-head
+    if parsed.group("tour") != "atp" or parsed.group("doubles"):
+        return kept, skipped  # WTA, ITF, or doubles
+
+    name = _tournament_of(title)
+    tournament = match_tournament(name)
+    if tournament is None:
+        return kept, skipped  # Challenger or unrecognised event
+    if EXCLUDE.search(title):
+        skipped.append(Skipped(title, slug, "non-tour format"))
+        return kept, skipped
+    if QUALIFYING.search(title) and not include_qualifying:
+        skipped.append(Skipped(title, slug, "qualifying"))
+        return kept, skipped
+
+    state = match_state(event)
+    if live_only and state != "live":
+        # start_time rides along so the poller knows when to look again.
+        skipped.append(Skipped(title, slug, state, event.get("startTime")))
+        return kept, skipped
+
+    for market in event.get("markets") or []:
+        if not isinstance(market, dict):
+            continue
+        question = str(market.get("question") or "")
+        is_moneyline = question == title
+        if not is_moneyline and not all_markets:
+            continue
+        if not _is_tradeable(market):
+            if is_moneyline:
+                skipped.append(Skipped(title, slug, "not accepting orders"))
+            continue
+        tokens = _binary_tokens(market)
+        if tokens is None:
+            skipped.append(Skipped(question, slug, "malformed token ids"))
+            continue
+        outcomes, token_ids = tokens
+        condition_id = str(market.get("conditionId") or "")
+        if not condition_id:
+            continue
+
+        kept.append(
+            TennisMarket(
+                condition_id=condition_id,
+                question=question,
+                slug=str(market.get("slug") or ""),
+                event_slug=slug,
+                event_title=title,
+                tournament=tournament.name,
+                tier=tournament.tier,
+                tour="atp",
+                match_date=parsed.group("date"),
+                market_type="moneyline" if is_moneyline else "derivative",
+                state=state,
+                start_time=event.get("startTime"),
+                period=event.get("period"),
+                score=event.get("score"),
+                outcomes=outcomes,
+                tokens=token_ids,
+                start_date=market.get("startDate") or event.get("startDate"),
+                end_date=market.get("endDate") or event.get("endDate"),
+                raw=market,
+            )
+        )
+
+    return kept, skipped
+
+
 def discover(
     api: Polymarket,
     all_markets: bool = False,
@@ -133,74 +222,13 @@ def discover(
     skipped: list[Skipped] = []
 
     for event in _events(api, max_pages):
-        title = str(event.get("title") or "")
-        slug = str(event.get("slug") or "")
-
-        parsed = MATCH_SLUG.match(slug)
-        if parsed is None:
-            continue  # outright/futures event, not a head-to-head
-        if parsed.group("tour") != "atp" or parsed.group("doubles"):
-            continue  # WTA, ITF, or doubles
-
-        name = _tournament_of(title)
-        tournament = match_tournament(name)
-        if tournament is None:
-            continue  # Challenger or unrecognised event
-        if EXCLUDE.search(title):
-            skipped.append(Skipped(title, slug, "non-tour format"))
-            continue
-        if QUALIFYING.search(title) and not include_qualifying:
-            skipped.append(Skipped(title, slug, "qualifying"))
-            continue
-
-        state = match_state(event)
-        if live_only and state != "live":
-            # start_time rides along so the poller knows when to look again.
-            skipped.append(Skipped(title, slug, state, event.get("startTime")))
-            continue
-
-        for market in event.get("markets") or []:
-            if not isinstance(market, dict):
-                continue
-            question = str(market.get("question") or "")
-            is_moneyline = question == title
-            if not is_moneyline and not all_markets:
-                continue
-            if not _is_tradeable(market):
-                if is_moneyline:
-                    skipped.append(Skipped(title, slug, "not accepting orders"))
-                continue
-            tokens = _binary_tokens(market)
-            if tokens is None:
-                skipped.append(Skipped(question, slug, "malformed token ids"))
-                continue
-            outcomes, token_ids = tokens
-            condition_id = str(market.get("conditionId") or "")
-            if not condition_id:
-                continue
-
-            kept.append(
-                TennisMarket(
-                    condition_id=condition_id,
-                    question=question,
-                    slug=str(market.get("slug") or ""),
-                    event_slug=slug,
-                    event_title=title,
-                    tournament=tournament.name,
-                    tier=tournament.tier,
-                    tour="atp",
-                    match_date=parsed.group("date"),
-                    market_type="moneyline" if is_moneyline else "derivative",
-                    state=state,
-                    start_time=event.get("startTime"),
-                    period=event.get("period"),
-                    score=event.get("score"),
-                    outcomes=outcomes,
-                    tokens=token_ids,
-                    start_date=market.get("startDate") or event.get("startDate"),
-                    end_date=market.get("endDate") or event.get("endDate"),
-                    raw=market,
-                )
-            )
+        found, missed = markets_from_event(
+            event,
+            all_markets=all_markets,
+            include_qualifying=include_qualifying,
+            live_only=live_only,
+        )
+        kept.extend(found)
+        skipped.extend(missed)
 
     return kept, skipped

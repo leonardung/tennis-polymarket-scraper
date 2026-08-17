@@ -15,7 +15,15 @@ import httpx
 
 from . import resolver
 from .api import Polymarket
-from .config import BOOK_DEPTH, CLOB, GAMMA, HEARTBEAT, POLL_INTERVAL, REFRESH_INTERVAL
+from .config import (
+    BOOK_DEPTH,
+    CLOB,
+    GAMMA,
+    HEARTBEAT,
+    POLL_INTERVAL,
+    REFRESH_INTERVAL,
+    SCORE_INTERVAL,
+)
 from .discovery import discover
 from .poller import Poller
 from .store import Store
@@ -93,14 +101,16 @@ def cmd_run(args: argparse.Namespace) -> int:
             live_only=not args.include_upcoming,
             only_changes=not args.every_tick,
             heartbeat=args.heartbeat,
+            score_interval=args.score_interval,
         )
         logging.info(
-            "capturing depth-%d books every %.0fs into %s (%s matches, %s)",
+            "capturing depth-%d books every %.0fs into %s (%s matches, %s, scores %s)",
             BOOK_DEPTH,
             args.interval,
             args.db,
             "live + upcoming" if args.include_upcoming else "live",
             "every tick" if args.every_tick else "on change",
+            f"every {args.score_interval:.0f}s" if args.score_interval > 0 else "off",
         )
         poller.run()
     return 0
@@ -125,6 +135,23 @@ def cmd_stats(args: argparse.Namespace) -> int:
         for tournament, markets, snaps in rows:
             print(f"  {(tournament or '-'):<20} {markets:>8} {snaps:>10}")
     print()
+    return 0
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the web dashboard over an existing capture database.
+
+    Read-only, like `sql`, so this is safe to leave open beside a running
+    capture -- it can neither block a write nor damage the recording.
+    """
+    from .dashboard import serve
+
+    path = Path(args.db)
+    if not path.exists():
+        print(f"no database at {path} -- has `polymarket run` been started?", file=sys.stderr)
+        return 1
+
+    serve(path, host=args.host, port=args.port, open_browser=not args.no_open)
     return 0
 
 
@@ -239,6 +266,12 @@ def main(argv: list[str] | None = None) -> int:
         default=HEARTBEAT,
         help=f"write an unchanged book at least this often, seconds (default {HEARTBEAT:.0f})",
     )
+    p_run.add_argument(
+        "--score-interval",
+        type=float,
+        default=SCORE_INTERVAL,
+        help=f"seconds between score-feed polls, 0 to disable (default {SCORE_INTERVAL:.0f})",
+    )
     p_run.set_defaults(func=cmd_run, needs_network=True)
 
     p_stats = sub.add_parser(
@@ -255,6 +288,14 @@ def main(argv: list[str] | None = None) -> int:
         help="SQL to run; omit to show the most recent quote for every match",
     )
     p_sql.set_defaults(func=cmd_sql, needs_network=False)
+
+    p_dash = sub.add_parser(
+        "dashboard", parents=[common], help="browse the capture in a browser (read-only)"
+    )
+    p_dash.add_argument("--port", type=int, default=8787)
+    p_dash.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
+    p_dash.add_argument("--no-open", action="store_true", help="do not open a browser")
+    p_dash.set_defaults(func=cmd_dashboard, needs_network=False)
 
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)

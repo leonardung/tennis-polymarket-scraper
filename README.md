@@ -9,13 +9,17 @@ into SQLite.
 ```bash
 uv run polymarket discover     # list the matches that would be captured
 uv run polymarket run          # start capturing (Ctrl-C to stop)
+uv run polymarket dashboard    # browse it in a browser
 uv run polymarket stats        # summarise the database
 uv run polymarket sql          # latest quote for every match
 uv run polymarket sql "SELECT ..."   # any query
 ```
 
-`stats` and `sql` are safe to run while `run` is recording — they open the database
-read-only, so a query can neither block nor damage the capture.
+`dashboard`, `stats` and `sql` are safe to run while `run` is recording — they open
+the database read-only, so a query can neither block nor damage the capture. (The
+dashboard opens it writable once at startup, to add any indexes an older database
+is missing; that is the same idempotent migration `run` performs on every start,
+and every query it then serves is read-only.)
 
 Run `discover` first to see what's on, then leave `run` going. It captures only
 matches actually in play, picks up each new match as it starts, and drops it when
@@ -31,8 +35,53 @@ it finishes — so it can stay running across a whole tournament unattended.
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
+| `--score-interval N` | `10` | seconds between score-feed polls; `0` disables |
 | `--dns MODE` | `auto` | see [DNS.md](DNS.md) |
 | `-v` | off | verbose logging |
+
+## Dashboard
+
+```bash
+uv run polymarket dashboard          # http://127.0.0.1:8787, opens a browser
+uv run polymarket dashboard --port 9000 --no-open
+```
+
+Three tabs — **Live**, **Upcoming**, **Past** — over the same database `run` is
+writing. It polls for new snapshots every 5 seconds, so a live match updates in
+front of you; leave it open beside the capture.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--port N` | `8787` | port to serve on |
+| `--host H` | `127.0.0.1` | bind address; localhost only by default |
+| `--no-open` | off | don't open a browser |
+
+Each card shows both players' current prices, the score, and a sparkline. Opening
+a match gives its full history:
+
+- **Price** — both players' mid over time, with the last traded price overlaid.
+- **Spread** — how far apart the two sides sit, and where quotes went missing.
+- **Depth** — shares resting on each side, so you can see liquidity arrive or leave.
+- **Order book** — the live 3-level ladder for both players.
+- **Table view** — the same numbers as text, for reading exact values.
+
+Set and game changes are drawn on every chart as vertical rules, and the hover
+readout names the score at that moment — this comes from `score_events`, so it
+only covers matches recorded after that table existed.
+
+Which tab a match lands in comes from the score feed's `state`, plus how recently
+the capture saw it: a match still marked `live` that nothing has touched for 15
+minutes has finished, not stalled, so it moves to **Past**. A scheduled match
+stays in **Upcoming** past its start time — tennis start times are "not before"
+times — but not indefinitely.
+
+The last-trade line is inferred, and the chart says so. Polymarket reports one
+last-traded price per match oriented to whichever side traded last (see
+`market_last_trade` below), and nothing in the record says which side that was.
+The dashboard re-expresses it as the first player by which of the two mids it
+sits nearer to. That is a good guess when the players are priced apart and a
+coin-flip when they aren't; `last_trade_raw` in the API response is the
+untouched value.
 
 ## Which matches are captured
 
@@ -46,6 +95,29 @@ is not the same as "still playing" — the match state comes from the live score
 feed instead. Matches are picked up as they start (including late starts, which
 are the norm) and dropped once they end. Pass `--include-upcoming` to also poll
 matches that haven't started.
+
+## The score feed
+
+The score is read on the book cadence, not the market-list one — every
+`--score-interval` seconds (10 by default), against only the matches whose score
+can actually change: those in play, and those within 15 minutes of their slot.
+Each change lands in `score_events`, so a price move can be read against the game
+that caused it. At refresh-rate sampling a whole service game fits between two
+readings; at 10 seconds none do.
+
+Two things follow from it beyond the score itself:
+
+- **A match starting or finishing is noticed within a tick**, not at the next
+  refresh. `run` reacts by refreshing early, so a finished match stops being
+  captured in seconds rather than minutes. Rate-limited to one triggered refresh
+  a minute — the feed's `live` flag is known to flicker, and a refresh pages the
+  whole tennis catalog.
+- **It costs bandwidth.** Gamma has no endpoint that returns a score without the
+  event's entire market list, and no parameter trims it, so each match costs about
+  60 KB per poll — roughly 25 KB/s with four matches in play, 50 KB/s with eight.
+  Raise `--score-interval` to trade resolution for traffic (30s still resolves
+  every game), or pass `0` to switch it off and fall back to whatever the
+  market-list refresh happens to catch.
 
 `discover` shows everything with its state; `discover --live-only` shows exactly
 what `run` would capture:
@@ -64,7 +136,7 @@ won't appear. `discover` is the way to check when a new event starts.
 
 ## What gets stored
 
-Two tables and a view, in one SQLite file.
+Three tables and a view, in one SQLite file.
 
 **`markets`** — one row per match:
 
@@ -108,6 +180,21 @@ opponent's price — Tommy Paul's row can read `0.19` while his own mid is `0.81
 Use it per match, and don't compare it to that row's `mid`. Everything else in the
 table is genuinely per-player.
 
+**`score_events`** — one row each time a match's `state`, `period` or `score`
+changes: `ts`, `condition_id`, `state`, `period`, `score`.
+
+`markets` holds only the latest score, which says where a match stands but not
+when it got there — so a price move can't be read against the point that caused
+it. This table timestamps every change. Only changes are written, and the feed is
+re-read every `--score-interval` seconds, so a row lands within about 10 seconds
+of the game that produced it.
+
+```sql
+-- what the score was doing while the price moved
+SELECT datetime(ts,'unixepoch') AS t, period, score
+FROM score_events WHERE condition_id = '0x...' ORDER BY ts;
+```
+
 **`quotes`** — a view that spells out the direction, since bid/ask is easy to
 invert:
 
@@ -142,5 +229,5 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 120 checks, no network needed
+uv run python tests/test_offline.py   # 201 checks, no network needed
 ```

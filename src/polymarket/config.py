@@ -19,6 +19,17 @@ OVERDUE_WINDOW = 6 * 3600.0  # stop expecting a match this long after its start 
 BOOK_DEPTH = 3  # levels captured per side
 BOOKS_CHUNK = 50  # token_ids per batched /books request
 
+# The score feed is read on its own cadence, alongside the books rather than
+# with the market-list refresh. A service game lasts a couple of minutes, so
+# refresh-rate sampling (5 minutes) can miss whole games; this resolves them.
+SCORE_INTERVAL = 10.0  # seconds between score-feed polls; 0 disables
+SCORE_CHUNK = 20  # event slugs per batched /events request
+# Each event comes back with its full market list attached and no way to ask for
+# less, so the poll is aimed at the matches whose score can actually change:
+# those in play, and those close enough to their slot to start at any moment.
+SCORE_LEAD = 900.0  # also poll matches starting within this many seconds
+MIN_REFRESH_GAP = 60.0  # floor between refreshes triggered by a state change
+
 
 @dataclass(frozen=True)
 class Tournament:
