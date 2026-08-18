@@ -690,6 +690,12 @@ MATCH_FEED = "AC÷3¬BA÷6¬BB÷4¬RC÷0:38¬~BC÷6¬DC÷3¬BD÷7¬DD÷7¬RD÷0:
 # What a match that has not been played answers with: TV listings, no status.
 EMPTY_FEED = "PSPH÷12¬PSPA÷22¬TA÷Arena Premium 5 (Srb)¬A1÷¬~"
 
+# The live feed, which is the only one carrying the points in the current game.
+# DP/DQ are those points, DR is who is serving, DN/DO the games in the set.
+LIVE_FEED = "DA÷2¬DB÷17¬DE÷0¬DF÷0¬DN÷1¬DO÷2¬DP÷15¬DQ÷40¬DR÷1¬~"
+# The same keys on a match that is over hold something else entirely.
+DONE_FEED = "DA÷3¬DB÷3¬DE÷2¬DF÷0¬DP÷12¬DQ÷7¬DR÷0¬~"
+
 
 def test_score_feed() -> None:
     print("\nscore feed parsing")
@@ -738,6 +744,24 @@ def test_score_feed() -> None:
     check("a tiebreak is still that set", _read_status({"AC": "48"}) == ("live", "S2"))
     check("retired is over", _read_status({"AC": "8"}) == ("ended", "RET"))
     check("postponed is still to come", _read_status({"AC": "4"}) == ("upcoming", "POST"))
+
+    # Points come off the other per-match feed, and only mean points while a
+    # set is being played -- a finished match reports its total games in the
+    # same keys, which is why the period has to gate them.
+    from polymarket.scores import parse_blocks, read_points
+
+    live = parse_blocks(LIVE_FEED)[0]
+    check("points read from the live feed", read_points(live, "S1") == ("15", "40"))
+    check("a tiebreak counts in whole points", read_points({"DP": "5", "DQ": "7"}, "S3") == ("5", "7"))
+    check("no points once the match is over", read_points(parse_blocks(DONE_FEED)[0], "FT") is None)
+    check("nor while it is interrupted", read_points(live, "INT") is None)
+    check("nor before it starts", read_points(live, None) is None)
+    check("nonsense is not a score", read_points({"DP": "x", "DQ": "y"}, "S1") is None)
+
+    scored = Reading("live", "S1", (SetScore(1, 2),), ("15", "40"))
+    check("the game reads in feed order", scored.game() == "15-40")
+    check("and flips with the score", scored.game(flip=True) == "40-15")
+    check("no points, no game", Reading("live", "S1", (SetScore(1, 2),)).game() is None)
 
     # A day with no tour matches on it and a feed that cannot be reached must
     # not look the same: one is an answer, the other is the absence of one.
@@ -963,6 +987,19 @@ def test_score_ratchet() -> None:
     took = [patient.accept("m", x) for _ in range(6) for x in (stale, good)]
     check("flapping never wears the ratchet down", took.count(True) == 6)
     check("and it stays on the newer score", patient.latest("m").line() == "4-2")
+
+    # Points are the one part that legitimately goes backwards -- deuce comes
+    # round again and again -- so they are exempt from the ratchet entirely.
+    game = Ratchet()
+    game.accept("m", Reading("live", "S1", (SetScore(3, 2),), ("0", "0")))
+    for a, b in [("15", "0"), ("15", "15"), ("40", "40"), ("A", "40"), ("40", "40")]:
+        got = game.accept("m", Reading("live", "S1", (SetScore(3, 2),), (a, b)))
+        check(f"points {a}-{b} get through", got is True)
+    check("and the score underneath is untouched", game.latest("m").line() == "3-2")
+    check(
+        "a rewind is still caught even with points on it",
+        game.accept("m", Reading("live", "S1", (SetScore(2, 2),), ("0", "0"))) is False,
+    )
 
     # Matches that are over stop being tracked, so their history is dropped.
     ratchet.forget(["other"])
@@ -1243,6 +1280,23 @@ def test_score_events() -> None:
             ).fetchall()
             check("history kept in order", [r[1] for r in rows] == ["6-3, 3-1", "6-3, 4-1", "6-3, 4-1"])
             check("final state recorded", rows[-1][0] == "FT")
+
+            # Points move within a game, so they are a change worth a row even
+            # when the score has not moved -- that is what the chart reads out
+            # on hover. The marks stay on the games; see scoreMarkers.
+            live = ScoreRow(cid, "live", "S2", "6-3, 4-1", "30-40")
+            check("points are recorded", store.record_score_events([live]) == 1)
+            check("the same points are not", store.record_score_events([live]) == 0)
+            check(
+                "the next point is",
+                store.record_score_events([ScoreRow(cid, "live", "S2", "6-3, 4-1", "40-40")]) == 1,
+            )
+            games = store.conn.execute(
+                "SELECT score, game FROM score_events WHERE condition_id = ? ORDER BY ts",
+                (cid,),
+            ).fetchall()
+            check("the score underneath is unchanged", games[-1][0] == games[-2][0] == "6-3, 4-1")
+            check("and the points differ", (games[-2][1], games[-1][1]) == ("30-40", "40-40"))
 
 
 def test_dashboard_state() -> None:

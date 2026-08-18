@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Sequence
 
 import httpx
@@ -123,6 +123,38 @@ _SET_KEYS = (
     ("BG", "BH", "DG", "DH"),
     ("BI", "BJ", "DI", "DJ"),
 )
+
+# The live feed's keys, which are its own: `dc_` names things differently from
+# the day card. Only the points are taken from it -- the status and the set
+# scores come from `df_sur_`, which is read anyway.
+_POINTS_HOME, _POINTS_AWAY = "DP", "DQ"
+
+# What a point can read as inside a game. A tiebreak counts in plain numbers
+# instead, so those are taken as they come.
+_GAME_POINTS = frozenset({"0", "15", "30", "40", "A", "AD"})
+
+
+def in_a_game(period: str | None) -> bool:
+    """True while a set is being played, which is when points mean points."""
+    return bool(period and len(period) == 2 and period[0] == "S" and period[1].isdigit())
+
+
+def read_points(block: dict[str, str], period: str | None) -> tuple[str, str] | None:
+    """The points in the game being played, if one is.
+
+    Only while a set is in progress. Outside that these keys hold something
+    else entirely -- a finished match reports 12 and 7, which are its total
+    games -- and the period is what says which it is.
+    """
+    if not in_a_game(period):
+        return None
+    home, away = block.get(_POINTS_HOME, ""), block.get(_POINTS_AWAY, "")
+    if home in _GAME_POINTS and away in _GAME_POINTS:
+        return (home, away)
+    if home.isdigit() and away.isdigit():
+        return (home, away)  # tiebreak, counted in points rather than 15s
+    return None
+
 
 # Name fragments that carry no identity of their own. "de Minaur" and "Auger-
 # Aliassime" still match on their distinctive parts, and dropping these stops a
@@ -204,6 +236,9 @@ class Reading:
     state: str  # "live", "upcoming" or "ended"
     period: str | None  # "S2", "FT", "INT", ...
     sets: tuple[SetScore, ...] = ()
+    # Points in the game being played, home then away: ("30", "40"). Raw counts
+    # during a tiebreak. None whenever no game is in progress.
+    points: tuple[str, str] | None = None
 
     def line(self, flip: bool = False) -> str | None:
         """The set scores as one string, e.g. ``"6-4, 6-7(3), 2-1"``.
@@ -214,6 +249,18 @@ class Reading:
         if not self.sets:
             return None
         return ", ".join(s.render(flip) for s in self.sets)
+
+    def game(self, flip: bool = False) -> str | None:
+        """The game in progress, e.g. ``"30-40"``, in the same order as `line`."""
+        if self.points is None:
+            return None
+        home, away = self.points
+        return f"{away}-{home}" if flip else f"{home}-{away}"
+
+    @property
+    def without_points(self) -> tuple[str, str | None, tuple[SetScore, ...]]:
+        """Everything but the points, which move differently -- see Ratchet."""
+        return (self.state, self.period, self.sets)
 
 
 @dataclass(frozen=True)
@@ -257,9 +304,17 @@ class Paired:
         """
         return reading.line(self.flip) if self.oriented else None
 
+    def render_game(self, reading: Reading) -> str | None:
+        """The points in the game being played, in the market's player order."""
+        return reading.game(self.flip) if self.oriented else None
+
     @property
     def score(self) -> str | None:
         return self.render(self.reading)
+
+    @property
+    def game(self) -> str | None:
+        return self.render_game(self.reading)
 
 
 def _read_status(block: dict[str, str]) -> tuple[str, str | None] | None:
@@ -512,8 +567,26 @@ class Flashscore:
         return ScoreBoard(matches)
 
     def reading(self, match_id: str) -> Reading | None:
-        """Re-read one match's score from its own feed."""
-        return parse_reading(self._get(f"df_sur_{SPORT}_{match_id}", timeout=SCORE_TIMEOUT))
+        """Re-read one match's score, and the game it is in, from its own feeds.
+
+        Two small requests: ``df_sur_`` for the status and the set-by-set score,
+        ``dc_`` for the points. The second is the optional one -- a score
+        without its points is still a score, so a failure there is not allowed
+        to lose the reading.
+        """
+        base = parse_reading(self._get(f"df_sur_{SPORT}_{match_id}", timeout=SCORE_TIMEOUT))
+        # Nobody is serving between sets, before the start or during a rain
+        # delay, so there is nothing to ask the second feed for.
+        if base is None or not in_a_game(base.period):
+            return base
+        try:
+            blocks = parse_blocks(self._get(f"dc_{SPORT}_{match_id}", timeout=SCORE_TIMEOUT))
+        except (httpx.HTTPError, ValueError) as exc:
+            log.debug("score feed: no points for %s (%s)", match_id, exc)
+            return base
+        if not blocks:
+            return base
+        return replace(base, points=read_points(blocks[0], base.period))
 
     def readings(self, match_ids: Sequence[str]) -> dict[str, Reading]:
         """Re-read several matches, one after another. Failures are simply absent.
@@ -586,9 +659,15 @@ class Ratchet:
         return self._best.get(key)
 
     def accept(self, key: str, reading: Reading) -> bool:
-        """True if this reading should be written down, and remember it if so."""
+        """True if this reading should be written down, and remember it if so.
+
+        Points are exempt. They are the one part of a reading that legitimately
+        goes backwards -- deuce comes round again and again -- so a reading that
+        only differs there is passed through rather than measured.
+        """
         best = self._best.get(key)
-        if best is None or reading == best or progress(reading) > progress(best):
+        unmoved = best is not None and reading.without_points == best.without_points
+        if best is None or unmoved or progress(reading) > progress(best):
             self._best[key] = reading
             self._rejected[key] = 0
             return True

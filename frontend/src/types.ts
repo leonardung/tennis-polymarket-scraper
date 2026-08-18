@@ -79,6 +79,8 @@ export interface ScoreEvent {
   state: string | null;
   period: string | null;
   score: string | null;
+  /** Points in the game being played at that moment, e.g. "30-40". */
+  game: string | null;
 }
 
 export interface MatchDetail {

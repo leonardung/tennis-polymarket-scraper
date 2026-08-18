@@ -66,8 +66,10 @@ a match gives its full history:
 - **Table view** — the same numbers as text, for reading exact values.
 
 Set and game changes are drawn on every chart as vertical rules, and the hover
-readout names the score at that moment — this comes from `score_events`, so it
-only covers matches recorded after that table existed.
+readout names the score at that moment, down to the point — `S2 6-3, 4-2 ·
+30-40`. This comes from `score_events`, so it only covers matches recorded
+after that table existed, and the points only those recorded after `game` was
+added to it.
 
 Which tab a match lands in comes from the score feed's `state`, plus how recently
 the capture saw it: a match still marked `live` that nothing has touched for 15
@@ -136,8 +138,11 @@ Two feeds are involved, and the split matters:
   either side of the local date boundary — for about 750 KB every 5 minutes.
   It sits behind an edge cache that says `no-store` and then answers with an
   `Age` of one to four minutes, so it can identify matches but cannot follow one.
-- **The per-match feed** (`df_sur_2_<id>`) is one match's status and set-by-set
-  score, about 200 bytes. This is what the tick cadence reads. It is also edge
+- **The per-match feeds** (`df_sur_2_<id>` and, for a match in play,
+  `dc_2_<id>`) carry one match's status and set-by-set score, and the points in
+  the game being played. About 200 bytes each. This is what the tick cadence
+  reads. `dc_` is the optional one: a score without its points is still a
+  score, so failing to read it does not lose the reading. It is also edge
   cached, but briefly: measured against matches in play, `Age` climbs to roughly
   two minutes and resets, and a set change was observed arriving 15 seconds after
   it happened.
@@ -252,8 +257,15 @@ opponent's price — Tommy Paul's row can read `0.19` while his own mid is `0.81
 Use it per match, and don't compare it to that row's `mid`. Everything else in the
 table is genuinely per-player.
 
-**`score_events`** — one row each time a match's `state`, `period` or `score`
-changes: `ts`, `condition_id`, `state`, `period`, `score`.
+**`score_events`** — one row each time a match's `state`, `period`, `score` or
+`game` changes: `ts`, `condition_id`, `state`, `period`, `score`, `game`.
+
+`game` is the points inside the game being played — `30-40`, or plain counts
+during a tiebreak — in the same player order as `score`. It turns over several
+times a game, so this table holds many more rows than the chart draws marks:
+the marks are the games, `game` is where you were within one. It is only read
+while a set is actually in progress; the same keys on a finished match hold its
+total games instead, which is why the period gates them.
 
 `markets` holds only the latest score, which says where a match stands but not
 when it got there — so a price move can't be read against the point that caused
@@ -301,7 +313,7 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 281 checks, no network needed
+uv run python tests/test_offline.py   # 302 checks, no network needed
 ```
 
 ## Working on the dashboard front end

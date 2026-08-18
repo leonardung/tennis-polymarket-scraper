@@ -397,7 +397,12 @@ function scoreLookup(events: ScoreEvent[]): (ts: number) => string | null {
       if (event.ts <= ts) found = event;
       else break;
     }
-    const label = found ? scoreLabel(found.period, found.score) : "";
-    return label ? `Score: ${label}` : null;
+    if (!found) return null;
+    const label = scoreLabel(found.period, found.score);
+    if (!label) return null;
+    // The points inside the game. They turn over several times a game, which is
+    // why score_events carries many more rows than the chart has markers: the
+    // marks are the games, this is where you were within one.
+    return found.game ? `Score: ${label} · ${found.game}` : `Score: ${label}`;
   };
 }

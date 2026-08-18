@@ -27,10 +27,11 @@ class ScoreRow:
     state: str
     period: str | None
     score: str | None
+    game: str | None = None  # points in the game being played, "30-40"
 
     @classmethod
     def of(cls, market: TennisMarket) -> "ScoreRow":
-        return cls(market.condition_id, market.state, market.period, market.score)
+        return cls(market.condition_id, market.state, market.period, market.score, market.game)
 
 
 def _depth_columns(depth: int) -> list[str]:
@@ -87,6 +88,15 @@ MARKET_COLUMNS = [
     ("raw", "TEXT"),
 ]
 
+SCORE_EVENT_COLUMNS = [
+    ("ts", "REAL"),
+    ("condition_id", "TEXT"),
+    ("state", "TEXT"),
+    ("period", "TEXT"),
+    ("score", "TEXT"),
+    ("game", "TEXT"),
+]
+
 _TEXT_COLUMNS = {"condition_id", "token_id", "outcome", "book_hash"}
 _INT_COLUMNS = {"outcome_index"}
 
@@ -113,13 +123,10 @@ CREATE TABLE IF NOT EXISTS books (
 -- markets.period/score hold only the latest value, which says where a match
 -- stands but not when it got there. Reading a price move against the point that
 -- caused it needs the score to carry a timestamp, so every change is appended
--- here as well.
+-- here as well -- including `game`, the points inside it, which turn over
+-- several times a game and are what the chart reads out on hover.
 CREATE TABLE IF NOT EXISTS score_events (
-    ts            REAL,
-    condition_id  TEXT,
-    state         TEXT,
-    period        TEXT,
-    score         TEXT,
+{",".join(chr(10) + f"    {name:<14} {kind}" for name, kind in SCORE_EVENT_COLUMNS)},
     PRIMARY KEY (condition_id, ts)
 ) WITHOUT ROWID;
 
@@ -183,6 +190,7 @@ class Store:
                 (col, "TEXT" if col in _TEXT_COLUMNS else "INTEGER" if col in _INT_COLUMNS else "REAL")
                 for col in BOOK_COLUMNS
             ],
+            "score_events": SCORE_EVENT_COLUMNS,
         }
         for table, columns in expected.items():
             present = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -279,9 +287,9 @@ class Store:
         now = time.time()
         rows = []
         for entry in scores:
-            current = (entry.state, entry.period, entry.score)
+            current = (entry.state, entry.period, entry.score, entry.game)
             previous = self.conn.execute(
-                "SELECT state, period, score FROM score_events "
+                "SELECT state, period, score, game FROM score_events "
                 "WHERE condition_id = ? ORDER BY ts DESC LIMIT 1",
                 (entry.condition_id,),
             ).fetchone()
@@ -292,7 +300,7 @@ class Store:
         if rows:
             self.conn.executemany(
                 "INSERT OR REPLACE INTO score_events "
-                "(ts, condition_id, state, period, score) VALUES (?, ?, ?, ?, ?)",
+                "(ts, condition_id, state, period, score, game) VALUES (?, ?, ?, ?, ?, ?)",
                 rows,
             )
         return len(rows)
