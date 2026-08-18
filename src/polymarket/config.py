@@ -25,7 +25,12 @@ BOOKS_CHUNK = 50  # token_ids per batched /books request
 # refresh-rate sampling (5 minutes) can miss whole games; this resolves them.
 SCORE_INTERVAL = 10.0  # seconds between score-feed polls; 0 disables
 SCORE_LEAD = 900.0  # also poll matches starting within this many seconds
-SCORE_WORKERS = 8  # concurrent per-match reads; one small request each
+SCORE_TIMEOUT = 6.0  # per-match read; short enough that a stall cannot eat a tick
+# Flashscore answers from whichever edge cache takes the request and they do not
+# all hold the same copy, so a score can appear to go backwards. Readings that
+# regress are dropped -- but not forever, or a genuine correction by the scorer
+# could never land. This many consecutive reads of the lower value takes it.
+SCORE_PATIENCE = 5
 MIN_REFRESH_GAP = 60.0  # floor between refreshes triggered by a state change
 
 FLASHSCORE_HOST = "https://local-global.flashscore.ninja"

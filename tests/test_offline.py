@@ -458,7 +458,7 @@ def test_migration() -> None:
     print("\nschema migration")
     import sqlite3
 
-    from polymarket.store import BOOK_COLUMNS, MARKET_COLUMNS
+    from polymarket.store import BOOK_COLUMNS
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "old.db"
@@ -894,6 +894,81 @@ def test_score_pairing() -> None:
     check("and the score comes out the market's way round", solved.score == "2-4")
 
 
+def test_score_ratchet() -> None:
+    """Stale reads from Flashscore's edge caches must not rewind a score."""
+    print("\nscore ratchet")
+    from polymarket.scores import Ratchet, Reading, SetScore, progress
+
+    def r(state, period, *sets):
+        return Reading(state, period, tuple(SetScore(*x) for x in sets))
+
+    check("more games is further on", progress(r("live", "S1", (3, 5))) > progress(r("live", "S1", (3, 4))))
+    check("a new set is further on", progress(r("live", "S2", (3, 6), (0, 0))) > progress(r("live", "S1", (3, 5))))
+    check("finishing is further on", progress(r("ended", "FT", (3, 6))) > progress(r("live", "S1", (3, 6))))
+    check("tiebreak points count", progress(r("live", "S1", (6, 6, 5, 4))) > progress(r("live", "S1", (6, 6, 4, 4))))
+
+    # The exact sequence the live capture recorded: every real game followed by
+    # one stale read that put it back, then the real value again.
+    ratchet = Ratchet()
+    seen = []
+    for reading in [
+        r("live", "S1", (1, 2)),
+        r("live", "S1", (1, 1)),   # stale
+        r("live", "S1", (1, 2)),
+        r("live", "S1", (2, 2)),
+        r("live", "S1", (1, 2)),   # stale
+        r("live", "S1", (2, 2)),
+        r("live", "S2", (3, 6), (0, 0)),
+        r("live", "S1", (3, 5)),   # stale
+        r("live", "S2", (3, 6), (0, 0)),
+    ]:
+        if ratchet.accept("m", reading):
+            seen.append(reading.line())
+    check("only forward readings are taken", seen == ["1-2", "1-2", "2-2", "2-2", "3-6, 0-0", "3-6, 0-0"])
+    check("no reading ever goes backwards", seen == sorted(seen, key=lambda x: (len(x), x)))
+    # Repeats are harmless -- record_score_events drops them -- but a rewind is
+    # not, and none of the three stale reads got through.
+    check("the score ends where the feed did", ratchet.latest("m").line() == "3-6, 0-0")
+
+    # A rain delay flaps the period with the score standing still. Same games,
+    # same state, so it is not progress and must not be written down.
+    flapping = Ratchet()
+    flapping.accept("m", r("live", "S2", (5, 7), (0, 0)))
+    check(
+        "a period-only flap is ignored",
+        flapping.accept("m", r("live", "INT", (5, 7), (0, 0))) is False,
+    )
+
+    # A retirement ends a match without another game being played, so the state
+    # moving on is progress even when nothing else has.
+    quit = Ratchet()
+    quit.accept("m", r("live", "S2", (7, 5), (1, 2)))
+    check("a retirement gets through", quit.accept("m", r("ended", "RET", (7, 5), (1, 2))) is True)
+
+    # A scorer correcting a mistake also reads as going backwards. It is told
+    # from a cache by sticking: an old copy alternates with the fresh one, a
+    # correction comes back every read.
+    fixed = Ratchet(patience=3)
+    fixed.accept("m", r("live", "S1", (4, 2)))
+    wrong = r("live", "S1", (3, 2))
+    check("first rewind is refused", fixed.accept("m", wrong) is False)
+    check("so is the second", fixed.accept("m", wrong) is False)
+    check("the third is taken as a correction", fixed.accept("m", wrong) is True)
+    check("and becomes the new floor", fixed.latest("m").line() == "3-2")
+
+    # ...whereas an alternating cache never gets there, however long it runs.
+    patient = Ratchet(patience=3)
+    good, stale = r("live", "S1", (4, 2)), r("live", "S1", (3, 2))
+    patient.accept("m", good)
+    took = [patient.accept("m", x) for _ in range(6) for x in (stale, good)]
+    check("flapping never wears the ratchet down", took.count(True) == 6)
+    check("and it stays on the newer score", patient.latest("m").line() == "4-2")
+
+    # Matches that are over stop being tracked, so their history is dropped.
+    ratchet.forget(["other"])
+    check("finished matches are forgotten", ratchet.latest("m") is None)
+
+
 # --------------------------------------------------------------------------
 # score polling on the tick cadence
 # --------------------------------------------------------------------------
@@ -985,6 +1060,34 @@ def test_score_poll() -> None:
             check("history is the sequence of changes", len(history) == 3)
             check("first entry is where refresh found it", history[0][1] == "6-3, 3-1")
             check("last entry is the newest", history[-1][0] == "S3")
+
+            # A stale copy from one of Flashscore's other edge caches, which is
+            # what turned every game into three score changes.
+            before = store.conn.execute("SELECT COUNT(*) FROM score_events").fetchone()[0]
+            says(18, (6, 3), (3, 1))          # one game behind what we have
+            check("a rewound score writes nothing", poller.poll_scores() == 0)
+            says(19, (6, 3), (6, 4), (1, 0))  # the real value again
+            check("and the real one is not re-written either", poller.poll_scores() == 0)
+            after = store.conn.execute("SELECT COUNT(*) FROM score_events").fetchone()[0]
+            check("so the history did not grow", after == before)
+            kept_row = store.conn.execute(
+                "SELECT period, score FROM markets WHERE condition_id = ?",
+                (next(iter(poller.watched)),),
+            ).fetchone()
+            check("and markets still holds the newer score", tuple(kept_row) == ("S3", "6-3, 6-4, 1-0"))
+
+            # A refresh re-reads the day card, which is staler still; it must not
+            # rewind the score either.
+            feed._board = _live_board(sets=((6, 3), (3, 1)))
+            poller.refresh()
+            row_after_refresh = store.conn.execute(
+                "SELECT period, score FROM markets WHERE condition_id = ?",
+                (next(iter(poller.watched)),),
+            ).fetchone()
+            check(
+                "a stale day card does not rewind it",
+                tuple(row_after_refresh) == ("S3", "6-3, 6-4, 1-0"),
+            )
 
             # A feed that answers with nothing is not a score of nothing: a
             # walkover reports no status at all, and the last one must stand.
@@ -1271,6 +1374,7 @@ if __name__ == "__main__":
     test_poller()
     test_score_feed()
     test_score_pairing()
+    test_score_ratchet()
     test_score_events()
     test_score_poll_targeting()
     test_score_poll()

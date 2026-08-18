@@ -142,6 +142,22 @@ Two feeds are involved, and the split matters:
   two minutes and resets, and a set change was observed arriving 15 seconds after
   it happened.
 
+That caching is not a simple delay, and it is worth knowing about before
+changing anything here. The requests are answered by a pool of caches holding
+copies of different ages, so two reads seconds apart can return a score and then
+the score before it. Written down as they arrive, one game becomes three score
+changes, two of them backwards — which is exactly what the first version did.
+Two things stop it. Every read goes over a **single connection**, which keeps
+them on one cache instead of scattering them (that is also what the host wants:
+eight at once got the burst reset). And every reading, from the day card or the
+per-match feed, passes through a **ratchet** before it is written: a tennis
+score only advances, so one that has gone backwards is a stale copy and is
+dropped. Not forever — a scorer correcting a mistake also reads as going
+backwards — so a value that comes back on `SCORE_PATIENCE` reads in a row is
+taken. A cache alternates with the fresh copy and never gets there; a
+correction does. Replayed over a day of real capture, this removes 47% of the
+recorded score changes, all of them spurious.
+
 Raise `--score-interval` to trade resolution for traffic, or pass `0` to switch
 the per-match reads off and take whatever the 5-minute day card happens to catch.
 
@@ -285,7 +301,7 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 250 checks, no network needed
+uv run python tests/test_offline.py   # 281 checks, no network needed
 ```
 
 ## Working on the dashboard front end

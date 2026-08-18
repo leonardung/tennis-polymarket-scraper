@@ -8,6 +8,7 @@ import {
   type ISeriesApi,
   type ISeriesMarkersPluginApi,
   type LineData,
+  type LogicalRange,
   type MouseEventParams,
   type SeriesMarker,
   type Time,
@@ -214,11 +215,21 @@ export function TimeSeriesChart({
     [ts, series],
   );
 
-  // Seconds covered by the window, read by the axis formatter, which Lightweight
-  // Charts holds from the moment the chart is created.
-  const spanRef = useRef(0);
-  spanRef.current =
+  // Seconds covered by what is actually on screen, read by the axis formatter,
+  // which Lightweight Charts holds from the moment the chart is created. The
+  // labels are drawn for the visible range, so it is that range -- not the
+  // whole window -- which decides whether minutes tell them apart: zoomed into
+  // one minute of an hour-long match every tick otherwise reads "10:50 PM".
+  // Written straight from the pan handler rather than through React state, so
+  // the formatter cannot lag a frame behind the axis it is labelling.
+  const dataSpanRef = useRef(0);
+  dataSpanRef.current =
     uniform.grid.length > 1 ? uniform.grid[uniform.grid.length - 1]! - uniform.grid[0]! : 0;
+  const visibleSpanRef = useRef<number | null>(null);
+  // The grid the pan handler measures against, which outlives any one render.
+  const gridRef = useRef<number[]>([]);
+  gridRef.current = uniform.grid;
+  const shownSpan = () => visibleSpanRef.current ?? dataSpanRef.current;
 
   // Read through a ref by the autoscale callback, which Lightweight Charts holds
   // from the moment the series is created.
@@ -271,7 +282,7 @@ export function TimeSeriesChart({
           new Date((time as number) * 1000).toLocaleTimeString([], {
             hour: "2-digit",
             minute: "2-digit",
-            ...(spanRef.current < 1800 ? { second: "2-digit" } : {}),
+            ...(shownSpan() < 1800 ? { second: "2-digit" } : {}),
           }),
       },
       crosshair: {
@@ -297,6 +308,20 @@ export function TimeSeriesChart({
     });
     chartRef.current = chart;
     fittedKey.current = null; // a new chart starts unfitted, whatever came before
+
+    // Keep the axis formatter told what is on screen. The range comes back in
+    // grid slots, so it is turned back into seconds through the grid itself,
+    // which is the only thing that knows how wide a slot is.
+    const onRange = (range: LogicalRange | null) => {
+      const grid = gridRef.current;
+      if (!range || grid.length < 2) {
+        visibleSpanRef.current = null;
+        return;
+      }
+      const step = (grid[grid.length - 1]! - grid[0]!) / (grid.length - 1);
+      visibleSpanRef.current = Math.max(0, (range.to - range.from) * step);
+    };
+    chart.timeScale().subscribeVisibleLogicalRangeChange(onRange);
 
     const onMove = (param: MouseEventParams<Time>) => {
       if (!param.point || param.time == null) {
@@ -383,6 +408,7 @@ export function TimeSeriesChart({
     // they had panned away. A poll that appends to the same window leaves
     // fitKey alone, so it never yanks the view out from under them.
     if (chartRef.current && fittedKey.current !== fitKey) {
+      visibleSpanRef.current = null; // refitting puts the whole window back on screen
       chartRef.current.timeScale().fitContent();
       fittedKey.current = fitKey;
     }

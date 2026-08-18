@@ -27,6 +27,14 @@ So the day feed is read on the market-list cadence to learn what exists, and
 matches in play are topped up from the per-match feed on the book cadence. A
 ten-second poll costs roughly 200 bytes per live match rather than 60 KB.
 
+The caching is not just a delay, and this is the thing to know before changing
+anything here. Requests are answered by a pool of edge caches holding copies of
+different ages, so consecutive reads can return a score and then the score
+before it. Taken at face value that writes one game down as three changes, two
+of them going backwards -- which is what it did until ``Ratchet``. Two things
+hold it off: every read goes over a single connection, which keeps them on one
+cache, and every reading is put through the ratchet before it is written.
+
 The feed is undocumented. ``FSIGN`` is a constant lifted from the site and the
 keys are single letters with no promise they stay put -- if scores start coming
 back empty, check ``_SET_KEYS`` and ``_STATUS`` here first.
@@ -37,7 +45,6 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -48,7 +55,8 @@ from .config import (
     FLASHSCORE_HOST,
     FLASHSCORE_SIGN,
     FLASHSCORE_TZ,
-    SCORE_WORKERS,
+    SCORE_PATIENCE,
+    SCORE_TIMEOUT,
     Tournament,
     match_tournament,
 )
@@ -444,13 +452,20 @@ class Flashscore:
         timeout: float = 20.0,
         days: Sequence[int] = FLASHSCORE_DAYS,
         tz: int = FLASHSCORE_TZ,
-        workers: int = SCORE_WORKERS,
     ) -> None:
         self.days = tuple(days)
         self.tz = tz
-        self.workers = workers
+        # One connection, deliberately. Flashscore answers from a pool of edge
+        # caches that do not hold the same copy, and spreading requests over
+        # several connections lands them on different ones -- which reads back
+        # as the score jumping between its current and its previous value. A
+        # single kept-alive connection stays on one cache and sees it advance.
+        # It is also what the host wants: eight at once got the burst reset.
         self._client = httpx.Client(
-            timeout=timeout, headers=HEADERS, transport=httpx.HTTPTransport(retries=2)
+            timeout=timeout,
+            headers=HEADERS,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+            transport=httpx.HTTPTransport(retries=2),
         )
 
     def close(self) -> None:
@@ -462,8 +477,11 @@ class Flashscore:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
-    def _get(self, feed: str) -> str:
-        response = self._client.get(f"{FLASHSCORE_HOST}/{SPORT}/x/feed/{feed}")
+    def _get(self, feed: str, timeout: float | None = None) -> str:
+        response = self._client.get(
+            f"{FLASHSCORE_HOST}/{SPORT}/x/feed/{feed}",
+            **({"timeout": timeout} if timeout is not None else {}),
+        )
         response.raise_for_status()
         return response.text
 
@@ -494,21 +512,116 @@ class Flashscore:
         return ScoreBoard(matches)
 
     def reading(self, match_id: str) -> Reading | None:
-        """Re-read one match's score from the uncached per-match feed."""
-        return parse_reading(self._get(f"df_sur_{SPORT}_{match_id}"))
+        """Re-read one match's score from its own feed."""
+        return parse_reading(self._get(f"df_sur_{SPORT}_{match_id}", timeout=SCORE_TIMEOUT))
 
     def readings(self, match_ids: Sequence[str]) -> dict[str, Reading]:
-        """Re-read several matches at once. Ones that fail are simply absent."""
-        if not match_ids:
-            return {}
+        """Re-read several matches, one after another. Failures are simply absent.
 
-        def attempt(match_id: str) -> tuple[str, Reading | None]:
+        Sequential rather than concurrent: see the connection limit in
+        ``__init__``. Each read is a couple of hundred bytes over a connection
+        that is already open, so a court's worth of matches costs a fraction of
+        the tick they are read on.
+        """
+        out: dict[str, Reading] = {}
+        for match_id in match_ids:
             try:
-                return match_id, self.reading(match_id)
+                reading = self.reading(match_id)
             except (httpx.HTTPError, ValueError) as exc:
                 log.debug("score feed: %s unavailable (%s)", match_id, exc)
-                return match_id, None
+                continue
+            if reading is not None:
+                out[match_id] = reading
+        return out
 
-        with ThreadPoolExecutor(max_workers=min(self.workers, len(match_ids))) as pool:
-            results = list(pool.map(attempt, match_ids))
-        return {mid: reading for mid, reading in results if reading is not None}
+
+# How far along a match is, ordered so that it can only ever increase. State
+# comes first: a match that has ended is past one still being played, however
+# the games read.
+_STATE_RANK = {"upcoming": 0, "live": 1, "ended": 2}
+
+
+def progress(reading: Reading) -> tuple[int, int, int, int]:
+    """A reading's place in the match, as something that only moves forwards.
+
+    Sets, games and tiebreak points accumulate and never come back, so
+    comparing this is how a stale copy is told from a newer one.
+    """
+    return (
+        _STATE_RANK.get(reading.state, 0),
+        len(reading.sets),
+        sum(s.home + s.away for s in reading.sets),
+        sum((s.home_tiebreak or 0) + (s.away_tiebreak or 0) for s in reading.sets),
+    )
+
+
+class Ratchet:
+    """Keeps each match's score moving forwards.
+
+    Flashscore answers from whichever of its edge caches takes the request, and
+    they do not all hold the same copy. Two reads seconds apart can return a
+    score and then the score before it, over and over -- so one game played
+    gets written down as three score changes, two of them backwards. The day
+    card is staler still, and fights the per-match reads every refresh.
+
+    A tennis score only advances, so a reading that has gone backwards is a
+    stale copy and is dropped. Not forever, though: a scorer correcting a
+    mistake also reads as going backwards, and would otherwise never land. The
+    two are told apart by persistence -- a cache serving an old copy alternates
+    with the fresh one, which resets the count, while a correction comes back
+    every single read until it is taken.
+
+    A reading that is level with the last one but labelled differently -- the
+    same games, "INT" instead of "S2" while play is stopped for rain -- is not
+    progress either, and is dropped for the same reason: it flaps.
+    """
+
+    def __init__(self, patience: int = SCORE_PATIENCE) -> None:
+        self.patience = patience
+        self._best: dict[str, Reading] = {}
+        self._rejected: dict[str, int] = {}
+
+    def latest(self, key: str) -> Reading | None:
+        """The furthest-along reading accepted for this match so far."""
+        return self._best.get(key)
+
+    def accept(self, key: str, reading: Reading) -> bool:
+        """True if this reading should be written down, and remember it if so."""
+        best = self._best.get(key)
+        if best is None or reading == best or progress(reading) > progress(best):
+            self._best[key] = reading
+            self._rejected[key] = 0
+            return True
+
+        rejected = self._rejected.get(key, 0) + 1
+        if rejected < self.patience:
+            self._rejected[key] = rejected
+            log.debug(
+                "score feed: ignoring a reading that went backwards (%s %s, had %s %s)",
+                reading.period,
+                reading.line(),
+                best.period,
+                best.line(),
+            )
+            return False
+
+        # It has come back every read since; that is a correction, not a cache.
+        log.info(
+            "score feed: %s %s has stood for %d reads, taking it over %s %s",
+            reading.period,
+            reading.line(),
+            rejected,
+            best.period,
+            best.line(),
+        )
+        self._best[key] = reading
+        self._rejected[key] = 0
+        return True
+
+    def forget(self, keys: Iterable[str]) -> None:
+        """Drop every match except these, which are the ones still followed."""
+        keeping = set(keys)
+        for key in list(self._best):
+            if key not in keeping:
+                self._best.pop(key, None)
+                self._rejected.pop(key, None)

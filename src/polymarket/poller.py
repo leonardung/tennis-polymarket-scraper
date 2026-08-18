@@ -23,7 +23,7 @@ from .config import (
     START_GRACE,
 )
 from .discovery import discover, seconds_from_now
-from .scores import Flashscore, Paired, ScoreBoard
+from .scores import Flashscore, Paired, Ratchet, ScoreBoard
 from .store import ScoreRow, Store
 
 log = logging.getLogger(__name__)
@@ -78,6 +78,10 @@ class Poller:
         self.store = store
         self.scores = scores if scores is not None else Flashscore()
         self.board = ScoreBoard()
+        # Every score, from the day card or from a per-match read, goes through
+        # here before it is written, so a stale copy cannot rewind one already
+        # recorded. See Ratchet.
+        self.ratchet = Ratchet()
         self.interval = interval
         self.refresh_interval = refresh_interval
         self.all_markets = all_markets
@@ -155,8 +159,22 @@ class Poller:
             for market in kept
             if market.pairing
         }
-        self._state = {m.condition_id: m.state for m in kept}
         self._state_changed = False
+
+        # The day card is minutes old, so for a match already being read on the
+        # tick it is usually behind. Where it is, keep what is already known
+        # rather than letting the refresh rewind the score every five minutes.
+        for market in kept:
+            if market.pairing is None:
+                continue
+            if not self.ratchet.accept(market.condition_id, market.pairing.reading):
+                best = self.ratchet.latest(market.condition_id)
+                if best is not None:
+                    market.state = best.state
+                    market.period = best.period
+                    market.score = market.pairing.render(best)
+        self.ratchet.forget(m.condition_id for m in kept)
+        self._state = {m.condition_id: m.state for m in kept}
 
         self.store.upsert_markets(kept)
         self.store.record_score_events(ScoreRow.of(m) for m in kept)
@@ -256,6 +274,10 @@ class Poller:
             # started, and one settled without play, both answer with nothing.
             # Keep what the board last said rather than inventing a state.
             if reading is None:
+                continue
+            # A read that has gone backwards is a stale copy of the feed, not
+            # news; writing it turns one game into three score changes.
+            if not self.ratchet.accept(watched.condition_id, reading):
                 continue
             rows.append(
                 ScoreRow(
