@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import signal
 import time
 from dataclasses import dataclass
@@ -45,6 +46,21 @@ class Watched:
     pairing: Paired
     start_time: str | None
     question: str
+
+
+def effective_score_interval(interval: float, score_interval: float) -> float:
+    """What the score cadence actually comes out as, given the tick it rides on.
+
+    The poll is only offered a turn between ticks, so it can never be faster
+    than one, and lands on the nearest tick to what was asked for rather than
+    the next one after it -- see ``Poller._score_due``. Asking for less than a
+    tick and a half therefore gets a tick. This is the same arithmetic, so the
+    CLI can say so instead of quietly doing something else.
+    """
+    if score_interval <= 0:
+        return 0.0
+    ticks = max(1, math.ceil(score_interval / interval - 0.5))
+    return interval * ticks
 
 
 def _fingerprint(snap: Snapshot) -> tuple:

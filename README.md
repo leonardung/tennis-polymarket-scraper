@@ -36,7 +36,7 @@ it finishes — so it can stay running across a whole tournament unattended.
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
-| `--score-interval N` | `10` | seconds between per-match score reads; `0` disables |
+| `--score-interval N` | `10` | seconds between per-match score reads; cannot beat `--interval`, `0` disables |
 | `--dns MODE` | `auto` | see [DNS.md](DNS.md) |
 | `-v` | off | verbose logging |
 
@@ -164,8 +164,25 @@ taken. A cache alternates with the fresh copy and never gets there; a
 correction does. Replayed over a day of real capture, this removes 47% of the
 recorded score changes, all of them spurious.
 
-Raise `--score-interval` to trade resolution for traffic, or pass `0` to switch
-the per-match reads off and take whatever the 5-minute day card happens to catch.
+`--score-interval` was the lever for trading resolution against traffic when a
+score cost 60 KB to read. At 400 bytes there is not much left to trade, and the
+useful setting now is `0`, which switches the per-match reads off and takes
+whatever the 5-minute day card happens to catch — worth reaching for if the
+feed starts refusing requests.
+
+The poll rides on the book tick and is only offered a turn between ticks, so it
+can never run faster than `--interval`, and it lands on the nearest tick rather
+than the one after. On the default 10-second tick that makes 5, 10 and 15 all
+mean 10; the first value that actually slows it down is 20. `run` says so at
+startup rather than appearing to accept a number and using another. To sample
+scores faster than 10 seconds, lower `--interval` — which is the honest thing
+to do anyway, since the books would otherwise still be on a 10-second grid and
+there would be nothing finer to line the score up against.
+
+Measured against a match in play, that grid is already fine enough: points turn
+over about every 26 seconds, and the feed serves the new value the moment it
+changes (`Age: 1s` at every change over a 2½-minute watch). A 10-second poll
+sees each of them.
 
 **A match starting or finishing is noticed within a tick**, not at the next
 refresh. `run` reacts by refreshing early, so a finished match stops being
@@ -329,7 +346,7 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 321 checks, no network needed
+uv run python tests/test_offline.py   # 333 checks, no network needed
 ```
 
 ## Working on the dashboard front end

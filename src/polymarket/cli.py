@@ -27,7 +27,7 @@ from .config import (
     SCORE_INTERVAL,
 )
 from .discovery import discover
-from .poller import Poller
+from .poller import Poller, effective_score_interval
 from .scores import Flashscore
 from .store import Store
 
@@ -108,6 +108,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             heartbeat=args.heartbeat,
             score_interval=args.score_interval,
         )
+        # The score poll rides on the book tick, so what was asked for is not
+        # always what happens. Say which, rather than appear to accept a number
+        # and then use another.
+        scores_every = effective_score_interval(args.interval, args.score_interval)
+        if scores_every != args.score_interval:
+            logging.warning(
+                "--score-interval %.0fs is not reachable on a %.0fs tick; reading scores every %.0fs",
+                args.score_interval,
+                args.interval,
+                scores_every,
+            )
         logging.info(
             "capturing depth-%d books every %.0fs into %s (%s matches, %s, scores %s)",
             BOOK_DEPTH,
@@ -115,7 +126,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             args.db,
             "live + upcoming" if args.include_upcoming else "live",
             "every tick" if args.every_tick else "on change",
-            f"every {args.score_interval:.0f}s" if args.score_interval > 0 else "off",
+            f"every {scores_every:.0f}s" if scores_every > 0 else "off",
         )
         poller.run()
     return 0

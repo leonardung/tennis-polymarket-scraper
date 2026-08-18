@@ -1199,6 +1199,38 @@ def test_score_cadence() -> None:
             check("and fires on the tick nearest it", slow._score_due() is True)
 
 
+def test_score_cadence_reported() -> None:
+    """What the flag asks for and what the tick can deliver are not always the same."""
+    print("\nscore cadence reported")
+    from polymarket.poller import Poller, effective_score_interval as effective
+
+    check("off stays off", effective(10, 0) == 0)
+    check("below a tick gets a tick", effective(10, 5) == 10)
+    check("a tick is a tick", effective(10, 10) == 10)
+    check("and so is a tick and a half, which rounds down", effective(10, 15) == 10)
+    check("past that it slows", effective(10, 20) == 20)
+    check("three ticks", effective(10, 30) == 30)
+    check("a faster tick can serve a faster poll", effective(5, 5) == 5)
+
+    # It has to agree with the poller, or the CLI would report one cadence and
+    # the loop would run another.
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "c.db") as store:
+            for asked in (5, 10, 15, 20, 30):
+                poller = Poller(
+                    FakeAPI([]), store, scores=FakeFlashscore(), interval=10.0, score_interval=asked
+                )
+                fired, clock = [], 0.0
+                poller._last_score = 0.0
+                for tick in range(1, 13):
+                    clock = tick * 10.0
+                    if clock - poller._last_score >= poller.score_interval - poller.interval / 2:
+                        fired.append(clock)
+                        poller._last_score = clock
+                gap = fired[1] - fired[0]
+                check(f"asking for {asked}s really runs at {gap:.0f}s", gap == effective(10, asked))
+
+
 def test_score_poll_isolation() -> None:
     """The score poll must never be able to take the capture down with it."""
     print("\nscore poll isolation")
@@ -1538,6 +1570,7 @@ if __name__ == "__main__":
     test_score_poll_targeting()
     test_score_poll()
     test_score_cadence()
+    test_score_cadence_reported()
     test_score_poll_isolation()
     test_update_scores()
     test_prune_score_events()
