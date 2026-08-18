@@ -124,7 +124,7 @@ the capture's first tick by a fraction of a second.
 
 | | |
 |---|---|
-| capture | `polymarket run --db=/data/tennis.db --interval=5` |
+| capture | `polymarket run --db=/data/tennis.db --interval=5 --include-upcoming` |
 | dashboard | `polymarket dashboard --host=0.0.0.0`, published to `127.0.0.1:8787` only |
 | data | `./data` on the host, mounted at `/data` |
 | user | uid 1000, non-root; set `PUID`/`PGID` in a `.env` if yours differs |
@@ -134,6 +134,12 @@ Both containers run as uid 1000 so the bind-mounted `./data` needs no `chown`.
 `--host=0.0.0.0` only makes the dashboard reachable inside its container; what
 decides who can actually reach it is the port publish, which is bound to
 localhost. Change it to `8787:8787` to expose it on the network.
+
+Unlike a bare `polymarket run`, the compose file passes `--include-upcoming`:
+the hours before a match are when its price moves on news, and a container left
+running unattended may as well record them. Drop it from `command:` if you only
+want matches in play — that is roughly the difference between polling every
+listed match and polling the two or three being played.
 
 Change a flag by editing `command:` in `docker-compose.yml`, or run any
 subcommand one-off against the same database:
