@@ -93,6 +93,14 @@ The charts are [TradingView Lightweight Charts](https://www.tradingview.com/ligh
 so they pan and zoom; the crosshair reads every series at once, with the score at
 that moment underneath.
 
+**A zoom survives the poll.** While you are looking at the whole window — where
+the 15m/1h/3h/All control leaves you — new snapshots are followed as they
+arrive. Once you zoom or pan into part of it, that stretch of time is held
+exactly as it was while the data underneath is replaced, and the new samples
+accumulate off to the right until you scroll to them. Pressing a range button
+again, including the one already selected, goes back to the full view and to
+following.
+
 One thing worth knowing about them: Lightweight Charts spaces points by **index**,
 not by time. That is right for daily bars and wrong for this data, which is
 sampled every 5 seconds while a match is being played and every 5 minutes while

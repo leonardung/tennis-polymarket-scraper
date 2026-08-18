@@ -280,9 +280,16 @@ Docker image has no Node in it.
   resamples onto an evenly spaced grid carrying the last reading forward; nulls
   become whitespace rather than being interpolated. The chart is created **once**
   (`[usable]` dep) and mutated afterwards — series set, data, markers, theme each
-  have their own effect — because recreating it loses the zoom. `fitKey` is the
-  only thing that refits the viewport, and it identifies the window *being shown*,
-  not the one last requested.
+  have their own effect — because recreating it loses the zoom. `fitKey` refits
+  the viewport, and it identifies the window *being shown*, not the one last
+  requested. On a poll the data effect decides between following and holding:
+  `viewport()` reads the visible range **as seconds** off the grid being drawn
+  (`drawnGrid`, not `uniform` — that is already the new one) before `setData`,
+  and `restoreViewport()` puts those same seconds back on the rebuilt grid. A
+  view covering the whole window is refit instead, so a chart nobody has touched
+  follows the capture. Holding by index would not hold anything: a poll slides
+  the window and changes `toUniformGrid`'s step, so the same indices are a
+  different stretch of the match.
 - **`theme.ts`** owns light/dark. CSS custom properties are the single source of
   truth; canvas cannot read them, so `readPalette()` pulls the `CHART_TOKENS` out
   of computed style after a frame and the charts are restyled from that.

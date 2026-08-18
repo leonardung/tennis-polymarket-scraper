@@ -47,9 +47,10 @@ export interface TimeSeriesChartProps {
   annotate?: (ts: number) => string | null;
   refLine?: { price: number; label: string };
   scale?: ScaleHint;
-  /** Refit the viewport whenever this changes; leave it alone when it does not.
-   *  Pass something identifying the window being shown, not the window that was
-   *  last requested -- see the fit effect. */
+  /** Refit the viewport whenever this changes, and go back to following new
+   *  data. While it does not change, the reader owns the viewport: see the data
+   *  effect. Pass something identifying the window being shown, not the window
+   *  that was last requested. */
   fitKey?: string;
   emptyText?: string;
   ariaLabel?: string;
@@ -135,6 +136,51 @@ function toLineData(grid: number[], values: (number | null)[]): (LineData<Time> 
     out.push(value == null || !Number.isFinite(value) ? { time } : { time, value });
   }
   return out;
+}
+
+export interface Viewport {
+  /** The stretch of time on screen, in seconds. */
+  from: number;
+  to: number;
+  /** True when that is the whole of the data: nobody has zoomed or panned. */
+  whole: boolean;
+}
+
+/** Where the chart is looking, read out of grid slots and into seconds.
+ *
+ * Lightweight Charts holds the viewport by index. That is stable while the data
+ * is, and a poll is exactly when it is not: the window slides, `toUniformGrid`
+ * picks a new step, and the same indices become a different stretch of the
+ * match. Seconds survive that; slots do not.
+ */
+export function viewport(chart: IChartApi, grid: number[]): Viewport | null {
+  if (grid.length < 2) return null;
+  const scale = chart.timeScale();
+  const logical = scale.getVisibleLogicalRange();
+  if (!logical) return null;
+  const first = grid[0]!;
+  const last = grid[grid.length - 1]!;
+  const step = (last - first) / (grid.length - 1);
+
+  // "The whole window" is measured against getVisibleRange, which is clamped to
+  // the data: a fit leaves empty slots at each edge and the logical range counts
+  // them, so comparing logical ranges would read a fitted chart as zoomed out.
+  const shown = scale.getVisibleRange();
+  const whole =
+    !shown || ((shown.from as number) <= first + step && (shown.to as number) >= last - step);
+  return { from: first + logical.from * step, to: first + logical.to * step, whole };
+}
+
+/** Put a viewport back after the grid underneath it has been rebuilt. */
+export function restoreViewport(chart: IChartApi, grid: number[], view: Viewport): void {
+  if (grid.length < 2) return;
+  const first = grid[0]!;
+  const step = (grid[grid.length - 1]! - first) / (grid.length - 1);
+  if (!(step > 0)) return;
+  const from = (view.from - first) / step;
+  const to = (view.to - first) / step;
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return;
+  chart.timeScale().setVisibleLogicalRange({ from, to });
 }
 
 export interface ScaleHint {
@@ -398,19 +444,45 @@ export function TimeSeriesChart({
 
   /* ---- data ---- */
   const fittedKey = useRef<string | null>(null);
+  // The grid the chart is currently drawing. It is what the viewport on screen
+  // is expressed in, so it cannot be read off `uniform`: by the time this effect
+  // runs that is already the incoming grid.
+  const drawnGrid = useRef<number[]>([]);
   useEffect(() => {
+    const chart = chartRef.current;
+    // Read where the reader is looking before the new data moves the ground
+    // under them.
+    const before = chart ? viewport(chart, drawnGrid.current) : null;
+
     series.forEach((definition, index) => {
       const column = uniform.values[index];
       if (column) seriesRef.current.get(definition.key)?.setData(toLineData(uniform.grid, column));
     });
+    drawnGrid.current = uniform.grid;
+    if (!chart) return;
+
     // Fit on the first data, and again whenever the window itself changes --
     // picking a new range should put the reader back at a full view even if
     // they had panned away. A poll that appends to the same window leaves
-    // fitKey alone, so it never yanks the view out from under them.
-    if (chartRef.current && fittedKey.current !== fitKey) {
+    // fitKey alone.
+    if (fittedKey.current !== fitKey) {
       visibleSpanRef.current = null; // refitting puts the whole window back on screen
-      chartRef.current.timeScale().fitContent();
+      chart.timeScale().fitContent();
       fittedKey.current = fitKey;
+      return;
+    }
+
+    // A poll, then. Following the new data is only what the reader wants while
+    // they are still looking at the whole window -- which is where picking a
+    // range leaves them, and is the only view a refit could be said to
+    // preserve. Once they have zoomed or panned into part of it, that part is
+    // what they asked to see: hold it exactly, in seconds, and let the new
+    // samples arrive off to the right until they scroll to them.
+    if (!before || before.whole) {
+      visibleSpanRef.current = null;
+      chart.timeScale().fitContent();
+    } else {
+      restoreViewport(chart, uniform.grid, before);
     }
   }, [uniform, series, fitKey]);
 

@@ -7,7 +7,8 @@ const POLL_MS = 5000;
  *
  * /api/pulse is a two-column read; the heavy endpoints are only refetched when
  * it moves. That keeps an idle dashboard from re-rendering every five seconds,
- * which matters here because a chart re-render throws away the user's zoom.
+ * which matters here because every refetch rebuilds a chart's whole grid -- see
+ * TimeSeriesChart's data effect for what it costs to hold a zoom across one.
  */
 export function useDataVersion(): number {
   const [version, setVersion] = useState(0);
