@@ -345,10 +345,10 @@ def score_events(conn: sqlite3.Connection, condition_id: str) -> list[dict[str, 
     """Timestamped score changes, or an empty list against an older database."""
     if not _has_table(conn, "score_events"):
         return []
+    # `game` and `serving` arrived after the table did, so a capture recorded
+    # before them simply has no points to show rather than failing to open.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(score_events)")}
-    # `game` arrived after the table did, so a database recorded before that
-    # simply has no points to show rather than failing to open.
-    game = "game" if "game" in columns else "NULL AS game"
+    extra = ", ".join(c if c in columns else f"NULL AS {c}" for c in ("game", "serving"))
     return [
         {
             "ts": r["ts"],
@@ -356,9 +356,10 @@ def score_events(conn: sqlite3.Connection, condition_id: str) -> list[dict[str, 
             "period": r["period"],
             "score": r["score"],
             "game": r["game"],
+            "serving": r["serving"],
         }
         for r in conn.execute(
-            f"SELECT ts, state, period, score, {game} FROM score_events "
+            f"SELECT ts, state, period, score, {extra} FROM score_events "
             "WHERE condition_id = ? ORDER BY ts",
             (condition_id,),
         )

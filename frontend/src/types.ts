@@ -81,6 +81,8 @@ export interface ScoreEvent {
   score: string | null;
   /** Points in the game being played at that moment, e.g. "30-40". */
   game: string | null;
+  /** Which of the two players was serving, by index into `players`. */
+  serving: number | null;
 }
 
 export interface MatchDetail {

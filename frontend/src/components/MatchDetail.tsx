@@ -8,6 +8,7 @@ import {
   fmtSize,
   NO_QUOTE,
   scoreLabel,
+  shortName,
 } from "../format";
 import { useAsync } from "../hooks";
 import type { ChartPalette } from "../theme";
@@ -79,7 +80,10 @@ export function MatchDetail({
 
   const colors = [palette["--series-1"], palette["--series-2"]] as const;
   const markers = useMemo(() => scoreMarkers(detail.data?.score_events ?? []), [detail.data]);
-  const annotate = useMemo(() => scoreLookup(detail.data?.score_events ?? []), [detail.data]);
+  const annotate = useMemo(
+    () => scoreLookup(detail.data?.score_events ?? [], detail.data?.players ?? ["", ""]),
+    [detail.data],
+  );
 
   if (!detail.data) {
     return (
@@ -389,7 +393,7 @@ function scoreMarkers(events: ScoreEvent[]): ChartMarker[] {
   return marks;
 }
 
-function scoreLookup(events: ScoreEvent[]): (ts: number) => string | null {
+function scoreLookup(events: ScoreEvent[], players: [string, string]): (ts: number) => string | null {
   const sorted = [...events].sort((a, b) => a.ts - b.ts);
   return (ts: number) => {
     let found: ScoreEvent | null = null;
@@ -400,9 +404,13 @@ function scoreLookup(events: ScoreEvent[]): (ts: number) => string | null {
     if (!found) return null;
     const label = scoreLabel(found.period, found.score);
     if (!label) return null;
-    // The points inside the game. They turn over several times a game, which is
-    // why score_events carries many more rows than the chart has markers: the
-    // marks are the games, this is where you were within one.
-    return found.game ? `Score: ${label} · ${found.game}` : `Score: ${label}`;
+    // The points inside the game, and who was serving them. They turn over
+    // several times a game, which is why score_events carries many more rows
+    // than the chart has markers: the marks are the games, this is where you
+    // were within one -- and 30-40 on serve is not the same news as 30-40
+    // against it.
+    const server = found.serving == null ? null : players[found.serving];
+    const parts = [label, found.game, server && `${shortName(server)} serving`];
+    return `Score: ${parts.filter(Boolean).join(" · ")}`;
   };
 }

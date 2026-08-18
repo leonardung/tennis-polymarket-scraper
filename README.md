@@ -13,6 +13,7 @@ uv run polymarket dashboard    # browse it in a browser
 uv run polymarket stats        # summarise the database
 uv run polymarket sql          # latest quote for every match
 uv run polymarket sql "SELECT ..."   # any query
+uv run polymarket clean-scores # repair a score history recorded before the ratchet
 ```
 
 `dashboard`, `stats` and `sql` are safe to run while `run` is recording — they open
@@ -66,10 +67,10 @@ a match gives its full history:
 - **Table view** — the same numbers as text, for reading exact values.
 
 Set and game changes are drawn on every chart as vertical rules, and the hover
-readout names the score at that moment, down to the point — `S2 6-3, 4-2 ·
-30-40`. This comes from `score_events`, so it only covers matches recorded
-after that table existed, and the points only those recorded after `game` was
-added to it.
+readout names the score at that moment, down to the point and who is serving it
+— `S2 6-3, 4-2 · 30-40 · Griekspoor serving`. This comes from `score_events`,
+so it only covers matches recorded after that table existed, and the points and
+server only those recorded after `game` and `serving` were added to it.
 
 Which tab a match lands in comes from the score feed's `state`, plus how recently
 the capture saw it: a match still marked `live` that nothing has touched for 15
@@ -140,7 +141,7 @@ Two feeds are involved, and the split matters:
   `Age` of one to four minutes, so it can identify matches but cannot follow one.
 - **The per-match feeds** (`df_sur_2_<id>` and, for a match in play,
   `dc_2_<id>`) carry one match's status and set-by-set score, and the points in
-  the game being played. About 200 bytes each. This is what the tick cadence
+  the game being played with who is serving them. About 200 bytes each. This is what the tick cadence
   reads. `dc_` is the optional one: a score without its points is still a
   score, so failing to read it does not lose the reading. It is also edge
   cached, but briefly: measured against matches in play, `Age` climbs to roughly
@@ -257,15 +258,30 @@ opponent's price — Tommy Paul's row can read `0.19` while his own mid is `0.81
 Use it per match, and don't compare it to that row's `mid`. Everything else in the
 table is genuinely per-player.
 
-**`score_events`** — one row each time a match's `state`, `period`, `score` or
-`game` changes: `ts`, `condition_id`, `state`, `period`, `score`, `game`.
+**`score_events`** — one row each time a match's `state`, `period`, `score`,
+`game` or `serving` changes: `ts`, `condition_id`, `state`, `period`, `score`,
+`game`, `serving`.
 
 `game` is the points inside the game being played — `30-40`, or plain counts
-during a tiebreak — in the same player order as `score`. It turns over several
-times a game, so this table holds many more rows than the chart draws marks:
-the marks are the games, `game` is where you were within one. It is only read
-while a set is actually in progress; the same keys on a finished match hold its
-total games instead, which is why the period gates them.
+during a tiebreak — in the same player order as `score`, and `serving` is which
+of the two is serving them, as an index into `outcome_0`/`outcome_1`. Together
+they are what separates 30-40 on serve from 30-40 against it. They turn over
+several times a game, so this table holds many more rows than the chart draws
+marks: the marks are the games, these are where you were within one. Both are
+only read while a set is actually in progress; the same feed keys on a finished
+match hold its total games instead, which is why the period gates them.
+
+```bash
+uv run polymarket clean-scores           # report what it would remove
+uv run polymarket clean-scores --apply   # remove it
+```
+
+A history recorded before the ratchet existed has the rewinds in it, roughly
+half the rows. `clean-scores` replays what is stored through the same ratchet
+the capture now uses, drops what it would not have accepted along with the
+repeats those left stranded, and brings `markets` back in step with what
+survives. It refuses to run while a capture is writing, and does nothing at all
+without `--apply`.
 
 `markets` holds only the latest score, which says where a match stands but not
 when it got there — so a price move can't be read against the point that caused
@@ -313,7 +329,7 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 302 checks, no network needed
+uv run python tests/test_offline.py   # 321 checks, no network needed
 ```
 
 ## Working on the dashboard front end

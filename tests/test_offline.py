@@ -758,10 +758,28 @@ def test_score_feed() -> None:
     check("nor before it starts", read_points(live, None) is None)
     check("nonsense is not a score", read_points({"DP": "x", "DQ": "y"}, "S1") is None)
 
-    scored = Reading("live", "S1", (SetScore(1, 2),), ("15", "40"))
+    scored = Reading("live", "S1", (SetScore(1, 2),), ("15", "40"), serving=1)
     check("the game reads in feed order", scored.game() == "15-40")
     check("and flips with the score", scored.game(flip=True) == "40-15")
     check("no points, no game", Reading("live", "S1", (SetScore(1, 2),)).game() is None)
+
+    from polymarket.scores import read_serving
+
+    check("the server is read", read_serving(parse_blocks(LIVE_FEED)[0]) == 1)
+    check("nobody serving reads as nobody", read_serving({"DR": "0"}) is None)
+    check("and a missing key too", read_serving({}) is None)
+    check("home serving is the first outcome", scored.server() == 0)
+    check("unless the sides are the other way round", scored.server(flip=True) == 1)
+    check("no server, no index", Reading("live", "S1").server() is None)
+
+    # A score line read back out of the database, which is how the cleanup
+    # replays what was already recorded.
+    from polymarket.scores import parse_line
+
+    check("a plain line round-trips", Reading("live", "S1", parse_line("6-4, 3-2")).line() == "6-4, 3-2")
+    check("a tiebreak round-trips", Reading("live", "S1", parse_line("6-7(3)")).line() == "6-7(3)")
+    check("nothing parses to nothing", parse_line(None) == () and parse_line("") == ())
+    check("junk is skipped", parse_line("not a score") == ())
 
     # A day with no tour matches on it and a feed that cannot be reached must
     # not look the same: one is an answer, the other is the absence of one.
@@ -996,6 +1014,10 @@ def test_score_ratchet() -> None:
         got = game.accept("m", Reading("live", "S1", (SetScore(3, 2),), (a, b)))
         check(f"points {a}-{b} get through", got is True)
     check("and the score underneath is untouched", game.latest("m").line() == "3-2")
+    check(
+        "the serve changing hands is not a rewind",
+        game.accept("m", Reading("live", "S1", (SetScore(3, 2),), ("0", "0"), serving=2)) is True,
+    )
     check(
         "a rewind is still caught even with points on it",
         game.accept("m", Reading("live", "S1", (SetScore(2, 2),), ("0", "0"))) is False,
@@ -1251,6 +1273,89 @@ def test_update_scores() -> None:
             check("identity is left alone", after[4] == before[1])
 
 
+def test_prune_score_events() -> None:
+    """Repairing a history recorded before the ratchet existed."""
+    print("\nscore cleanup")
+    from polymarket.store import ScoreRow
+
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]), _live_board())
+    cid = kept[0].condition_id
+
+    # The exact shape the capture left behind: each real game written down, then
+    # rewound by a stale read, then written again.
+    recorded = [
+        ("live", "S1", "0-0"),
+        ("live", "S1", "1-0"),
+        ("live", "S1", "0-0"),   # stale
+        ("live", "S1", "1-0"),   # only a change because of the rewind
+        ("live", "S1", "1-1"),
+        ("live", "S1", "1-0"),   # stale
+        ("live", "S1", "1-1"),
+        ("live", "S2", "6-1, 0-0"),
+        ("live", "S1", "5-1"),   # stale, a whole set behind
+        ("live", "S2", "6-1, 0-0"),
+        ("ended", "FT", "6-1, 6-2"),
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dirty.db"
+        with Store(path) as store:
+            store.upsert_markets(kept)
+            for index, (state, period, score) in enumerate(recorded):
+                store.conn.execute(
+                    "INSERT INTO score_events (ts, condition_id, state, period, score) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (1_800_000_000.0 + index * 10, cid, state, period, score),
+                )
+            store.conn.execute(
+                "UPDATE markets SET state = ?, period = ?, score = ? WHERE condition_id = ?",
+                ("live", "S1", "5-1", cid),  # what the last stale write left
+            )
+
+            dry = store.prune_score_events()
+            check("a dry run reports what it would do", dry["removing"] == 6)
+            check("and changes nothing", dry["applied"] is False)
+            check(
+                "the rows are all still there",
+                store.conn.execute("SELECT COUNT(*) FROM score_events").fetchone()[0] == 11,
+            )
+
+            done = store.prune_score_events(apply=True)
+            check("applying removes them", done["removing"] == 6)
+            survivors = [
+                r[0]
+                for r in store.conn.execute(
+                    "SELECT score FROM score_events WHERE condition_id = ? ORDER BY ts", (cid,)
+                )
+            ]
+            check(
+                "what is left only ever moves forward",
+                survivors == ["0-0", "1-0", "1-1", "6-1, 0-0", "6-1, 6-2"],
+            )
+            check(
+                "markets is brought back in step",
+                tuple(
+                    store.conn.execute(
+                        "SELECT state, period, score FROM markets WHERE condition_id = ?", (cid,)
+                    ).fetchone()
+                )
+                == ("ended", "FT", "6-1, 6-2"),
+            )
+            check("running it again finds nothing left", store.prune_score_events()["removing"] == 0)
+
+    # Points move within a game and must survive a cleanup, since they are not
+    # a rewind of anything.
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "points.db") as store:
+            store.upsert_markets(kept)
+            for index, game in enumerate(["0-0", "15-0", "15-15", "15-30", "30-30"]):
+                store.record_score_events([ScoreRow(cid, "live", "S1", "3-2", game)])
+            check(
+                "every point is kept",
+                store.prune_score_events()["removing"] == 0,
+            )
+
+
 # --------------------------------------------------------------------------
 # dashboard: state classification, last-trade orientation, series reconstruction
 # --------------------------------------------------------------------------
@@ -1435,6 +1540,7 @@ if __name__ == "__main__":
     test_score_cadence()
     test_score_poll_isolation()
     test_update_scores()
+    test_prune_score_events()
     test_dashboard_state()
     test_last_trade_orientation()
     test_dashboard_series()

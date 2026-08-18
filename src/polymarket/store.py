@@ -28,10 +28,18 @@ class ScoreRow:
     period: str | None
     score: str | None
     game: str | None = None  # points in the game being played, "30-40"
+    serving: int | None = None  # which outcome is serving, by index
 
     @classmethod
     def of(cls, market: TennisMarket) -> "ScoreRow":
-        return cls(market.condition_id, market.state, market.period, market.score, market.game)
+        return cls(
+            market.condition_id,
+            market.state,
+            market.period,
+            market.score,
+            market.game,
+            market.serving,
+        )
 
 
 def _depth_columns(depth: int) -> list[str]:
@@ -95,6 +103,7 @@ SCORE_EVENT_COLUMNS = [
     ("period", "TEXT"),
     ("score", "TEXT"),
     ("game", "TEXT"),
+    ("serving", "INTEGER"),
 ]
 
 _TEXT_COLUMNS = {"condition_id", "token_id", "outcome", "book_hash"}
@@ -287,9 +296,9 @@ class Store:
         now = time.time()
         rows = []
         for entry in scores:
-            current = (entry.state, entry.period, entry.score, entry.game)
+            current = (entry.state, entry.period, entry.score, entry.game, entry.serving)
             previous = self.conn.execute(
-                "SELECT state, period, score, game FROM score_events "
+                "SELECT state, period, score, game, serving FROM score_events "
                 "WHERE condition_id = ? ORDER BY ts DESC LIMIT 1",
                 (entry.condition_id,),
             ).fetchone()
@@ -300,7 +309,8 @@ class Store:
         if rows:
             self.conn.executemany(
                 "INSERT OR REPLACE INTO score_events "
-                "(ts, condition_id, state, period, score, game) VALUES (?, ?, ?, ?, ?, ?)",
+                "(ts, condition_id, state, period, score, game, serving) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
         return len(rows)
@@ -357,3 +367,77 @@ class Store:
             "last_ts": last,
             "by_tournament": by_tournament,
         }
+
+    def prune_score_events(self, apply: bool = False) -> dict[str, object]:
+        """Drop score rows that went backwards, and the repeats they leave behind.
+
+        Captures recorded before the ratchet took every score at face value, and
+        Flashscore's edge caches hand out copies of different ages -- so a game
+        was written down three times, the middle one a rewind. This replays what
+        is stored through the same ratchet the capture now uses and removes what
+        it would not have accepted.
+
+        Deleting a rewind usually strands the row after it, which was only a
+        change because the rewind had moved the score away and back, so those go
+        too. What survives is the sequence of readings that actually advanced.
+
+        Returns a summary and, unless ``apply``, changes nothing.
+        """
+        from .scores import Ratchet, Reading, parse_line
+
+        rows = self.conn.execute(
+            "SELECT ts, condition_id, state, period, score, game, serving "
+            "FROM score_events ORDER BY condition_id, ts"
+        ).fetchall()
+
+        doomed: list[tuple[str, float]] = []
+        by_match: dict[str, int] = {}
+        ratchets: dict[str, object] = {}
+        previous: dict[str, tuple] = {}
+        # One pass, in (condition_id, ts) order as selected, so each match's
+        # rows arrive together and in the order the capture wrote them.
+        for ts, cid, state, period, score, game, serving in rows:
+            ratchet = ratchets.setdefault(cid, Ratchet())
+            reading = Reading(state or "upcoming", period, parse_line(score))
+            current = (state, period, score, game, serving)
+            # Rejected outright, or left as a repeat by an earlier deletion.
+            if not ratchet.accept(cid, reading) or current == previous.get(cid):
+                doomed.append((cid, ts))
+                by_match[cid] = by_match.get(cid, 0) + 1
+                continue
+            previous[cid] = current
+
+        summary: dict[str, object] = {
+            "rows": len(rows),
+            "removing": len(doomed),
+            "matches": len(by_match),
+            "applied": apply,
+        }
+        if not apply or not doomed:
+            return summary
+
+        self.conn.execute("BEGIN")
+        self.conn.executemany(
+            "DELETE FROM score_events WHERE condition_id = ? AND ts = ?", doomed
+        )
+        # markets holds the latest reading, and it was written by the same
+        # unfiltered path, so bring it back in step with what now survives.
+        self.conn.execute(
+            """
+            UPDATE markets SET state = COALESCE((
+                    SELECT s.state FROM score_events s
+                    WHERE s.condition_id = markets.condition_id
+                    ORDER BY s.ts DESC LIMIT 1), state),
+                period = COALESCE((
+                    SELECT s.period FROM score_events s
+                    WHERE s.condition_id = markets.condition_id
+                    ORDER BY s.ts DESC LIMIT 1), period),
+                score = COALESCE((
+                    SELECT s.score FROM score_events s
+                    WHERE s.condition_id = markets.condition_id
+                    ORDER BY s.ts DESC LIMIT 1), score)
+            WHERE condition_id IN (SELECT DISTINCT condition_id FROM score_events)
+            """
+        )
+        self.conn.execute("COMMIT")
+        return summary

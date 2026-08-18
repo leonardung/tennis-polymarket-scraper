@@ -127,7 +127,7 @@ _SET_KEYS = (
 # The live feed's keys, which are its own: `dc_` names things differently from
 # the day card. Only the points are taken from it -- the status and the set
 # scores come from `df_sur_`, which is read anyway.
-_POINTS_HOME, _POINTS_AWAY = "DP", "DQ"
+_POINTS_HOME, _POINTS_AWAY, _SERVING = "DP", "DQ", "DR"
 
 # What a point can read as inside a game. A tiebreak counts in plain numbers
 # instead, so those are taken as they come.
@@ -154,6 +154,12 @@ def read_points(block: dict[str, str], period: str | None) -> tuple[str, str] | 
     if home.isdigit() and away.isdigit():
         return (home, away)  # tiebreak, counted in points rather than 15s
     return None
+
+
+def read_serving(block: dict[str, str]) -> int | None:
+    """Which side is serving: 1 home, 2 away. Anything else means nobody is."""
+    value = _int(block, _SERVING)
+    return value if value in (1, 2) else None
 
 
 # Name fragments that carry no identity of their own. "de Minaur" and "Auger-
@@ -239,6 +245,8 @@ class Reading:
     # Points in the game being played, home then away: ("30", "40"). Raw counts
     # during a tiebreak. None whenever no game is in progress.
     points: tuple[str, str] | None = None
+    # Who is serving, as the feed numbers them: 1 home, 2 away.
+    serving: int | None = None
 
     def line(self, flip: bool = False) -> str | None:
         """The set scores as one string, e.g. ``"6-4, 6-7(3), 2-1"``.
@@ -257,9 +265,21 @@ class Reading:
         home, away = self.points
         return f"{away}-{home}" if flip else f"{home}-{away}"
 
+    def server(self, flip: bool = False) -> int | None:
+        """Which player is serving, as an index into the market's two outcomes."""
+        if self.serving not in (1, 2):
+            return None
+        index = self.serving - 1
+        return 1 - index if flip else index
+
     @property
-    def without_points(self) -> tuple[str, str | None, tuple[SetScore, ...]]:
-        """Everything but the points, which move differently -- see Ratchet."""
+    def settled(self) -> tuple[str, str | None, tuple[SetScore, ...]]:
+        """The parts of a reading that only ever move forwards.
+
+        The points and the server are left out, because both legitimately go
+        backwards -- deuce comes round again and again, and serve alternates
+        every game -- so the ratchet cannot measure them. See Ratchet.
+        """
         return (self.state, self.period, self.sets)
 
 
@@ -308,6 +328,10 @@ class Paired:
         """The points in the game being played, in the market's player order."""
         return reading.game(self.flip) if self.oriented else None
 
+    def render_server(self, reading: Reading) -> int | None:
+        """Which outcome is serving, by index. None when the sides are unsure."""
+        return reading.server(self.flip) if self.oriented else None
+
     @property
     def score(self) -> str | None:
         return self.render(self.reading)
@@ -315,6 +339,10 @@ class Paired:
     @property
     def game(self) -> str | None:
         return self.render_game(self.reading)
+
+    @property
+    def server(self) -> int | None:
+        return self.render_server(self.reading)
 
 
 def _read_status(block: dict[str, str]) -> tuple[str, str | None] | None:
@@ -586,7 +614,11 @@ class Flashscore:
             return base
         if not blocks:
             return base
-        return replace(base, points=read_points(blocks[0], base.period))
+        return replace(
+            base,
+            points=read_points(blocks[0], base.period),
+            serving=read_serving(blocks[0]),
+        )
 
     def readings(self, match_ids: Sequence[str]) -> dict[str, Reading]:
         """Re-read several matches, one after another. Failures are simply absent.
@@ -661,12 +693,12 @@ class Ratchet:
     def accept(self, key: str, reading: Reading) -> bool:
         """True if this reading should be written down, and remember it if so.
 
-        Points are exempt. They are the one part of a reading that legitimately
-        goes backwards -- deuce comes round again and again -- so a reading that
-        only differs there is passed through rather than measured.
+        The points and the server are exempt: they are the parts of a reading
+        that legitimately go backwards, so a reading differing only there is
+        passed through rather than measured. See Reading.settled.
         """
         best = self._best.get(key)
-        unmoved = best is not None and reading.without_points == best.without_points
+        unmoved = best is not None and reading.settled == best.settled
         if best is None or unmoved or progress(reading) > progress(best):
             self._best[key] = reading
             self._rejected[key] = 0
@@ -704,3 +736,25 @@ class Ratchet:
             if key not in keeping:
                 self._best.pop(key, None)
                 self._rejected.pop(key, None)
+
+
+# A rendered set, read back: "6-4", "7-6(3)", "0-0".
+_SET_LINE = re.compile(r"^(\d+)-(\d+)(?:\((\d+)\))?$")
+
+
+def parse_line(score: str | None) -> tuple[SetScore, ...]:
+    """Read a stored score line back into sets. The inverse of ``Reading.line``.
+
+    Lossy on tiebreaks: the line only carries the loser's points, so both sides
+    come back as that number. Nothing here needs the true pair -- ``progress``
+    only sums them, and a decided set's tiebreak never changes again -- but do
+    not treat what comes out as the real score of a tiebreak.
+    """
+    sets = []
+    for part in (score or "").split(","):
+        found = _SET_LINE.match(part.strip())
+        if found is None:
+            continue
+        tiebreak = int(found[3]) if found[3] else None
+        sets.append(SetScore(int(found[1]), int(found[2]), tiebreak, tiebreak))
+    return tuple(sets)

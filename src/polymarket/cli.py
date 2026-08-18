@@ -7,6 +7,7 @@ import json
 import logging
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -118,6 +119,48 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         poller.run()
     return 0
+
+
+def cmd_clean_scores(args: argparse.Namespace) -> int:
+    """Undo the damage stale feed reads did to score_events before the ratchet."""
+    if args.apply and not _capture_is_idle(args.db):
+        print(
+            "\na capture looks like it is writing to this database.\n"
+            "stop it first: two writers would fight over the same rows.\n",
+            file=sys.stderr,
+        )
+        return 2
+
+    with Store(args.db) as store:
+        summary = store.prune_score_events(apply=args.apply)
+
+    rows, removing = summary["rows"], summary["removing"]
+    if not rows:
+        print("\nno score history recorded yet\n")
+        return 0
+    share = 100 * int(removing) / int(rows)
+    verb = "removed" if args.apply else "would remove"
+    print(f"\n{rows} score rows, {verb} {removing} ({share:.0f}%) across {summary['matches']} match(es)")
+    if args.apply:
+        print("markets brought back in step with what survives\n")
+    else:
+        print("nothing changed -- pass --apply to do it\n")
+    return 0
+
+
+def _capture_is_idle(db: str) -> bool:
+    """True if nothing has written to the database in the last minute.
+
+    Not a lock: SQLite would let both write and simply interleave them. This is
+    the cheap check that catches the real mistake, which is running the cleanup
+    with the capture still going.
+    """
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            latest = conn.execute("SELECT MAX(ts) FROM books").fetchone()[0]
+    except sqlite3.Error:
+        return True
+    return latest is None or (time.time() - latest) > 60
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
@@ -282,6 +325,18 @@ def main(argv: list[str] | None = None) -> int:
         "stats", parents=[common], help="summarize what has been captured"
     )
     p_stats.set_defaults(func=cmd_stats, needs_network=False)
+
+    p_clean = sub.add_parser(
+        "clean-scores",
+        parents=[common],
+        help="remove score rows that a stale feed read wrote backwards",
+    )
+    p_clean.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually delete them; without this it only reports what it would do",
+    )
+    p_clean.set_defaults(func=cmd_clean_scores, needs_network=False)
 
     p_sql = sub.add_parser(
         "sql", parents=[common], help="query the database (read-only, safe while recording)"

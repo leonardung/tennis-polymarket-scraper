@@ -78,6 +78,7 @@ class TennisMarket:
     period: str | None
     score: str | None
     game: str | None  # points in the game being played, "30-40"
+    serving: int | None  # which outcome is serving, by index
     outcomes: list[str]
     tokens: list[str]
     start_date: str | None
@@ -116,11 +117,13 @@ def apply_score(market: TennisMarket, board: ScoreBoard) -> bool:
     if paired is None:
         market.state = unpaired_state(market.start_time)
         market.period = market.score = market.game = None
+        market.serving = None
         return False
     market.state = paired.reading.state
     market.period = paired.reading.period
     market.score = paired.score
     market.game = paired.game
+    market.serving = paired.server
     return True
 
 
@@ -235,6 +238,7 @@ def markets_from_event(
                 period=None,
                 score=None,
                 game=None,
+                serving=None,
                 outcomes=outcomes,
                 tokens=token_ids,
                 start_date=market.get("startDate") or event.get("startDate"),

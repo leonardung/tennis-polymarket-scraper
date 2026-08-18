@@ -174,6 +174,7 @@ class Poller:
                     market.period = best.period
                     market.score = market.pairing.render(best)
                     market.game = market.pairing.render_game(best)
+                    market.serving = market.pairing.render_server(best)
         self.ratchet.forget(m.condition_id for m in kept)
         self._state = {m.condition_id: m.state for m in kept}
 
@@ -287,6 +288,7 @@ class Poller:
                     period=reading.period,
                     score=watched.pairing.render(reading),
                     game=watched.pairing.render_game(reading),
+                    serving=watched.pairing.render_server(reading),
                 )
             )
         if not rows:
