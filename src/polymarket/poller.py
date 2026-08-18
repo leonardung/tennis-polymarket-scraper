@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import signal
 import time
 from dataclasses import dataclass
@@ -19,7 +18,6 @@ from .config import (
     OVERDUE_WINDOW,
     POLL_INTERVAL,
     REFRESH_INTERVAL,
-    SCORE_INTERVAL,
     SCORE_LEAD,
     START_GRACE,
 )
@@ -48,21 +46,6 @@ class Watched:
     question: str
 
 
-def effective_score_interval(interval: float, score_interval: float) -> float:
-    """What the score cadence actually comes out as, given the tick it rides on.
-
-    The poll is only offered a turn between ticks, so it can never be faster
-    than one, and lands on the nearest tick to what was asked for rather than
-    the next one after it -- see ``Poller._score_due``. Asking for less than a
-    tick and a half therefore gets a tick. This is the same arithmetic, so the
-    CLI can say so instead of quietly doing something else.
-    """
-    if score_interval <= 0:
-        return 0.0
-    ticks = max(1, math.ceil(score_interval / interval - 0.5))
-    return interval * ticks
-
-
 def _fingerprint(snap: Snapshot) -> tuple:
     """What we actually store. Deduplication compares this, not the API's own
     book hash, which also changes for levels deeper than we keep."""
@@ -87,7 +70,6 @@ class Poller:
         live_only: bool = True,
         only_changes: bool = True,
         heartbeat: float = HEARTBEAT,
-        score_interval: float = SCORE_INTERVAL,
         scores: Flashscore | None = None,
     ) -> None:
         self.api = api
@@ -105,14 +87,12 @@ class Poller:
         self.live_only = live_only
         self.only_changes = only_changes
         self.heartbeat = heartbeat
-        self.score_interval = score_interval
         self.tracked: dict[str, Tracked] = {}
         self.watched: dict[str, Watched] = {}  # by condition_id
         self._state: dict[str, str] = {}  # last seen live/upcoming/ended
         self._last_fingerprint: dict[str, tuple] = {}
         self._last_write: dict[str, float] = {}
         self._next_start: float | None = None  # monotonic deadline
-        self._last_score: float = 0.0  # monotonic; 0 = poll on the first tick
         self._state_changed = False
         self._stop = False
 
@@ -336,19 +316,6 @@ class Poller:
         )
         return written
 
-    def _score_due(self) -> bool:
-        """True when the score feed is due to be re-read.
-
-        The poll can only run between ticks, so a deadline landing a hair after
-        the tick that should have served it would wait out a whole extra tick --
-        with the two intervals equal, that halves the sampling rate. Allowing
-        half a tick of slack takes the nearest tick instead.
-        """
-        if self.score_interval <= 0:
-            return False
-        slack = self.interval / 2
-        return time.monotonic() - self._last_score >= self.score_interval - slack
-
     # ---------------- one snapshot ----------------
 
     def tick(self) -> int:
@@ -426,16 +393,14 @@ class Poller:
             except Exception:  # noqa: BLE001 - a bad tick must not kill the capture
                 log.exception("unexpected error in tick, continuing")
 
-            if self._score_due():
-                # Stamped before the call, not after, so a slow or failing poll
-                # cannot push the next one further and further out.
-                self._last_score = time.monotonic()
-                try:
-                    self.poll_scores()
-                except httpx.HTTPError as exc:
-                    log.warning("score poll failed (%s), continuing", exc)
-                except Exception:  # noqa: BLE001 - the books matter more than the score
-                    log.exception("unexpected error in score poll, continuing")
+            # Every tick, on the same cadence as the books: the two are read
+            # together so a price and the point it moved on share a timestamp.
+            try:
+                self.poll_scores()
+            except httpx.HTTPError as exc:
+                log.warning("score poll failed (%s), continuing", exc)
+            except Exception:  # noqa: BLE001 - the books matter more than the score
+                log.exception("unexpected error in score poll, continuing")
 
             if self._refresh_due(last_refresh):
                 try:

@@ -10,7 +10,10 @@ CLOB = "https://clob.polymarket.com"
 
 TENNIS_TAG_ID = "864"  # Gamma tag slug "tennis"; resolved at runtime, this is the fallback
 
-POLL_INTERVAL = 10.0  # seconds between order-book snapshots
+# One cadence for everything the capture reads on a timer: the order books and,
+# for the matches in play, the score. They are read in the same pass, so there
+# is nothing to keep in step.
+POLL_INTERVAL = 5.0  # seconds between polls
 REFRESH_INTERVAL = 300.0  # seconds between market-list refreshes
 HEARTBEAT = 300.0  # force a snapshot this often even if the book has not moved
 START_GRACE = 20.0  # wait this long after a scheduled start before re-checking
@@ -20,10 +23,9 @@ BOOK_DEPTH = 3  # levels captured per side
 BOOKS_CHUNK = 50  # token_ids per batched /books request
 
 # Scores come from Flashscore, not from Polymarket -- see scores.py for why.
-# The per-match feed is read on its own cadence, alongside the books rather than
-# with the market-list refresh. A service game lasts a couple of minutes, so
-# refresh-rate sampling (5 minutes) can miss whole games; this resolves them.
-SCORE_INTERVAL = 10.0  # seconds between score-feed polls; 0 disables
+# They are read on POLL_INTERVAL with the books, rather than with the
+# market-list refresh: a service game lasts a couple of minutes, so
+# refresh-rate sampling (5 minutes) misses whole games.
 SCORE_LEAD = 900.0  # also poll matches starting within this many seconds
 SCORE_TIMEOUT = 6.0  # per-match read; short enough that a stall cannot eat a tick
 # Flashscore answers from whichever edge cache takes the request and they do not

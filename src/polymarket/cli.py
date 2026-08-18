@@ -24,10 +24,9 @@ from .config import (
     HEARTBEAT,
     POLL_INTERVAL,
     REFRESH_INTERVAL,
-    SCORE_INTERVAL,
 )
 from .discovery import discover
-from .poller import Poller, effective_score_interval
+from .poller import Poller
 from .scores import Flashscore
 from .store import Store
 
@@ -106,27 +105,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             live_only=not args.include_upcoming,
             only_changes=not args.every_tick,
             heartbeat=args.heartbeat,
-            score_interval=args.score_interval,
         )
-        # The score poll rides on the book tick, so what was asked for is not
-        # always what happens. Say which, rather than appear to accept a number
-        # and then use another.
-        scores_every = effective_score_interval(args.interval, args.score_interval)
-        if scores_every != args.score_interval:
-            logging.warning(
-                "--score-interval %.0fs is not reachable on a %.0fs tick; reading scores every %.0fs",
-                args.score_interval,
-                args.interval,
-                scores_every,
-            )
         logging.info(
-            "capturing depth-%d books every %.0fs into %s (%s matches, %s, scores %s)",
+            "capturing depth-%d books and scores every %.0fs into %s (%s matches, %s)",
             BOOK_DEPTH,
             args.interval,
             args.db,
             "live + upcoming" if args.include_upcoming else "live",
             "every tick" if args.every_tick else "on change",
-            f"every {scores_every:.0f}s" if scores_every > 0 else "off",
         )
         poller.run()
     return 0
@@ -306,7 +292,13 @@ def main(argv: list[str] | None = None) -> int:
     p_discover.set_defaults(func=cmd_discover, needs_network=True)
 
     p_run = sub.add_parser("run", parents=[common], help="start the capture loop")
-    p_run.add_argument("--interval", type=float, default=POLL_INTERVAL)
+    p_run.add_argument(
+        "--interval",
+        type=float,
+        default=POLL_INTERVAL,
+        help="seconds between polls -- order books and, for matches in play, the "
+        f"score, which are read together on the same tick (default {POLL_INTERVAL:.0f})",
+    )
     p_run.add_argument("--refresh", type=float, default=REFRESH_INTERVAL)
     p_run.add_argument(
         "--include-upcoming",
@@ -323,12 +315,6 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=HEARTBEAT,
         help=f"write an unchanged book at least this often, seconds (default {HEARTBEAT:.0f})",
-    )
-    p_run.add_argument(
-        "--score-interval",
-        type=float,
-        default=SCORE_INTERVAL,
-        help=f"seconds between score-feed polls, 0 to disable (default {SCORE_INTERVAL:.0f})",
     )
     p_run.set_defaults(func=cmd_run, needs_network=True)
 

@@ -1089,7 +1089,7 @@ def test_score_poll() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "s.db") as store:
-            poller = Poller(api, store, scores=feed, score_interval=10.0)
+            poller = Poller(api, store, scores=feed)
             poller.refresh()
             check("a live match is watched", len(poller.watched) == 1)
             check("refresh seeds the known state", set(poller._state.values()) == {"live"})
@@ -1172,63 +1172,36 @@ def test_score_poll() -> None:
 
 
 def test_score_cadence() -> None:
-    """The poll only gets to run between ticks, so its deadline must allow for that."""
+    """Books and scores share one cadence, and the loop reads them together."""
     print("\nscore cadence")
+    import inspect
+
     from polymarket.poller import Poller
+    from polymarket.scores import Reading, SetScore
+
+    check(
+        "there is no separate score interval to get out of step",
+        "score_interval" not in inspect.signature(Poller.__init__).parameters,
+    )
+
+    api = FakeAPI([_cincinnati_atp()])
+    api.books = lambda token_ids: {tid: dict(BOOK, asset_id=tid) for tid in token_ids}
+    feed = FakeFlashscore(_live_board())
+    feed.readings_by_id["fs0"] = Reading("live", "S1", (SetScore(1, 0),))
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "c.db") as store:
-            p = Poller(FakeAPI([]), store, scores=FakeFlashscore(), interval=10.0, score_interval=10.0)
-            check("polls on the very first tick", p._score_due() is True)
+            poller = Poller(api, store, scores=feed, interval=5.0)
+            poller.refresh()
+            check("the default cadence is five seconds", Poller(api, store, scores=feed).interval == 5.0)
 
-            now = time.monotonic()
-            p._last_score = now
-            check("not due again immediately", p._score_due() is False)
-            # Equal intervals: the deadline lands within the same tick that should
-            # serve it. Without slack this waits a whole extra tick and samples
-            # at half the requested rate.
-            p._last_score = now - 9.9
-            check("the tick at the deadline serves it", p._score_due() is True)
-            p._last_score = now - 4.0
-            check("but not one arriving far too early", p._score_due() is False)
-
-            slow = Poller(FakeAPI([]), store, scores=FakeFlashscore(), interval=10.0, score_interval=30.0)
-            slow._last_score = time.monotonic() - 10.0
-            check("a longer interval makes ticks wait", slow._score_due() is False)
-            slow._last_score = time.monotonic() - 29.0
-            check("and fires on the tick nearest it", slow._score_due() is True)
-
-
-def test_score_cadence_reported() -> None:
-    """What the flag asks for and what the tick can deliver are not always the same."""
-    print("\nscore cadence reported")
-    from polymarket.poller import Poller, effective_score_interval as effective
-
-    check("off stays off", effective(10, 0) == 0)
-    check("below a tick gets a tick", effective(10, 5) == 10)
-    check("a tick is a tick", effective(10, 10) == 10)
-    check("and so is a tick and a half, which rounds down", effective(10, 15) == 10)
-    check("past that it slows", effective(10, 20) == 20)
-    check("three ticks", effective(10, 30) == 30)
-    check("a faster tick can serve a faster poll", effective(5, 5) == 5)
-
-    # It has to agree with the poller, or the CLI would report one cadence and
-    # the loop would run another.
-    with tempfile.TemporaryDirectory() as tmp:
-        with Store(Path(tmp) / "c.db") as store:
-            for asked in (5, 10, 15, 20, 30):
-                poller = Poller(
-                    FakeAPI([]), store, scores=FakeFlashscore(), interval=10.0, score_interval=asked
-                )
-                fired, clock = [], 0.0
-                poller._last_score = 0.0
-                for tick in range(1, 13):
-                    clock = tick * 10.0
-                    if clock - poller._last_score >= poller.score_interval - poller.interval / 2:
-                        fired.append(clock)
-                        poller._last_score = clock
-                gap = fired[1] - fired[0]
-                check(f"asking for {asked}s really runs at {gap:.0f}s", gap == effective(10, asked))
+            # One turn of the loop's body, three times over: the score feed is
+            # asked every time, not every other time.
+            before = len(feed.calls)
+            for _ in range(3):
+                poller.tick()
+                poller.poll_scores()
+            check("every tick reads the score", len(feed.calls) - before == 3)
 
 
 def test_score_poll_isolation() -> None:
@@ -1237,7 +1210,8 @@ def test_score_poll_isolation() -> None:
     from polymarket.poller import Poller
 
     api = FakeAPI([_cincinnati_atp()])
-    api.books = lambda token_ids: {tid: dict(BOOK, asset_id=tid) for tid in token_ids}
+    book = dict(BOOK)
+    api.books = lambda token_ids: {tid: dict(book, asset_id=tid) for tid in token_ids}
     feed = FakeFlashscore(_live_board())
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1271,8 +1245,12 @@ def test_score_poll_isolation() -> None:
             check("a dead board keeps the previous one", len(poller.board) == before)
             check("and the match stays tracked", len(poller.tracked) == 2)
 
-            off = Poller(api, store, scores=feed, score_interval=0)
-            check("scores can be turned off entirely", off._score_due() is False)
+            # A feed that cannot be reached at all is survivable on its own:
+            # readings() drops what it cannot fetch, and the books carry on.
+            feed.readings = lambda ids: {}
+            check("an unreachable feed writes nothing", poller.poll_scores() == 0)
+            book["last_trade_price"] = "0.61"
+            check("and the books still go in", poller.tick() == 2)
 
 
 def test_update_scores() -> None:
@@ -1570,7 +1548,6 @@ if __name__ == "__main__":
     test_score_poll_targeting()
     test_score_poll()
     test_score_cadence()
-    test_score_cadence_reported()
     test_score_poll_isolation()
     test_update_scores()
     test_prune_score_events()

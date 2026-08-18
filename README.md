@@ -1,8 +1,9 @@
 # Polymarket ATP tennis capture
 
 Records the Polymarket order book for every ATP tour-level (250 and above) tennis
-match **while it is being played**, every 10 seconds, 3 levels deep on each side,
-into SQLite.
+match **while it is being played**, every 5 seconds, 3 levels deep on each side,
+into SQLite — with the live score read on the same tick, so a price and the
+point it moved on share a timestamp.
 
 ## Commands
 
@@ -29,14 +30,13 @@ it finishes — so it can stay running across a whole tournament unattended.
 | Flag | Default | Effect |
 |---|---|---|
 | `--db PATH` | `data/tennis.db` | where to write |
-| `--interval N` | `10` | seconds between snapshots |
+| `--interval N` | `5` | seconds between polls — **books and scores both** |
 | `--refresh N` | `300` | seconds between match-list refreshes |
 | `--all-markets` | off | also capture set winner and games/sets over-under |
 | `--include-qualifying` | off | also capture qualifying rounds |
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
-| `--score-interval N` | `10` | seconds between per-match score reads; cannot beat `--interval`, `0` disables |
 | `--dns MODE` | `auto` | see [DNS.md](DNS.md) |
 | `-v` | off | verbose logging |
 
@@ -84,7 +84,7 @@ that moment underneath.
 
 One thing worth knowing about them: Lightweight Charts spaces points by **index**,
 not by time. That is right for daily bars and wrong for this data, which is
-sampled every 10 seconds while a match is being played and every 5 minutes while
+sampled every 5 seconds while a match is being played and every 5 minutes while
 it is not — fed the rows as stored, nine quiet hours take as much width as ten
 live minutes. The dashboard therefore resamples onto an evenly spaced time grid
 before charting, carrying the last reading forward. That is not smoothing: the
@@ -124,9 +124,9 @@ with eight matches on court. Flashscore's per-match feed answers the same
 question in about 200 bytes.
 
 Which is what makes the cadence affordable. The score is read on the book
-cadence, not the market-list one — every `--score-interval` seconds (10 by
-default), against only the matches whose score can actually change: those in
-play, and those within 15 minutes of their slot. Each change lands in
+cadence, not the market-list one — every `--interval` seconds, against only the
+matches whose score can actually change: those in play, and those within 15
+minutes of their slot. Each change lands in
 `score_events`, so a price move can be read against the game that caused it. At
 refresh-rate sampling a whole service game fits between two readings; at 10
 seconds none do.
@@ -164,25 +164,19 @@ taken. A cache alternates with the fresh copy and never gets there; a
 correction does. Replayed over a day of real capture, this removes 47% of the
 recorded score changes, all of them spurious.
 
-`--score-interval` was the lever for trading resolution against traffic when a
-score cost 60 KB to read. At 400 bytes there is not much left to trade, and the
-useful setting now is `0`, which switches the per-match reads off and takes
-whatever the 5-minute day card happens to catch — worth reaching for if the
-feed starts refusing requests.
+**`--interval` is the one cadence.** Books and scores are read in the same
+pass, so there is nothing to keep in step and no way for the two to drift: a
+price and the point it moved on carry the same timestamp because they were
+fetched together. There was a separate `--score-interval`, from when a score
+cost 60 KB to read off Polymarket and slowing it down saved real bandwidth. At
+400 bytes it saved nothing, could not go faster than the tick it rode on
+anyway, and silently ignored half its own range. It is gone.
 
-The poll rides on the book tick and is only offered a turn between ticks, so it
-can never run faster than `--interval`, and it lands on the nearest tick rather
-than the one after. On the default 10-second tick that makes 5, 10 and 15 all
-mean 10; the first value that actually slows it down is 20. `run` says so at
-startup rather than appearing to accept a number and using another. To sample
-scores faster than 10 seconds, lower `--interval` — which is the honest thing
-to do anyway, since the books would otherwise still be on a 10-second grid and
-there would be nothing finer to line the score up against.
-
-Measured against a match in play, that grid is already fine enough: points turn
-over about every 26 seconds, and the feed serves the new value the moment it
-changes (`Age: 1s` at every change over a 2½-minute watch). A 10-second poll
-sees each of them.
+For scale: points turn over about every 26 seconds, and the feed serves the new
+value the moment it changes — `Age: 1s` at every change across a 2½-minute
+watch. So the 5-second default sees every point with room to spare, and the
+binding constraint on reading a price against a point is the book grid, which
+is the same number.
 
 **A match starting or finishing is noticed within a tick**, not at the next
 refresh. `run` reacts by refreshing early, so a finished match stops being
@@ -243,7 +237,7 @@ they hold the latest known state rather than a per-tick history. `score` reads i
 the same order as `outcome_0` and `outcome_1`, and a set won on a tiebreak carries
 the loser's points — `6-7(3)`.
 
-**`books`** — one row per player per 10-second tick:
+**`books`** — one row per player per tick:
 
 | Column | Meaning |
 |---|---|
@@ -303,8 +297,8 @@ without `--apply`.
 `markets` holds only the latest score, which says where a match stands but not
 when it got there — so a price move can't be read against the point that caused
 it. This table timestamps every change. Only changes are written, and the feed is
-re-read every `--score-interval` seconds, so a row lands within about 10 seconds
-of the game that produced it.
+re-read every `--interval` seconds, so a row lands within a few seconds of the
+game that produced it.
 
 ```sql
 -- what the score was doing while the price moved
@@ -340,13 +334,15 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
 ## Notes
 
 - A Masters typically has a handful of matches in play at once — expect tens of
-  thousands of rows a day, and a full season well under a gigabyte.
+  thousands of rows a day, and a full season comfortably inside a gigabyte. The
+  5-second tick roughly doubles that against the 10 seconds this used to run
+  at; raise `--interval` if you would rather have the disk.
 - Safe to stop and restart: it reopens the same database and carries on, and
   re-running a tick never duplicates rows.
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 333 checks, no network needed
+uv run python tests/test_offline.py   # 319 checks, no network needed
 ```
 
 ## Working on the dashboard front end
