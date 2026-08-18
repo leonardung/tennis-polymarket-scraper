@@ -1,4 +1,10 @@
-"""The capture loop: snapshot every tracked order book on a fixed interval."""
+"""The capture loop: snapshot every tracked order book on a fixed grid.
+
+Each match is read at its own cadence -- every tick while it is being played,
+every `idle_interval` before it starts, not at all once it is over. The grid
+itself never changes; `_due_matches` decides who is on it. Books and score for
+one match are read in the same pass, so they share a timestamp.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +19,7 @@ from .api import Polymarket
 from .book import Snapshot, parse_book
 from .config import (
     HEARTBEAT,
+    IDLE_INTERVAL,
     MIN_REFRESH_GAP,
     OVERDUE_RECHECK,
     OVERDUE_WINDOW,
@@ -64,6 +71,7 @@ class Poller:
         api: Polymarket,
         store: Store,
         interval: float = POLL_INTERVAL,
+        idle_interval: float = IDLE_INTERVAL,
         refresh_interval: float = REFRESH_INTERVAL,
         all_markets: bool = False,
         include_qualifying: bool = False,
@@ -81,6 +89,7 @@ class Poller:
         # recorded. See Ratchet.
         self.ratchet = Ratchet()
         self.interval = interval
+        self.idle_interval = idle_interval
         self.refresh_interval = refresh_interval
         self.all_markets = all_markets
         self.include_qualifying = include_qualifying
@@ -92,6 +101,8 @@ class Poller:
         self._state: dict[str, str] = {}  # last seen live/upcoming/ended
         self._last_fingerprint: dict[str, tuple] = {}
         self._last_write: dict[str, float] = {}
+        self._last_poll: dict[str, float] = {}  # by condition_id: when it was last read
+        self._retired: set[str] = set()  # condition ids already logged as finished
         self._next_start: float | None = None  # monotonic deadline
         self._state_changed = False
         self._stop = False
@@ -155,6 +166,9 @@ class Poller:
             for market in kept
             if market.pairing
         }
+        for condition_id in set(self._last_poll) - self._followed():
+            self._last_poll.pop(condition_id, None)
+            self._retired.discard(condition_id)
         self._state_changed = False
 
         # The day card is minutes old, so for a match already being read on the
@@ -231,18 +245,78 @@ class Poller:
         else:
             self._next_start = None
 
+    # ---------------- cadence ----------------
+
+    def _followed(self) -> set[str]:
+        """Every match the last refresh left us reading, by condition id."""
+        return {t.condition_id for t in self.tracked.values()} | set(self.watched)
+
+    def _question(self, condition_id: str) -> str:
+        watched = self.watched.get(condition_id)
+        if watched is not None:
+            return watched.question
+        for meta in self.tracked.values():
+            if meta.condition_id == condition_id:
+                return meta.question
+        return condition_id
+
+    def _due_matches(self) -> set[str]:
+        """Which matches to read on this tick, remembering that they were read.
+
+        A match in play is read every tick, because that is what the five-second
+        cadence is for: a point turns over about every 26 seconds and the book
+        moves with it. A match that has not started is read every
+        `idle_interval` instead -- its book drifts, its score has nothing to say
+        until it starts, and polling a whole day's card with the live matches is
+        most of the request volume for none of the data. A match that has
+        finished is not read at all; its market lingers open for a while yet,
+        but there is nothing left in it to record.
+
+        Nothing is lost at the start of a match: going live moves it onto the
+        fast cadence within one idle poll, and the refresh that a state change
+        triggers reads the card again anyway.
+
+        Call this once per tick. It stamps what it returns, so a second call in
+        the same tick would find the idle matches not yet due.
+        """
+        now = time.monotonic()
+        due: set[str] = set()
+        retiring: list[str] = []
+        for condition_id in self._followed():
+            state = self._state.get(condition_id, "upcoming")
+            if state == "ended":
+                if condition_id not in self._retired:
+                    self._retired.add(condition_id)
+                    retiring.append(condition_id)
+                continue
+            self._retired.discard(condition_id)
+            last = self._last_poll.get(condition_id)
+            if state != "live" and last is not None and now - last < self.idle_interval:
+                continue
+            self._last_poll[condition_id] = now
+            due.add(condition_id)
+        for condition_id in retiring:
+            log.info("finished, no longer polling: %s", self._question(condition_id))
+        return due
+
     # ---------------- score feed ----------------
 
-    def _score_targets(self) -> list[Watched]:
+    def _score_targets(self, due: set[str] | None = None) -> list[Watched]:
         """Which matches are worth re-reading the score for right now.
 
         Each read is one small request, so this is aimed at the matches whose
         score can actually move: those in play, and those close enough to their
         slot to start at any moment. For everything else the day card has
         already said all there is to say, and the next refresh re-reads it.
+
+        `due` is the set of matches this tick is reading, so a score and the
+        book beside it stay on one cadence and in one pass. None means no
+        cadence filter, which is what a one-off call wants.
         """
         targets = []
         for condition_id, watched in self.watched.items():
+            if due is not None and condition_id not in due:
+                continue
             state = self._state.get(condition_id, "upcoming")
             if state == "live":
                 targets.append(watched)
@@ -255,9 +329,12 @@ class Poller:
                 targets.append(watched)
         return targets
 
-    def poll_scores(self) -> int:
-        """Re-read the score for the matches in play. Returns rows written."""
-        targets = self._score_targets()
+    def poll_scores(self, due: set[str] | None = None) -> int:
+        """Re-read the score for the matches in play. Returns rows written.
+
+        `due` comes from `_due_matches`; see `_score_targets`.
+        """
+        targets = self._score_targets(due)
         if not targets:
             return 0
 
@@ -318,12 +395,23 @@ class Poller:
 
     # ---------------- one snapshot ----------------
 
-    def tick(self) -> int:
+    def tick(self, due: set[str] | None = None) -> int:
+        """Snapshot every book due this tick. Returns rows written.
+
+        `due` comes from `_due_matches`, which the loop calls once and hands to
+        the score poll as well; None asks it here instead, which is what a
+        one-off call wants.
+        """
         if not self.tracked:
+            return 0
+        if due is None:
+            due = self._due_matches()
+        tokens = [token for token, meta in self.tracked.items() if meta.condition_id in due]
+        if not tokens:
             return 0
         ts = time.time()
         started = time.monotonic()
-        books = self.api.books(list(self.tracked))
+        books = self.api.books(tokens)
 
         rows = []
         for token, book in books.items():
@@ -336,16 +424,18 @@ class Poller:
             rows.append((snap, meta.condition_id, meta.outcome_index, meta.outcome))
 
         written = self.store.insert_snapshots(ts, rows) if rows else 0
-        missing = len(self.tracked) - len(books)
+        missing = len(tokens) - len(books)
         unchanged = len(books) - written
+        waiting = len(self.tracked) - len(tokens)
         log.info(
-            "tick: %d/%d books, %d rows%s, %.2fs%s",
+            "tick: %d/%d books, %d rows%s, %.2fs%s%s",
             len(books),
-            len(self.tracked),
+            len(tokens),
             written,
             f" ({unchanged} unchanged)" if unchanged > 0 else "",
             time.monotonic() - started,
             f", {missing} missing" if missing else "",
+            f", {waiting} token(s) not due" if waiting else "",
         )
         return written
 
@@ -386,17 +476,21 @@ class Poller:
         tick_index = 0
 
         while not self._stop:
+            # Decided once, for the books and the score alike: a match is read
+            # by both or by neither, so its price and its score never drift
+            # onto different clocks.
+            due = self._due_matches()
             try:
-                self.tick()
+                self.tick(due)
             except httpx.HTTPError as exc:
                 log.error("tick failed (%s), continuing", exc)
             except Exception:  # noqa: BLE001 - a bad tick must not kill the capture
                 log.exception("unexpected error in tick, continuing")
 
-            # Every tick, on the same cadence as the books: the two are read
-            # together so a price and the point it moved on share a timestamp.
+            # In the same pass as the books, so a price and the point it moved
+            # on share a timestamp.
             try:
-                self.poll_scores()
+                self.poll_scores(due)
             except httpx.HTTPError as exc:
                 log.warning("score poll failed (%s), continuing", exc)
             except Exception:  # noqa: BLE001 - the books matter more than the score

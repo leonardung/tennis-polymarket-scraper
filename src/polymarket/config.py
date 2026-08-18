@@ -10,10 +10,18 @@ CLOB = "https://clob.polymarket.com"
 
 TENNIS_TAG_ID = "864"  # Gamma tag slug "tennis"; resolved at runtime, this is the fallback
 
-# One cadence for everything the capture reads on a timer: the order books and,
-# for the matches in play, the score. They are read in the same pass, so there
-# is nothing to keep in step.
-POLL_INTERVAL = 5.0  # seconds between polls
+# Two cadences, chosen per match rather than per feed: a match in play is read
+# every POLL_INTERVAL, everything else every IDLE_INTERVAL, and a match that has
+# finished is not read at all. The books and the score of one match are still
+# read in the same pass on the ticks it is read, so a price and the point it
+# moved on keep sharing a timestamp.
+#
+# The split exists because a point turns over about every 26 seconds: that is
+# what the five-second tick is for, and a match that has not started has nothing
+# to say that often. Polling a whole day's card at five seconds is most of the
+# request volume for none of the data.
+POLL_INTERVAL = 5.0  # seconds between polls of a match in play
+IDLE_INTERVAL = 60.0  # seconds between polls of a match that is not in play
 REFRESH_INTERVAL = 300.0  # seconds between market-list refreshes
 HEARTBEAT = 300.0  # force a snapshot this often even if the book has not moved
 START_GRACE = 20.0  # wait this long after a scheduled start before re-checking
@@ -23,9 +31,9 @@ BOOK_DEPTH = 3  # levels captured per side
 BOOKS_CHUNK = 50  # token_ids per batched /books request
 
 # Scores come from Flashscore, not from Polymarket -- see scores.py for why.
-# They are read on POLL_INTERVAL with the books, rather than with the
-# market-list refresh: a service game lasts a couple of minutes, so
-# refresh-rate sampling (5 minutes) misses whole games.
+# They are read with the books, on the same cadence as the match they belong to,
+# rather than with the market-list refresh: a service game lasts a couple of
+# minutes, so refresh-rate sampling (5 minutes) misses whole games.
 SCORE_LEAD = 900.0  # also poll matches starting within this many seconds
 SCORE_TIMEOUT = 6.0  # per-match read; short enough that a stall cannot eat a tick
 # Flashscore answers from whichever edge cache takes the request and they do not

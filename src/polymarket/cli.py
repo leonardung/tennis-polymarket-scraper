@@ -22,6 +22,7 @@ from .config import (
     FLASHSCORE_HOST,
     GAMMA,
     HEARTBEAT,
+    IDLE_INTERVAL,
     POLL_INTERVAL,
     REFRESH_INTERVAL,
 )
@@ -99,6 +100,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             store,
             scores=scores,
             interval=args.interval,
+            idle_interval=args.idle_interval,
             refresh_interval=args.refresh,
             all_markets=args.all_markets,
             include_qualifying=args.include_qualifying,
@@ -107,10 +109,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             heartbeat=args.heartbeat,
         )
         logging.info(
-            "capturing depth-%d books and scores every %.0fs into %s (%s matches, %s)",
+            "capturing depth-%d books and scores into %s: every %.0fs while a match "
+            "is in play, every %.0fs before it starts, never once it is over "
+            "(%s matches, %s)",
             BOOK_DEPTH,
-            args.interval,
             args.db,
+            args.interval,
+            args.idle_interval,
             "live + upcoming" if args.include_upcoming else "live",
             "every tick" if args.every_tick else "on change",
         )
@@ -296,8 +301,15 @@ def main(argv: list[str] | None = None) -> int:
         "--interval",
         type=float,
         default=POLL_INTERVAL,
-        help="seconds between polls -- order books and, for matches in play, the "
-        f"score, which are read together on the same tick (default {POLL_INTERVAL:.0f})",
+        help="seconds between polls of a match in play -- its order books and its "
+        f"score, read together on the same tick (default {POLL_INTERVAL:.0f})",
+    )
+    p_run.add_argument(
+        "--idle-interval",
+        type=float,
+        default=IDLE_INTERVAL,
+        help="seconds between polls of a match that has not started; a finished "
+        f"match is not polled at all (default {IDLE_INTERVAL:.0f})",
     )
     p_run.add_argument("--refresh", type=float, default=REFRESH_INTERVAL)
     p_run.add_argument(

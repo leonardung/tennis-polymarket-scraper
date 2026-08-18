@@ -697,6 +697,75 @@ LIVE_FEED = "DA÷2¬DB÷17¬DE÷0¬DF÷0¬DN÷1¬DO÷2¬DP÷15¬DQ÷40¬DR÷1¬~
 DONE_FEED = "DA÷3¬DB÷3¬DE÷2¬DF÷0¬DP÷12¬DQ÷7¬DR÷0¬~"
 
 
+def test_poll_cadence() -> None:
+    """Who is read on this tick: the matches in play every time, the ones that
+    have not started every idle interval, the finished ones never again."""
+    print("\npoll cadence")
+    from polymarket.poller import Poller, Tracked
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "cad.db") as store:
+            asked: list[list[str]] = []
+            api = FakeAPI([])
+            api.books = lambda token_ids: asked.append(list(token_ids)) or {}
+            poller = Poller(api, store, scores=FakeFlashscore())
+            check("the idle cadence defaults to a minute", poller.idle_interval == 60.0)
+
+            def track(cid: str, state: str) -> None:
+                for index in (0, 1):
+                    poller.tracked[f"{cid}-{index}"] = Tracked(cid, index, f"P{index}", f"Match {cid}")
+                poller._state[cid] = state
+
+            track("live", "live")
+            track("soon", "upcoming")
+            track("done", "ended")
+
+            first = poller._due_matches()
+            check("a match in play is read", "live" in first)
+            check("one that has not started is read on the first tick", "soon" in first)
+            check("a finished match is not read at all", "done" not in first)
+
+            check("the next tick reads only the match in play", poller._due_matches() == {"live"})
+            check("and the one after that", poller._due_matches() == {"live"})
+
+            # A minute later the upcoming match comes back round.
+            poller._last_poll["soon"] -= 60.0
+            check("an idle match is read again after the idle interval", "soon" in poller._due_matches())
+
+            # A match that ends between refreshes stops being read at once,
+            # rather than waiting for the market list to drop it.
+            poller._state["live"] = "ended"
+            check("a match that has just ended drops out", poller._due_matches() == set())
+
+            # ... and the books request is asked for exactly those tokens.
+            poller._state["live"] = "live"
+            poller._last_poll.clear()
+            poller.tick()
+            check(
+                "the first tick asks for the live and the upcoming books",
+                set(asked[-1]) == {"live-0", "live-1", "soon-0", "soon-1"},
+            )
+            poller.tick()
+            check("the next asks only for the match in play", set(asked[-1]) == {"live-0", "live-1"})
+
+            # The score of a match is read in the same pass as its book, so the
+            # two cannot end up on different clocks.
+            from polymarket.poller import Watched
+            from polymarket.scores import Paired, Reading
+
+            for cid in ("live", "soon"):
+                poller.watched[cid] = Watched(
+                    cid, Paired(f"fs-{cid}", False, Reading("live", None), "x"), _iso(300), f"Match {cid}"
+                )
+            due = poller._due_matches()
+            ids = {w.pairing.id for w in poller._score_targets(due)}
+            check("the live match's score is read with its book", ids == {"fs-live"})
+            check(
+                "the idle match's score waits for its own turn",
+                {w.pairing.id for w in poller._score_targets({"soon"})} == {"fs-soon"},
+            )
+
+
 def test_score_feed() -> None:
     print("\nscore feed parsing")
     from polymarket.scores import Reading, SetScore, parse_board, parse_reading
@@ -1041,7 +1110,8 @@ def _iso(offset_seconds: float) -> str:
 
 
 def test_score_poll_targeting() -> None:
-    """Which matches the poll asks about -- one request each, on every tick."""
+    """Which matches the poll asks about, before the tick cadence narrows it
+    further -- one small request each."""
     print("\nscore poll targeting")
     from polymarket.poller import Poller, Watched
     from polymarket.scores import Paired, Reading
@@ -1541,6 +1611,7 @@ if __name__ == "__main__":
     test_migration()
     test_encoded_fields()
     test_poller()
+    test_poll_cadence()
     test_score_feed()
     test_score_pairing()
     test_score_ratchet()

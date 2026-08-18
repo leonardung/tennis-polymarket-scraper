@@ -10,12 +10,15 @@ A research capture tool. It records the Polymarket order book for every ATP
 tour-level (250 and above) men's singles match **while it is being played** —
 every 5 seconds, 3 levels deep on each side — into SQLite, with the live score
 read on the same tick so a price and the point it moved on carry the same
-timestamp. A read-only web dashboard browses what has been recorded.
+timestamp. A match that has not started yet is read once a minute instead, and
+one that has finished is not read again. A read-only web dashboard browses what
+has been recorded.
 
 The point of the dataset is reading price against play: what does the book do
 when a break point is saved, when a set turns, when a match is stopped for rain.
 That is why the score is timestamped in its own table rather than only kept as a
-current value, and why the book and the score share one poll cadence.
+current value, and why the book and the score of one match are always read in the
+same pass, on that match's own cadence.
 
 **It only reads.** There is no trading, no wallet, no authentication, no order
 placement anywhere in the codebase, and none of the APIs it touches require auth.
@@ -43,7 +46,9 @@ A Masters has a handful of matches in play at once. Expect tens of thousands of
 rows a day; a full season fits comfortably inside a gigabyte. The current
 `data/tennis.db` is ~25 MB. A score read is ~200 bytes per live match per tick;
 the day card is ~750 KB every 5 minutes. Points turn over about every 26 seconds,
-so the 5-second tick sees every point with room to spare.
+so the 5-second tick sees every point with room to spare. Only matches in play
+run at that cadence -- a full day card of matches yet to start costs one poll a
+minute each.
 
 ## How to run it
 
@@ -65,7 +70,7 @@ discover`.
 ## How to verify a change
 
 ```bash
-uv run python tests/test_offline.py     # ~319 checks, no network
+uv run python tests/test_offline.py     # ~331 checks, no network
 ```
 
 `tests/test_offline.py` is a **plain script, not pytest** — a flat list of

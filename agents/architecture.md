@@ -8,8 +8,9 @@ project is for, conventions, workflows).
 ## One paragraph
 
 A Python CLI (`src/polymarket/`) polls the Polymarket CLOB for ATP tennis order
-books every 5 seconds and, on the same tick, reads the live score from
-Flashscore. Both land in one SQLite file. A FastAPI dashboard
+books every 5 seconds while a match is being played -- every 60 seconds before
+it starts, never once it is over -- and, on the same tick, reads the live score
+from Flashscore. Both land in one SQLite file. A FastAPI dashboard
 (`src/polymarket/dashboard/`) serves that file read-only to a React + Lightweight
 Charts front end (`frontend/`, built into the Python package). `docker compose`
 runs the capture and the dashboard as two containers off one image, plus an
@@ -40,7 +41,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, TimeSeriesChart, OrderBook,
                            Sparkline, TableView
-tests/test_offline.py      ~319 assertions, no network, plain `python` script
+tests/test_offline.py      ~331 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -59,7 +60,8 @@ Flashscore day card f_2_… ───┘         (3 gates + ScoreBoard.pair)
                                                 ▼
                                  store.upsert_markets + record_score_events
                                                 │
-  every --interval (5s):                        ▼
+  every --interval (5s), for the                ▼
+  matches _due_matches() returns:
     CLOB POST /books (batched 50) ──> parse_book ──> Poller._changed ──> books
     Flashscore df_sur_2_<id> (+ dc_2_<id>) ──> Ratchet ──> markets, score_events
                                                 │
@@ -76,13 +78,21 @@ behind it skips whole slots and logs it.
 
 Each iteration, in order:
 
-1. **`tick()`** — one batched `POST /books` for every tracked token id.
+0. **`_due_matches()`** — which matches this tick reads, by condition id, and it
+   stamps them as read, so it is called **once** per iteration and the set is
+   passed to both `tick()` and `poll_scores()`. A match whose `_state` is `live`
+   is due every tick; anything else is due every `--idle-interval` (60s); a
+   match that has ended is never due again and is logged once as retired. This
+   is the only thing that varies -- the loop grid stays at `--interval`, and a
+   match's book and score are still read in the same pass, so they share a
+   timestamp.
+1. **`tick(due)`** — one batched `POST /books` for the due token ids.
    `parse_book` normalises each; `_changed()` decides whether to write.
    Deduplication compares `_fingerprint()` (best bid/ask, both ladders,
    last trade) rather than the API's `hash`, which also moves for levels deeper
    than the 3 captured. An unchanged book is still written every `--heartbeat`
    (300s) so a quiet market stays distinguishable from a stopped collector.
-2. **`poll_scores()`** — `_score_targets()` picks the matches whose score can
+2. **`poll_scores(due)`** — `_score_targets(due)` picks the due matches whose score can
    move (state `live`, or within `SCORE_LEAD`=900s of the slot, or with no slot
    at all). Each is re-read from its own Flashscore feed, run through the
    `Ratchet`, and written to `markets` (`update_scores`) plus `score_events`
@@ -311,9 +321,10 @@ only activates when the system resolver fails. See `DNS.md`.
 
 ## Invariants a change must not break
 
-1. **A tick's price and score share a timestamp.** One `--interval` drives both;
-   they are read in the same pass. There is no separate score interval (there
-   was; it was removed).
+1. **A tick's price and score share a timestamp.** A match's book and score are
+   read in the same pass, off one `due` set. There is no separate score interval
+   (there was; it was removed) -- what varies is which matches a tick reads, not
+   which feed.
 2. **Score reads stay on one connection, sequential.** See `Flashscore.__init__`.
 3. **Every score written passes through the `Ratchet`** — day card and per-match
    read alike.
@@ -335,6 +346,7 @@ only activates when the system resolver fails. See `DNS.md`.
 |---|---|
 | Add / fix a tournament | `config.TOURNAMENTS` (and check with `polymarket discover`) |
 | Change a cadence or window | `config.py` constants; flags in `cli.py` |
+| Change who is polled how often | `poller._due_matches` (`POLL_INTERVAL` / `IDLE_INTERVAL`) |
 | Capture more book depth | `config.BOOK_DEPTH` — `store` columns and `queries._LEVELS` follow automatically; the DB migrates itself, old rows stay NULL |
 | Capture a new field per tick | `book.Snapshot` + `parse_book` -> `store.BOOK_COLUMNS` + `insert_snapshots` -> `queries._BOOK_FIELDS` -> `types.ts` |
 | Handle a new Flashscore status | `scores._STATUS` / `_STAGE` |

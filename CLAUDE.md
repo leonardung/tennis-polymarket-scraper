@@ -24,7 +24,7 @@ Polymarket API" failure.
 ## Before saying a change is done
 
 ```bash
-uv run python tests/test_offline.py      # ~319 checks, no network, plain script
+uv run python tests/test_offline.py      # ~331 checks, no network, plain script
 cd frontend && npm run build             # typechecks, then writes into the package
 ```
 

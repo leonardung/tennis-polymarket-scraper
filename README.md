@@ -29,10 +29,19 @@ Run `discover` first to see what's on, then leave `run` going. It captures only
 matches actually in play, picks up each new match as it starts, and drops it when
 it finishes — so it can stay running across a whole tournament unattended.
 
+Each match is read at its own cadence. A match **in play** is read every
+`--interval` seconds, books and score together. A match that **hasn't started**
+— only tracked at all with `--include-upcoming` — is read every
+`--idle-interval` seconds instead: its book drifts, and its score has nothing to
+say until it starts. A match that has **finished** is not read again; going live
+puts a match on the fast cadence within one idle poll, and the state change also
+triggers an early refresh.
+
 | Flag | Default | Effect |
 |---|---|---|
 | `--db PATH` | `data/tennis.db` | where to write |
-| `--interval N` | `5` | seconds between polls — **books and scores both** |
+| `--interval N` | `5` | seconds between polls of a match in play — **books and scores both** |
+| `--idle-interval N` | `60` | seconds between polls of a match that hasn't started; a finished one isn't polled at all |
 | `--refresh N` | `300` | seconds between match-list refreshes |
 | `--all-markets` | off | also capture set winner and games/sets over-under |
 | `--include-qualifying` | off | also capture qualifying rounds |
@@ -215,7 +224,8 @@ with eight matches on court. Flashscore's per-match feed answers the same
 question in about 200 bytes.
 
 Which is what makes the cadence affordable. The score is read on the book
-cadence, not the market-list one — every `--interval` seconds, against only the
+cadence, not the market-list one — every `--interval` seconds for a match in
+play, every `--idle-interval` for one waiting to start, and against only the
 matches whose score can actually change: those in play, and those within 15
 minutes of their slot. Each change lands in
 `score_events`, so a price move can be read against the game that caused it. At
@@ -255,12 +265,14 @@ taken. A cache alternates with the fresh copy and never gets there; a
 correction does. Replayed over a day of real capture, this removes 47% of the
 recorded score changes, all of them spurious.
 
-**`--interval` is the one cadence.** Books and scores are read in the same
-pass, so there is nothing to keep in step and no way for the two to drift: a
-price and the point it moved on carry the same timestamp because they were
-fetched together. There was a separate `--score-interval`, from when a score
-cost 60 KB to read off Polymarket and slowing it down saved real bandwidth. At
-400 bytes it saved nothing, could not go faster than the tick it rode on
+**One cadence per match, not one per feed.** A match's books and its score are
+read in the same pass, so there is nothing to keep in step and no way for the two
+to drift: a price and the point it moved on carry the same timestamp because they
+were fetched together. What varies is which matches are on a given tick —
+`--interval` for the ones in play, `--idle-interval` for the rest — never
+whether the two feeds agree. There was a separate `--score-interval`, from when a
+score cost 60 KB to read off Polymarket and slowing it down saved real bandwidth.
+At 400 bytes it saved nothing, could not go faster than the tick it rode on
 anyway, and silently ignored half its own range. It is gone.
 
 For scale: points turn over about every 26 seconds, and the feed serves the new
@@ -388,8 +400,8 @@ without `--apply`.
 `markets` holds only the latest score, which says where a match stands but not
 when it got there — so a price move can't be read against the point that caused
 it. This table timestamps every change. Only changes are written, and the feed is
-re-read every `--interval` seconds, so a row lands within a few seconds of the
-game that produced it.
+re-read every `--interval` seconds while the match is in play, so a row lands
+within a few seconds of the game that produced it.
 
 ```sql
 -- what the score was doing while the price moved
@@ -427,7 +439,9 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
 - A Masters typically has a handful of matches in play at once — expect tens of
   thousands of rows a day, and a full season comfortably inside a gigabyte. The
   5-second tick roughly doubles that against the 10 seconds this used to run
-  at; raise `--interval` if you would rather have the disk.
+  at; raise `--interval` if you would rather have the disk. Only the matches in
+  play run at that cadence, so a day card full of matches that haven't started
+  costs a poll a minute each, not one every five seconds.
 - Safe to stop and restart: it reopens the same database and carries on, and
   re-running a tick never duplicates rows.
 - If the API can't be reached, see [DNS.md](DNS.md).
