@@ -65,3 +65,28 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Reaches the dashboard from outside the house, through a Cloudflare tunnel.
+  # The connection is outbound -- cloudflared dials Cloudflare and traffic comes
+  # back down that pipe -- so no port is forwarded, and the host still opens
+  # nothing to the internet. The dashboard's own publish stays on localhost.
+  #
+  # The tunnel's origin must be `http://dashboard:8787` -- the service name,
+  # which is its hostname on this network -- and not localhost:8787, which
+  # inside this container is this container.
+  #
+  # Sharing the dashboard's network namespace would make localhost:8787 correct
+  # and save that configuration, but it fails badly: recreating the dashboard
+  # leaves cloudflared holding a dead namespace, still reporting Up while every
+  # request 502s. `docker compose up -d` after a rebuild does exactly that.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    # As an environment variable rather than `--token` on the command line,
+    # where `docker compose ps` and the host's process list would both show it.
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARED_TOKEN:?set CLOUDFLARED_TOKEN in .env -- copy .env.example}
+    depends_on:
+      dashboard:
+        condition: service_healthy

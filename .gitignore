@@ -22,3 +22,6 @@ frontend/.vite/
 *.tsbuildinfo
 
 screenshots/
+
+# The Cloudflare tunnel token. See .env.example for what belongs here.
+.env

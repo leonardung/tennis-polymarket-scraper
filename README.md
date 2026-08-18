@@ -126,6 +126,7 @@ the capture's first tick by a fraction of a second.
 |---|---|
 | capture | `polymarket run --db=/data/tennis.db --interval=5 --include-upcoming` |
 | dashboard | `polymarket dashboard --host=0.0.0.0`, published to `127.0.0.1:8787` only |
+| cloudflared | optional public hostname for the dashboard, see below |
 | data | `./data` on the host, mounted at `/data` |
 | user | uid 1000, non-root; set `PUID`/`PGID` in a `.env` if yours differs |
 | timestamps | UTC unless you set `TZ` in a `.env` |
@@ -148,6 +149,42 @@ subcommand one-off against the same database:
 docker compose run --rm capture discover
 docker compose run --rm capture stats
 ```
+
+### Reaching it from outside
+
+The stack includes a [Cloudflare tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/),
+so the dashboard can be read from anywhere without forwarding a port or opening
+anything on the host — cloudflared dials out to Cloudflare and traffic comes
+back down that connection.
+
+Put the tunnel's token in `.env` (see `.env.example`); it is gitignored, because
+that token *is* the tunnel — anyone holding it can serve traffic as your
+hostname. It reaches the container as an environment variable rather than as
+`--token` on the command line, where `docker compose ps` and the host's process
+list would both show it.
+
+On the Cloudflare side, the public hostname's **Service** must be:
+
+```
+HTTP  ->  dashboard:8787
+```
+
+`dashboard` — not `localhost`. cloudflared runs in its own container, where
+localhost is cloudflared; `dashboard` is the service name, which Docker also
+makes its hostname on the compose network. Getting this wrong is a 502 with
+`dial tcp [::1]:8787: connect: connection refused` in `docker compose logs
+cloudflared`.
+
+Sharing the dashboard's network namespace (`network_mode: "service:dashboard"`)
+would make `localhost:8787` correct and save that step, and it is a trap:
+recreating the dashboard leaves cloudflared holding a dead namespace, still
+reporting `Up` while every request 502s — and `docker compose up -d` after a
+rebuild does exactly that.
+
+Anyone with the URL can read the whole capture; there is no login. Put
+[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
+in front of the hostname if that matters — the dashboard is read-only, so the
+exposure is what has been recorded, not the recording itself.
 
 The image has no Node in it: it serves the frontend bundle committed under
 `src/polymarket/dashboard/static/`, by the same rule that installing the package
