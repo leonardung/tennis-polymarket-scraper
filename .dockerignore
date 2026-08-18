@@ -1,0 +1,24 @@
+# The image is built from the lockfile and the Python package. Anything that is
+# regenerated, machine-local, or only used to produce the committed frontend
+# bundle stays out of the build context.
+.git/
+.venv/
+.ruff_cache/
+__pycache__/
+*.py[oc]
+*.egg-info/
+
+# The frontend build output under src/polymarket/dashboard/static/ IS in the
+# image -- it is what the dashboard serves -- but its sources and toolchain are
+# not: the image has no Node, by the same rule that installing the package does
+# not need one.
+frontend/
+screenshots/
+
+# Captures belong to the host, mounted in at /data.
+data/
+
+.claude/
+.dockerignore
+Dockerfile
+docker-compose.yml

@@ -1,0 +1,63 @@
+# Two containers off one image: the capture writes data/tennis.db, the dashboard
+# reads it. They are separate services rather than one because they fail and
+# restart independently -- reloading the dashboard must never interrupt a
+# recording, and a recording is the one thing here that cannot be redone later.
+
+x-polymarket: &polymarket
+  build: .
+  image: polymarket:latest
+  restart: unless-stopped
+  # Both processes touch the same file, so both must be the same uid as whoever
+  # owns ./data on the host. Set PUID/PGID in a .env file if yours is not 1000.
+  user: "${PUID:-1000}:${PGID:-1000}"
+  volumes:
+    - ./data:/data
+  environment:
+    # Log timestamps only; nothing in the capture reads the clock's zone.
+    TZ: "${TZ:-UTC}"
+
+services:
+  capture:
+    <<: *polymarket
+    command:
+      - run
+      - --db=/data/tennis.db
+      # 5s is the default; it is spelled out because it is the one number here
+      # worth changing, and --interval covers books and scores together.
+      - --interval=5
+    # The database exists from the moment the store opens, which is before the
+    # first poll -- so this reports "ready" as soon as the dashboard has
+    # something to open, rather than waiting for a match to be in play.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/data/tennis.db"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
+  dashboard:
+    <<: *polymarket
+    command:
+      - dashboard
+      - --db=/data/tennis.db
+      # 0.0.0.0 inside the container only; the port publish below is what
+      # decides who can actually reach it, and that is localhost.
+      - --host=0.0.0.0
+      - --no-open
+    ports:
+      - "127.0.0.1:8787:8787"
+    # Without this the dashboard would start first often enough to matter and
+    # exit 1 on a database that is about to exist.
+    depends_on:
+      capture:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/pulse')
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

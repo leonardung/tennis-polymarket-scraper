@@ -17,6 +17,8 @@ uv run polymarket sql "SELECT ..."   # any query
 uv run polymarket clean-scores # repair a score history recorded before the ratchet
 ```
 
+Or run the capture and the dashboard as two containers — see [Docker](#docker).
+
 `dashboard`, `stats` and `sql` are safe to run while `run` is recording — they open
 the database read-only, so a query can neither block nor damage the capture. (The
 dashboard opens it writable once at startup, to add any indexes an older database
@@ -99,6 +101,52 @@ The dashboard re-expresses it as the first player by which of the two mids it
 sits nearer to. That is a good guess when the players are priced apart and a
 coin-flip when they aren't; `last_trade_raw` in the API response is the
 untouched value.
+
+## Docker
+
+```bash
+docker compose up -d          # capture + dashboard
+docker compose logs -f capture
+docker compose down
+```
+
+The dashboard is then on <http://127.0.0.1:8787> and the capture is writing
+`./data/tennis.db` on the host, through a bind mount — so `sqlite3 data/tennis.db`,
+`uv run polymarket stats` and the rest still work against it from outside the
+containers, and nothing is trapped in a Docker volume.
+
+Two services rather than one, off a single image: they fail and restart
+independently, and rebuilding or restarting the dashboard must never interrupt a
+recording, which is the one thing here that cannot be redone later. The dashboard
+waits on a health check that the database file exists, because it exits rather
+than serve a database that isn't there and would otherwise lose the race with
+the capture's first tick by a fraction of a second.
+
+| | |
+|---|---|
+| capture | `polymarket run --db=/data/tennis.db --interval=5` |
+| dashboard | `polymarket dashboard --host=0.0.0.0`, published to `127.0.0.1:8787` only |
+| data | `./data` on the host, mounted at `/data` |
+| user | uid 1000, non-root; set `PUID`/`PGID` in a `.env` if yours differs |
+| timestamps | UTC unless you set `TZ` in a `.env` |
+
+Both containers run as uid 1000 so the bind-mounted `./data` needs no `chown`.
+`--host=0.0.0.0` only makes the dashboard reachable inside its container; what
+decides who can actually reach it is the port publish, which is bound to
+localhost. Change it to `8787:8787` to expose it on the network.
+
+Change a flag by editing `command:` in `docker-compose.yml`, or run any
+subcommand one-off against the same database:
+
+```bash
+docker compose run --rm capture discover
+docker compose run --rm capture stats
+```
+
+The image has no Node in it: it serves the frontend bundle committed under
+`src/polymarket/dashboard/static/`, by the same rule that installing the package
+doesn't need a Node toolchain. After changing anything in `frontend/src`, run
+`npm run build` and then `docker compose build`.
 
 ## Which matches are captured
 
@@ -358,6 +406,10 @@ npm install          # once
 npm run build        # typechecks, then writes into the Python package
 npm run dev          # hot reload on :5173, proxying /api to :8787
 ```
+
+The Docker image serves that committed bundle rather than building one, so a
+frontend change reaches a container only after `npm run build` **and**
+`docker compose build`.
 
 `npm run dev` expects a dashboard already serving the real database alongside it
 (`uv run polymarket dashboard --no-open`), so the front end reloads on save while
