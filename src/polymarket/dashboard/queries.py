@@ -150,6 +150,34 @@ ORDER BY ts DESC LIMIT ?
 """
 
 
+# Where each match stands inside the game being played. `markets` keeps only the
+# set score, so the points have to come from the tail of `score_events` -- one
+# seek per match, since (condition_id, ts) is that table's primary key.
+_LATEST_POINTS = """
+SELECT e.condition_id, e.game
+FROM markets m
+CROSS JOIN score_events e
+  ON e.condition_id = m.condition_id
+ AND e.ts = (
+        SELECT MAX(x.ts) FROM score_events x WHERE x.condition_id = m.condition_id
+    )
+"""
+
+
+def _latest_points(conn: sqlite3.Connection) -> dict[str, str | None]:
+    """The current points per match, empty against a database without them.
+
+    `score_events` and its `game` column both arrived after the first captures,
+    so an older file shows cards with no points rather than failing to load.
+    """
+    if not _has_table(conn, "score_events"):
+        return {}
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(score_events)")}
+    if "game" not in columns:
+        return {}
+    return {r["condition_id"]: r["game"] for r in conn.execute(_LATEST_POINTS)}
+
+
 def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any]:
     now = time.time()
 
@@ -158,6 +186,7 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
         latest.setdefault(row["condition_id"], {})[row["outcome_index"]] = row
 
     coverage = {r["condition_id"]: r for r in conn.execute(_COVERAGE)}
+    points = _latest_points(conn)
 
     sparks: dict[str, list[float | None]] = {}
     for cid in coverage:
@@ -184,6 +213,7 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
                 "state": classify(market["state"], market["start_time"], market["last_seen"], now),
                 "period": market["period"],
                 "score": market["score"],
+                "game": points.get(cid),
                 "start_time": market["start_time"],
                 "start_epoch": _epoch(market["start_time"]),
                 "last_seen": market["last_seen"],

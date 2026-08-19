@@ -35,7 +35,9 @@ export function MatchCard({ match, onOpen }: { match: MatchSummary; onOpen: () =
       type="button"
       className="card"
       onClick={onOpen}
-      aria-label={`${match.question}. ${match.score ?? match.state}`}
+      aria-label={`${match.question}. ${match.score ?? match.state}${
+        match.state === "live" && match.game ? `, ${match.game}` : ""
+      }`}
     >
       <div className="card-top">
         <span className="card-meta">{match.tournament ?? "—"}</span>
@@ -44,7 +46,18 @@ export function MatchCard({ match, onOpen }: { match: MatchSummary; onOpen: () =
 
       <div className="card-top">
         <Badge match={match} overdue={overdue} />
-        {match.score && <span className="card-score">{match.score}</span>}
+        {match.score && (
+          <span className="card-score">
+            {match.score}
+            {/* The points inside the current game, which turn over several times
+                a game -- only while one is being played, and only for a live
+                match, where they are still the state of play rather than the
+                last thing that happened. */}
+            {match.state === "live" && match.game && (
+              <span className="card-points">{match.game}</span>
+            )}
+          </span>
+        )}
       </div>
 
       <div className="players">

@@ -68,8 +68,9 @@ front of you; leave it open beside the capture.
 | `--host H` | `127.0.0.1` | bind address; localhost only by default |
 | `--no-open` | off | don't open a browser |
 
-Each card shows both players' current prices, the score, and a sparkline. Opening
-a match gives its full history:
+Each card shows both players' current prices, the score, and a sparkline. A live
+match also carries the points in the game being played — `6-3, 4-2` `30-40` —
+which turn over several times a game. Opening a match gives its full history:
 
 - **Price** — both players' mid over time, with the last traded price overlaid.
 - **Spread** — how far apart the two sides sit, and where quotes went missing.

@@ -35,6 +35,8 @@ export interface MatchSummary {
   state: MatchState;
   period: string | null;
   score: string | null;
+  /** Points in the game being played, e.g. "40-30", in `players` order. */
+  game: string | null;
   start_time: string | null;
   start_epoch: number | null;
   last_seen: number | null;

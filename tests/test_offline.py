@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import time
@@ -1586,6 +1587,31 @@ def test_dashboard_series() -> None:
         check("overview sees the match", len(view["matches"]) == 1)
         check("overview counts by tab", sum(view["counts"].values()) == 1)
         check("sparkline carries the mid series", len(view["matches"][0]["spark"]) == 2)
+        # No score recorded yet: the card has no points to show rather than a
+        # stale or invented pair.
+        check("no points without a score event", view["matches"][0]["game"] is None)
+        conn.close()
+
+        # `markets` keeps only the set score, so the points on a card come from
+        # the newest score_events row -- and it has to be the newest, since they
+        # turn over several times a game.
+        from polymarket.store import ScoreRow
+
+        cid = market.condition_id
+        with Store(path) as store:
+            store.record_score_events([ScoreRow(cid, "live", "S2", "6-3, 4-1", "30-40")])
+            store.record_score_events([ScoreRow(cid, "live", "S2", "6-3, 4-1", "40-40")])
+
+        conn = queries.connect(path)
+        check("overview carries the latest points", queries.overview(conn)["matches"][0]["game"] == "40-40")
+        conn.close()
+
+        # A capture written before score_events existed shows cards with no
+        # points rather than failing to load.
+        with sqlite3.connect(path) as raw:
+            raw.execute("DROP TABLE score_events")
+        conn = queries.connect(path)
+        check("a database without the table still loads", queries.overview(conn)["matches"][0]["game"] is None)
         conn.close()
 
 

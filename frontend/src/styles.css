@@ -223,6 +223,12 @@ main { padding: 20px 24px 56px; }
   border-top: 1px solid var(--gridline); padding-top: 9px;
 }
 .card-score { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+/* The points inside the current game, set off from the set score they follow. */
+.card-points {
+  margin-left: 6px; padding: 1px 6px; border-radius: 999px;
+  background: var(--wash); color: var(--text-primary);
+  font-size: 11px; font-weight: 600;
+}
 .card-stats { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .spark { display: block; }
 
