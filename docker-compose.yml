@@ -24,7 +24,7 @@ services:
       - --db=/data/tennis.db
       # 5s is the default; it is spelled out because it is the one number here
       # worth changing, and --interval covers books and scores together.
-      - --interval=5
+      - --interval=2
       # Record the book from the moment a match is listed, not from its first
       # point: the hours before a match are when the price moves on news, and
       # they cannot be recovered afterwards.
