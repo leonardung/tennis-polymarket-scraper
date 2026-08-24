@@ -22,6 +22,7 @@ export function App() {
   useTicker();
 
   const [filters, setFilters] = useState<FilterState>({
+    tour: "",
     tournament: "",
     search: "",
     sort: "natural",
@@ -69,6 +70,7 @@ export function App() {
         onToggleTheme={toggle}
       />
       <Filters
+        tours={overview.data?.tours ?? []}
         tournaments={overview.data?.tournaments ?? []}
         value={filters}
         onChange={setFilters}
@@ -120,6 +122,7 @@ export function App() {
 function filterMatches(matches: MatchSummary[], filters: FilterState): MatchSummary[] {
   const needle = filters.search.trim().toLowerCase();
   return matches.filter((match) => {
+    if (filters.tour && match.tour !== filters.tour) return false;
     if (filters.tournament && match.tournament !== filters.tournament) return false;
     if (!needle) return true;
     return [match.question, ...match.players].join(" ").toLowerCase().includes(needle);

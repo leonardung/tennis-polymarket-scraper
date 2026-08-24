@@ -2,9 +2,9 @@
 
 Read this file at the start of each conversation about this repository.
 
-Polymarket ATP tennis capture: a read-only tool that records order books for
-live ATP matches into SQLite alongside the live score, plus a dashboard over it.
-No trading, no auth, no wallets — do not add them unasked.
+Polymarket tennis capture: a read-only tool that records order books for live
+ATP and WTA matches into SQLite alongside the live score, plus a dashboard over
+it. No trading, no auth, no wallets — do not add them unasked.
 
 The durable project context lives in `agents/`:
 
@@ -24,7 +24,7 @@ Polymarket API" failure.
 ## Before saying a change is done
 
 ```bash
-uv run python tests/test_offline.py      # ~331 checks, no network, plain script
+uv run python tests/test_offline.py      # ~355 checks, no network, plain script
 cd frontend && npm run build             # typechecks, then writes into the package
 ```
 

@@ -336,7 +336,8 @@ function subtitle(match: Detail): string {
         ? `starts ${fmtDateTime(match.start_epoch)} (${fmtRelative(match.start_epoch)})`
         : `ended · ${scoreLabel(match.period, match.score) || "no final score recorded"}`;
   const kind = match.market_type === "moneyline" ? "match winner" : match.market_type;
-  return [match.tournament, state, kind].filter(Boolean).join(" · ");
+  const event = [match.tour?.toUpperCase(), match.tournament].filter(Boolean).join(" ");
+  return [event, state, kind].filter(Boolean).join(" · ");
 }
 
 function priceNote(

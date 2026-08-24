@@ -1,16 +1,18 @@
-"""Find ATP tour-level (250+) tennis match markets on Polymarket.
+"""Find tour-level (250+) singles tennis match markets on Polymarket.
 
-The filter is three independent gates, in order:
+Both tours are captured. The filter is three independent gates, in order:
 
-1. the event slug must parse as a head-to-head with an ``atp`` tour prefix and no
-   ``doubles`` segment  -> men's singles;
-2. the tournament name (the event title up to the first colon) must be on the ATP
-   calendar in ``config.TOURNAMENTS``                        -> 250 or above;
+1. the event slug must parse as a head-to-head with a captured tour prefix
+   (``atp`` or ``wta``) and no ``doubles`` segment            -> singles;
+2. the tournament name (the event title up to the first colon) must be on that
+   tour's calendar in ``config.ATP_TOURNAMENTS`` / ``WTA_TOURNAMENTS``
+                                                              -> 250 or above;
 3. the market must be open and accepting orders               -> actually tradeable.
 
-Gate 1 is what separates ATP from WTA at combined events like Cincinnati, where
-both draws share a tournament name. Gate 2 is what drops the Challenger circuit,
-which shares the ``atp`` slug prefix.
+Gate 1 is what tells the two draws apart at a combined event like Cincinnati,
+where both share a tournament name and nothing else in the payload distinguishes
+them. Gate 2 is what drops the Challenger circuit and the WTA 125s, which share
+the ``atp`` and ``wta`` slug prefixes with the tour proper.
 
 Whether a match that passes is being played comes from Flashscore rather than
 from Polymarket -- ``scores.py`` explains why -- so ``discover`` takes a
@@ -22,7 +24,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import httpx
 
@@ -33,6 +35,7 @@ from .config import (
     OVERDUE_WINDOW,
     QUALIFYING,
     TENNIS_TAG_ID,
+    TOURS,
     match_tournament,
 )
 from .scores import Paired, ScoreBoard
@@ -112,7 +115,9 @@ def unpaired_state(start_time: str | None) -> str:
 
 def apply_score(market: TennisMarket, board: ScoreBoard) -> bool:
     """Fill in a market's state, period and score from the board. True if paired."""
-    paired = board.pair(market.tournament, market.outcomes, parse_iso(market.start_time))
+    paired = board.pair(
+        market.tour, market.tournament, market.outcomes, parse_iso(market.start_time)
+    )
     market.pairing = paired
     if paired is None:
         market.state = unpaired_state(market.start_time)
@@ -171,6 +176,7 @@ def markets_from_event(
     event: dict[str, Any],
     all_markets: bool = False,
     include_qualifying: bool = False,
+    tours: Sequence[str] = TOURS,
 ) -> tuple[list[TennisMarket], list[Skipped]]:
     """Apply the three gates to a single event and build the markets it yields.
 
@@ -187,13 +193,14 @@ def markets_from_event(
     parsed = MATCH_SLUG.match(slug)
     if parsed is None:
         return kept, skipped  # outright/futures event, not a head-to-head
-    if parsed.group("tour") != "atp" or parsed.group("doubles"):
-        return kept, skipped  # WTA, ITF, or doubles
+    tour = parsed.group("tour")
+    if tour not in tours or parsed.group("doubles"):
+        return kept, skipped  # a tour not being captured, ITF, or doubles
 
     name = _tournament_of(title)
-    tournament = match_tournament(name)
+    tournament = match_tournament(name, tour)
     if tournament is None:
-        return kept, skipped  # Challenger or unrecognised event
+        return kept, skipped  # Challenger, WTA 125, or unrecognised event
     if EXCLUDE.search(title):
         skipped.append(Skipped(title, slug, "non-tour format"))
         return kept, skipped
@@ -230,7 +237,7 @@ def markets_from_event(
                 event_title=title,
                 tournament=tournament.name,
                 tier=tournament.tier,
-                tour="atp",
+                tour=tour,
                 match_date=parsed.group("date"),
                 market_type="moneyline" if is_moneyline else "derivative",
                 state="upcoming",
@@ -257,6 +264,7 @@ def discover(
     include_qualifying: bool = False,
     live_only: bool = False,
     max_pages: int = 60,
+    tours: Sequence[str] = TOURS,
 ) -> tuple[list[TennisMarket], list[Skipped]]:
     """Return (markets to capture, notable skips).
 
@@ -264,6 +272,7 @@ def discover(
     sets / games over-under, completed-match) rather than just the moneyline.
     ``live_only`` keeps only matches that are actually being played, which is
     the board's verdict -- pass one, or every match reads as not started.
+    ``tours`` narrows the capture to one circuit; by default it is both.
     """
     board = board if board is not None else ScoreBoard()
     kept: list[TennisMarket] = []
@@ -277,6 +286,7 @@ def discover(
             event,
             all_markets=all_markets,
             include_qualifying=include_qualifying,
+            tours=tours,
         )
         skipped.extend(missed)
         for market in found:

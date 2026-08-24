@@ -21,7 +21,7 @@ STATIC = Path(__file__).parent / "static"
 
 
 def build_app(db: str | Path) -> FastAPI:
-    app = FastAPI(title="Polymarket ATP dashboard", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Polymarket tennis dashboard", docs_url=None, redoc_url=None)
     # One connection per thread: sqlite3 objects are not safe to share across
     # them, and a read-only connection is cheap enough to make per worker.
     local = threading.local()

@@ -40,7 +40,9 @@ export function MatchCard({ match, onOpen }: { match: MatchSummary; onOpen: () =
       }`}
     >
       <div className="card-top">
-        <span className="card-meta">{match.tournament ?? "—"}</span>
+        <span className="card-meta">
+          {[match.tour?.toUpperCase(), match.tournament].filter(Boolean).join(" · ") || "—"}
+        </span>
         <span className="card-when">{when}</span>
       </div>
 

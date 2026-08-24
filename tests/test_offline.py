@@ -86,16 +86,41 @@ def test_book() -> None:
 
 def test_filters() -> None:
     print("\ntournament matching")
-    check("slam", match_tournament("Wimbledon").name == "Wimbledon")
-    check("masters full name", match_tournament("Cincinnati Open").name == "Cincinnati Open")
-    check("alias", match_tournament("Western & Southern Open").name == "Cincinnati Open")
-    check("hyphen alias", match_tournament("Monte-Carlo Masters").name == "Monte-Carlo")
-    check("atp 250", match_tournament("Winston-Salem Open").name == "Winston-Salem")
-    check("atp 250 by city", match_tournament("Geneva Open").name == "Geneva")
-    check("challenger city not on tour", match_tournament("Sion") is None)
-    check("challenger city 2", match_tournament("Kingston") is None)
-    check("challenger city 3", match_tournament("Prague 2") is None)
-    check("non-tennis rejected", match_tournament("Will the Fed cut rates?") is None)
+    check("slam", match_tournament("Wimbledon", "atp").name == "Wimbledon")
+    check("masters full name", match_tournament("Cincinnati Open", "atp").name == "Cincinnati Open")
+    check("alias", match_tournament("Western & Southern Open", "atp").name == "Cincinnati Open")
+    check("hyphen alias", match_tournament("Monte-Carlo Masters", "atp").name == "Monte-Carlo")
+    check("atp 250", match_tournament("Winston-Salem Open", "atp").name == "Winston-Salem")
+    check("atp 250 by city", match_tournament("Geneva Open", "atp").name == "Geneva")
+    check("challenger city not on tour", match_tournament("Sion", "atp") is None)
+    check("challenger city 2", match_tournament("Kingston", "atp") is None)
+    check("challenger city 3", match_tournament("Prague 2", "atp") is None)
+    check("non-tennis rejected", match_tournament("Will the Fed cut rates?", "atp") is None)
+
+    # The two calendars are looked up separately, because a combined event runs
+    # both draws under one name and they are not the same tournament.
+    check("wta 1000", match_tournament("Wuhan Open", "wta").name == "Wuhan Open")
+    check("wta 500", match_tournament("Charleston Open", "wta").name == "Charleston")
+    check("wta 250", match_tournament("Hobart International", "wta").name == "Hobart")
+    check("wta slam", match_tournament("Roland Garros", "wta").name == "Roland Garros")
+    check(
+        "a combined event is on both calendars",
+        match_tournament("Cincinnati Open", "wta").name == "Cincinnati Open",
+    )
+    check(
+        "and reads as that tour's tier",
+        (
+            match_tournament("Cincinnati Open", "atp").tier,
+            match_tournament("Cincinnati Open", "wta").tier,
+        )
+        == ("masters", "wta_1000"),
+    )
+    check(
+        "a name only one tour plays is not on the other's calendar",
+        match_tournament("Wuhan Open", "atp") is None
+        and match_tournament("Shanghai Masters", "wta") is None,
+    )
+    check("an unknown tour matches nothing", match_tournament("Wimbledon", "itf") is None)
 
     print("\nslug parsing")
     m = MATCH_SLUG.match("atp-norrie-navone-2026-05-20")
@@ -155,7 +180,7 @@ class FakeFlashscore:
         return {i: self.readings_by_id[i] for i in wanted if i in self.readings_by_id}
 
 
-def _board(*matches: tuple) -> object:
+def _board(*matches: tuple, tour: str = "atp") -> object:
     """Build a ScoreBoard the way parse_board would, from (players, status, sets).
 
     Each entry is ``(home, away, status_code, [(games, games), ...])`` with the
@@ -171,8 +196,9 @@ def _board(*matches: tuple) -> object:
         state, period = _STATUS[str(status)]
         built.append(
             BoardMatch(
-                id=f"fs{index}",
-                tournament=match_tournament("Cincinnati Open"),
+                id=f"fs{index}" if tour == "atp" else f"{tour}{index}",
+                tour=tour,
+                tournament=match_tournament("Cincinnati Open", tour),
                 home=home,
                 away=away,
                 home_tokens=name_tokens(home),
@@ -190,6 +216,18 @@ _ZANDSCHULP = ("Van de Zandschulp B.", "Griekspoor T.")
 
 def _live_board(sets=((6, 3), (3, 1)), status: int = 18) -> object:
     return _board((*_ZANDSCHULP, status, sets))
+
+
+# The WTA half of the same combined event, as the day card lists it.
+_BOUZKOVA = ("Bouzkova M.", "Stefanini L.")
+
+
+def _both_tours_board() -> object:
+    """One board carrying both draws of the same tournament, as Cincinnati does."""
+    from polymarket.scores import ScoreBoard
+
+    atp, wta = _live_board(), _board((*_BOUZKOVA, 17, [(2, 1)]), tour="wta")
+    return ScoreBoard(list(atp.matches.values()) + list(wta.matches.values()))
 
 
 def _event(
@@ -255,6 +293,12 @@ def test_discovery() -> None:
             "wta-bouzkov-stefani-2026-08-15",
             [(wta_title, ["Marie Bouzkova", "Lucrezia Stefanini"], True)],
         ),
+        # wta slug prefix, but a 125 -> below WTA 250
+        _event(
+            "Contrexeville: Player C vs Player D",
+            "wta-playerc-playerd-2026-08-16",
+            [("Contrexeville: Player C vs Player D", ["Player C", "Player D"], True)],
+        ),
         # atp slug prefix, but a Challenger -> below ATP 250
         _event(
             "Sion: Player A vs Player B",
@@ -285,22 +329,36 @@ def test_discovery() -> None:
         ),
     ]
 
-    kept, _ = discover(FakeAPI(events), _live_board())
-    check("only the ATP moneyline kept", len(kept) == 1)
-    check("right match", kept[0].question.startswith("Cincinnati Open: Botic"))
-    check("tournament", kept[0].tournament == "Cincinnati Open")
-    check("tier", kept[0].tier == "masters")
-    check("match date from slug", kept[0].match_date == "2026-08-13")
-    check("typed as moneyline", kept[0].market_type == "moneyline")
-    check("player-name outcomes", kept[0].outcomes[1] == "Tallon Griekspoor")
-    check("wta at same tournament excluded", not any("Bouzkova" in m.question for m in kept))
+    kept, _ = discover(FakeAPI(events), _both_tours_board())
+    check("both moneylines kept", len(kept) == 2)
+    atp = [m for m in kept if m.tour == "atp"]
+    wta = [m for m in kept if m.tour == "wta"]
+    check("right match", atp[0].question.startswith("Cincinnati Open: Botic"))
+    check("tournament", atp[0].tournament == "Cincinnati Open")
+    check("tier", atp[0].tier == "masters")
+    check("match date from slug", atp[0].match_date == "2026-08-13")
+    check("typed as moneyline", atp[0].market_type == "moneyline")
+    check("player-name outcomes", atp[0].outcomes[1] == "Tallon Griekspoor")
+
+    # The same tournament name, the other draw: only the slug prefix says so,
+    # and it is what decides which calendar the name is looked up on.
+    check("the wta draw at the same event is kept too", len(wta) == 1)
+    check("and is the wta match", wta[0].question.startswith("Cincinnati Open: Marie"))
+    check("tiered on the wta calendar", wta[0].tier == "wta_1000")
+    check("paired against the wta half of the board", wta[0].pairing is not None)
+    check("with the wta score, not the atp one", wta[0].score == "2-1")
     check("challenger excluded", not any("Sion" in m.question for m in kept))
+    check("wta 125 excluded", not any("Contrexeville" in m.question for m in kept))
     check("doubles excluded", not any("Doubles" in m.question for m in kept))
     check("itf excluded", not any("ITF" in m.question for m in kept))
     check("outright excluded", not any("Will Carlos" in m.question for m in kept))
 
-    everything, _ = discover(FakeAPI(events), _live_board(), all_markets=True)
-    check("all-markets picks up derivatives", len(everything) == 3)
+    only_atp, _ = discover(FakeAPI(events), _both_tours_board(), tours=("atp",))
+    check("one tour can be asked for on its own", len(only_atp) == 1)
+    check("and it is that one", only_atp[0].tour == "atp")
+
+    everything, _ = discover(FakeAPI(events), _both_tours_board(), all_markets=True)
+    check("all-markets picks up derivatives", len(everything) == 4)
     check(
         "derivatives typed",
         sorted({m.market_type for m in everything}) == ["derivative", "moneyline"],
@@ -772,14 +830,20 @@ def test_score_feed() -> None:
     from polymarket.scores import Reading, SetScore, parse_board, parse_reading
 
     board = parse_board(DAY_FEED)
-    check("only tour-level singles is read", len(board) == 2)
+    check("only tour-level singles is read", len(board) == 3)
     check("a challenger with the same players is skipped", all(m.id != "chal1234" for m in board))
-    check("the wta draw at the same event is skipped", all(m.id != "wta12345" for m in board))
 
-    finished, interrupted = board
+    finished, interrupted, women = board
     check("id read", finished.id == "Qi0f7iu1")
     check("players read", (finished.home, finished.away) == ("Lehecka J.", "Berrettini M."))
     check("tournament resolved to the ATP calendar", finished.tournament.name == "Cincinnati Open")
+    check("and the heading says which tour it is", finished.tour == "atp")
+
+    # The other draw at the same event, under its own heading. Same tournament
+    # name, other calendar, other tier.
+    check("the wta draw is read as well", women.id == "wta12345")
+    check("tagged as wta", women.tour == "wta")
+    check("on the wta calendar", women.tournament.tier == "wta_1000")
     check("start time read", finished.starts_at == 1786969800.0)
     check("finished match is ended", finished.reading.state == "ended")
     check("with full time as its period", finished.reading.period == "FT")
@@ -884,7 +948,7 @@ def test_score_feed() -> None:
         return DAY_FEED
 
     half._get = flaky
-    check("one bad day still yields the others", len(half.board()) == 2)
+    check("one bad day still yields the others", len(half.board()) == 3)
     quiet.close(), down.close(), half.close()
 
 
@@ -897,29 +961,29 @@ def test_score_pairing() -> None:
 
     # Polymarket spells names out in full; Flashscore abbreviates the first name
     # in the display name and reverses it in the slug.
-    hit = board.pair("Cincinnati Open", ["Arthur Fery", "Alex de Minaur"])
+    hit = board.pair("atp", "Cincinnati Open", ["Arthur Fery", "Alex de Minaur"])
     check("full names match abbreviated ones", hit is not None and hit.id == "Iy42aBeE")
     check("same order needs no flip", hit.flip is False)
     check("score comes out in that order", hit.score == "5-7, 0-0")
 
-    flipped = board.pair("Cincinnati Open", ["Alex de Minaur", "Arthur Fery"])
+    flipped = board.pair("atp", "Cincinnati Open", ["Alex de Minaur", "Arthur Fery"])
     check("the reverse order pairs too", flipped is not None and flipped.id == "Iy42aBeE")
     check("and is flagged as flipped", flipped.flip is True)
     check("so the score is mirrored", flipped.score == "7-5, 0-0")
 
     check(
         "one player agreeing is not enough",
-        board.pair("Cincinnati Open", ["Arthur Fery", "Somebody Else"]) is None,
+        board.pair("atp", "Cincinnati Open", ["Arthur Fery", "Somebody Else"]) is None,
     )
     check(
         "the right players at the wrong tournament do not pair",
-        board.pair("Wimbledon", ["Arthur Fery", "Alex de Minaur"]) is None,
+        board.pair("atp", "Wimbledon", ["Arthur Fery", "Alex de Minaur"]) is None,
     )
     check(
         "a match the board has never seen does not pair",
-        board.pair("Cincinnati Open", ["Nobody Here", "Nor Here"]) is None,
+        board.pair("atp", "Cincinnati Open", ["Nobody Here", "Nor Here"]) is None,
     )
-    check("an empty board pairs nothing", ScoreBoard().pair("Cincinnati Open", ["A B", "C D"]) is None)
+    check("an empty board pairs nothing", ScoreBoard().pair("atp", "Cincinnati Open", ["A B", "C D"]) is None)
 
     # Names that are only particles must not be read as agreement: every Dutch
     # player shares "van", and "de Minaur" and "de Jong" are different people.
@@ -936,7 +1000,8 @@ def test_score_pairing() -> None:
     def entry(mid, home, away):
         return BoardMatch(
             id=mid,
-            tournament=match_tournament("Cincinnati Open"),
+            tour="atp",
+            tournament=match_tournament("Cincinnati Open", "atp"),
             home=home,
             away=away,
             home_tokens=name_tokens(home),
@@ -948,17 +1013,17 @@ def test_score_pairing() -> None:
     particles = ScoreBoard([entry("a", "De Jong J.", "Van Rijthoven T.")])
     check(
         "sharing only a particle is not a pairing",
-        particles.pair("Cincinnati Open", ["Alex de Minaur", "Botic van de Zandschulp"]) is None,
+        particles.pair("atp", "Cincinnati Open", ["Alex de Minaur", "Botic van de Zandschulp"]) is None,
     )
 
     # Two matches that fit equally well is not a coin toss to be won; refusing
     # leaves the market on the fallback, which is at least honest.
     twins = ScoreBoard([entry("x", "Smith J.", "Jones A."), entry("y", "Smith J.", "Jones A.")])
-    check("a genuine tie is refused", twins.pair("Cincinnati Open", ["John Smith", "Alan Jones"]) is None)
+    check("a genuine tie is refused", twins.pair("atp", "Cincinnati Open", ["John Smith", "Alan Jones"]) is None)
 
     # The same fixture on two adjacent day cards is one match, not two.
     same = ScoreBoard([entry("x", "Smith J.", "Jones A."), entry("x", "Smith J.", "Jones A.")])
-    check("the day cards overlap harmlessly", same.pair("Cincinnati Open", ["John Smith", "Alan Jones"]).id == "x")
+    check("the day cards overlap harmlessly", same.pair("atp", "Cincinnati Open", ["John Smith", "Alan Jones"]).id == "x")
 
     # Two brothers across the net: the surname fits either side, so which way
     # round the score goes cannot be read off the names.
@@ -968,7 +1033,8 @@ def test_score_pairing() -> None:
         [
             BoardMatch(
                 id="sib",
-                tournament=match_tournament("Cincinnati Open"),
+                tour="atp",
+                tournament=match_tournament("Cincinnati Open", "atp"),
                 home="Cerundolo F.",
                 away="Cerundolo J. M.",
                 home_tokens=name_tokens("Cerundolo F."),
@@ -978,7 +1044,7 @@ def test_score_pairing() -> None:
             )
         ]
     )
-    sib = brothers.pair("Cincinnati Open", ["Francisco Cerundolo", "Juan Manuel Cerundolo"])
+    sib = brothers.pair("atp", "Cincinnati Open", ["Francisco Cerundolo", "Juan Manuel Cerundolo"])
     check("the match is still identified", sib is not None and sib.id == "sib")
     check("but flagged as un-orientable", sib.oriented is False)
     check("so no score is claimed", sib.score is None)
@@ -991,7 +1057,8 @@ def test_score_pairing() -> None:
         [
             BoardMatch(
                 id="sib",
-                tournament=match_tournament("Cincinnati Open"),
+                tour="atp",
+                tournament=match_tournament("Cincinnati Open", "atp"),
                 home="Cerundolo F.",
                 away="Cerundolo J. M.",
                 home_tokens=name_tokens("Cerundolo F. cerundolo-francisco"),
@@ -1001,7 +1068,7 @@ def test_score_pairing() -> None:
             )
         ]
     )
-    solved = told_apart.pair("Cincinnati Open", ["Juan Manuel Cerundolo", "Francisco Cerundolo"])
+    solved = told_apart.pair("atp", "Cincinnati Open", ["Juan Manuel Cerundolo", "Francisco Cerundolo"])
     check("first names settle it", solved.oriented is True)
     check("and the score comes out the market's way round", solved.score == "2-4")
 
@@ -1586,6 +1653,11 @@ def test_dashboard_series() -> None:
         view = queries.overview(conn)
         check("overview sees the match", len(view["matches"]) == 1)
         check("overview counts by tab", sum(view["counts"].values()) == 1)
+        # The tour rides through to the UI: at a combined event the tournament
+        # name alone cannot say which draw a card belongs to.
+        check("overview carries the tour", view["matches"][0]["tour"] == "atp")
+        check("and offers it as a filter", view["tours"] == ["atp"])
+        check("detail carries it too", detail["tour"] == "atp")
         check("sparkline carries the mid series", len(view["matches"][0]["spark"]) == 2)
         # No score recorded yet: the card has no points to show rather than a
         # stale or invented pair.

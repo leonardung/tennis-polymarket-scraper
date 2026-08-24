@@ -7,10 +7,10 @@ project is for, conventions, workflows).
 
 ## One paragraph
 
-A Python CLI (`src/polymarket/`) polls the Polymarket CLOB for ATP tennis order
-books every 5 seconds while a match is being played -- every 60 seconds before
-it starts, never once it is over -- and, on the same tick, reads the live score
-from Flashscore. Both land in one SQLite file. A FastAPI dashboard
+A Python CLI (`src/polymarket/`) polls the Polymarket CLOB for ATP and WTA tennis
+order books every 5 seconds while a match is being played -- every 60 seconds
+before it starts, never once it is over -- and, on the same tick, reads the live
+score from Flashscore. Both land in one SQLite file. A FastAPI dashboard
 (`src/polymarket/dashboard/`) serves that file read-only to a React + Lightweight
 Charts front end (`frontend/`, built into the Python package). `docker compose`
 runs the capture and the dashboard as two containers off one image, plus an
@@ -22,10 +22,10 @@ package — a fuller Flashscore client that is not imported by anything in `src/
 ```
 src/polymarket/            the package; `polymarket` console script -> cli.main
   cli.py                   argparse; subcommands discover/run/dashboard/stats/sql/clean-scores
-  config.py                all tunables + the ATP tournament whitelist + regexes
+  config.py                all tunables + the two tournament whitelists + regexes
   api.py                   Polymarket: Gamma (catalog) and CLOB (books) HTTP client
   book.py                  Snapshot dataclass; parse_book() normalises a raw book
-  discovery.py             TennisMarket; the three gates that pick ATP singles markets
+  discovery.py             TennisMarket; the three gates that pick tour-level singles
   scores.py                Flashscore feeds, pairing, Ratchet. The subtlest file here.
   poller.py                Poller: the capture loop (tick, score poll, refresh)
   store.py                 Store: SQLite schema, migration, writes, prune_score_events
@@ -41,7 +41,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, TimeSeriesChart, OrderBook,
                            Sparkline, TableView
-tests/test_offline.py      ~331 assertions, no network, plain `python` script
+tests/test_offline.py      ~355 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -115,14 +115,15 @@ score wins rather than the refresh rewinding it every 5 minutes.
 
 Three independent gates, in order:
 
-1. `config.MATCH_SLUG` must match the **event slug** with `tour == "atp"` and no
-   `doubles-` segment. The slug prefix is the only reliable ATP/WTA signal —
-   match events carry generic tags. This is what separates the draws at combined
-   events like Cincinnati.
-2. The tournament name (event title up to the first `:`) must hit
-   `config.TOURNAMENTS` via `match_tournament()`. This is what drops Challengers,
-   which also use the `atp-` slug prefix. `EXCLUDE` and `QUALIFYING` filter
-   further.
+1. `config.MATCH_SLUG` must match the **event slug** with its `tour` in the
+   captured set (`config.TOURS`, both by default) and no `doubles-` segment. The
+   slug prefix is the only reliable ATP/WTA signal — match events carry generic
+   tags. This is what separates the two draws at combined events like Cincinnati,
+   and it decides which calendar gate 2 searches.
+2. The tournament name (event title up to the first `:`) must hit that tour's
+   calendar — `config.ATP_TOURNAMENTS` or `WTA_TOURNAMENTS` — via
+   `match_tournament(name, tour)`. This is what drops Challengers and WTA 125s,
+   which use the same slug prefixes. `EXCLUDE` and `QUALIFYING` filter further.
 3. The market must be tradeable (`acceptingOrders and active and not closed and
    not archived`).
 
@@ -143,7 +144,7 @@ Feeds are `KEY÷VALUE` pairs joined by `¬`, blocks split by `~` (`parse_blocks`
 
 | Feed | Read on | Carries |
 |---|---|---|
-| `f_2_<day>_<tz>_en_1` | market-list refresh, 3 days (`FLASHSCORE_DAYS`) | the whole day card: ids, names, slugs, start times, status, set scores |
+| `f_2_<day>_<tz>_en_1` | market-list refresh, 3 days (`FLASHSCORE_DAYS`) | the whole day card: ids, names, slugs, start times, status, set scores. A `ZA` heading names the circuit (`scores.TOUR_HEADINGS`); anything not under `ATP - SINGLES` or `WTA - SINGLES` is skipped |
 | `df_sur_2_<id>` | every tick, per live match | one match's status + set-by-set score |
 | `dc_2_<id>` | every tick, only while a set is in play | points in the game and who is serving; **optional** — a failure must not lose the reading |
 
@@ -164,8 +165,8 @@ Three mechanisms, each load-bearing:
   `points` and `serving`, which legitimately go backwards (deuce, serve
   alternating). Replayed over a day of real capture this removed 47% of recorded
   score changes, all spurious.
-- **Pairing.** `ScoreBoard.pair(tournament, players, start_time)` matches by
-  tournament **and both players at once**, comparing folded token sets
+- **Pairing.** `ScoreBoard.pair(tour, tournament, players, start_time)` matches by
+  tour and tournament **and both players at once**, comparing folded token sets
   (`name_tokens`: accent-folded, punctuation-split, single letters dropped since
   Flashscore abbreviates first names; `_PARTICLES` drops bare "de"/"van"). Ties
   are broken by more shared tokens, then by proximity to the market's start time.
@@ -191,7 +192,7 @@ One SQLite file, WAL, `synchronous=NORMAL`, `isolation_level=None`.
 
 | Object | Grain | Notes |
 |---|---|---|
-| `markets` | one row per condition_id | metadata + **latest** state/period/score; `raw` is the JSON payload |
+| `markets` | one row per condition_id | metadata (`tour` included) + **latest** state/period/score; `raw` is the JSON payload |
 | `books` | one row per token per written tick | `PRIMARY KEY (token_id, ts) WITHOUT ROWID`; `INSERT OR REPLACE`, so replaying a tick never duplicates |
 | `score_events` | one row per *change* of (state, period, score, game, serving) | `PRIMARY KEY (condition_id, ts)`; this is the timestamped history `markets` lacks |
 | `quotes` | view | spells out direction: `buy_price = best_ask`, `sell_price = best_bid` |
@@ -351,7 +352,8 @@ only activates when the system resolver fails. See `DNS.md`.
 
 | Goal | Touch |
 |---|---|
-| Add / fix a tournament | `config.TOURNAMENTS` (and check with `polymarket discover`) |
+| Add / fix a tournament | `config.ATP_TOURNAMENTS` or `config.WTA_TOURNAMENTS`, whichever tour plays it (and check with `polymarket discover`) |
+| Capture another circuit | `config.TOURS` + a calendar + a `scores.TOUR_HEADINGS` entry; `discovery` and the poller take `tours` as an argument |
 | Change a cadence or window | `config.py` constants; flags in `cli.py` |
 | Change who is polled how often | `poller._due_matches` (`POLL_INTERVAL` / `IDLE_INTERVAL`) |
 | Capture more book depth | `config.BOOK_DEPTH` — `store` columns and `queries._LEVELS` follow automatically; the DB migrates itself, old rows stay NULL |

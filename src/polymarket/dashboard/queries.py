@@ -205,6 +205,7 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
             {
                 "condition_id": cid,
                 "question": market["question"],
+                "tour": market["tour"],
                 "tournament": market["tournament"],
                 "tier": market["tier"],
                 "market_type": market["market_type"],
@@ -237,6 +238,10 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
         "last_tick": last_tick,
         "capturing": last_tick is not None and (now - last_tick) < STALE_AFTER,
         "counts": counts,
+        # Tournament names are shared across the two draws of a combined event,
+        # so the two filters are independent: picking a tour does not shorten
+        # this list, and picking a name does not decide which draw.
+        "tours": sorted({m["tour"] for m in matches if m["tour"]}),
         "tournaments": sorted({m["tournament"] for m in matches if m["tournament"]}),
         "matches": matches,
     }
@@ -319,6 +324,7 @@ def match_detail(conn: sqlite3.Connection, condition_id: str) -> dict[str, Any] 
     return {
         "condition_id": condition_id,
         "question": market["question"],
+        "tour": market["tour"],
         "tournament": market["tournament"],
         "tier": market["tier"],
         "market_type": market["market_type"],

@@ -6,13 +6,18 @@ map, data flow, invariants).
 
 ## What it is
 
-A research capture tool. It records the Polymarket order book for every ATP
-tour-level (250 and above) men's singles match **while it is being played** —
-every 5 seconds, 3 levels deep on each side — into SQLite, with the live score
-read on the same tick so a price and the point it moved on carry the same
-timestamp. A match that has not started yet is read once a minute instead, and
-one that has finished is not read again. A read-only web dashboard browses what
-has been recorded.
+A research capture tool. It records the Polymarket order book for every
+tour-level (250 and above) ATP and WTA singles match **while it is being
+played** — every 5 seconds, 3 levels deep on each side — into SQLite, with the
+live score read on the same tick so a price and the point it moved on carry the
+same timestamp. A match that has not started yet is read once a minute instead,
+and one that has finished is not read again. A read-only web dashboard browses
+what has been recorded.
+
+Both circuits are captured by default; `--tour atp` / `--tour wta` narrows it to
+one. A combined event runs both draws under one tournament name, so the event
+slug's tour prefix is what tells them apart, and each draw is looked up on its
+own calendar.
 
 The point of the dataset is reading price against play: what does the book do
 when a break point is saved, when a set turns, when a match is stopped for rain.
@@ -42,7 +47,8 @@ choose the book.
 
 ## Scale and cost
 
-A Masters has a handful of matches in play at once. Expect tens of thousands of
+A Masters week has a handful of matches in play at once, and a combined week
+roughly twice that, since both draws are on court together. Expect tens of thousands of
 rows a day; a full season fits comfortably inside a gigabyte. The current
 `data/tennis.db` is ~25 MB. A score read is ~200 bytes per live match per tick;
 the day card is ~750 KB every 5 minutes. Points turn over about every 26 seconds,
@@ -70,7 +76,7 @@ discover`.
 ## How to verify a change
 
 ```bash
-uv run python tests/test_offline.py     # ~331 checks, no network
+uv run python tests/test_offline.py     # ~355 checks, no network
 ```
 
 `tests/test_offline.py` is a **plain script, not pytest** — a flat list of
@@ -150,9 +156,11 @@ Other conventions:
   constant lifted from the site and the keys are single letters. If scores start
   coming back empty, check `_STATUS` and `_SET_KEYS` in `scores.py` first — that
   is the expected failure mode, not a bug in the pairing.
-- **The ATP calendar shifts each year.** A tournament missing from
-  `config.TOURNAMENTS` means its matches silently never appear. `discover` is how
-  you check.
+- **Both calendars shift each year.** A tournament missing from
+  `config.ATP_TOURNAMENTS` / `config.WTA_TOURNAMENTS` means its matches silently
+  never appear. `discover` is how you check. The two lists are separate on
+  purpose: a combined event's name is on both, at a different tier each side, and
+  `match_tournament(name, tour)` will not look one up without being told which.
 - **The committed frontend bundle can drift from `frontend/src`.** Nothing
   enforces it.
 - **`.env` holds the Cloudflare tunnel token and is gitignored.** That token *is*
@@ -167,8 +175,9 @@ Other conventions:
 ## Out of scope / deliberately absent
 
 - **Trading, orders, wallets, auth** — never add these without being asked.
-- **WTA, doubles, Challengers, ITF, juniors, qualifying** (qualifying is behind an
-  opt-in flag). The three gates in `discovery.py` enforce this.
+- **Doubles, Challengers, WTA 125s, ITF, juniors, qualifying** (qualifying is
+  behind an opt-in flag). The three gates in `discovery.py` enforce this. ATP and
+  WTA tour level are both **in** scope, since 2026-08-24.
 - **`flashscore-scraper/`** is a standalone package with its own README and CLI.
   Nothing in `src/polymarket/` imports it; `scores.py` is the trimmed, capture-
   oriented reimplementation. Changing one does **not** change the other — decide

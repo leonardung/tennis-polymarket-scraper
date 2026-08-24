@@ -352,11 +352,13 @@ class Store:
         snaps, first, last = cur.execute(
             "SELECT COUNT(*), MIN(ts), MAX(ts) FROM books"
         ).fetchone()
+        # By tour as well as tournament: a combined event runs an ATP and a WTA
+        # draw under one name, and merging them would hide which is which.
         by_tournament = cur.execute(
             """
-            SELECT m.tournament, COUNT(DISTINCT m.condition_id), COUNT(b.ts)
+            SELECT m.tour, m.tournament, COUNT(DISTINCT m.condition_id), COUNT(b.ts)
             FROM markets m LEFT JOIN books b ON b.condition_id = m.condition_id
-            GROUP BY m.tournament ORDER BY 3 DESC
+            GROUP BY m.tour, m.tournament ORDER BY 4 DESC
             """
         ).fetchall()
         return {

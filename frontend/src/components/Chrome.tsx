@@ -31,7 +31,7 @@ export function TopBar({
     <header className="topbar">
       <div className="brand">
         <span className="brand-mark" aria-hidden="true" />
-        <h1>ATP order books</h1>
+        <h1>Tennis order books</h1>
         <span className="brand-sub">Polymarket capture</span>
       </div>
       <div className="topbar-right">
@@ -53,17 +53,20 @@ export function TopBar({
 }
 
 export interface FilterState {
+  tour: string;
   tournament: string;
   search: string;
   sort: string;
 }
 
 export function Filters({
+  tours,
   tournaments,
   value,
   onChange,
   summary,
 }: {
+  tours: string[];
   tournaments: string[];
   value: FilterState;
   onChange: (next: FilterState) => void;
@@ -71,6 +74,25 @@ export function Filters({
 }) {
   return (
     <div className="filters" role="search">
+      {/* Only worth a control once both draws are in the capture; with one tour
+          it would be a select with a single choice in it. */}
+      {tours.length > 1 && (
+        <label className="field">
+          <span className="field-label">Tour</span>
+          <select
+            value={value.tour}
+            onChange={(e) => onChange({ ...value, tour: e.target.value })}
+          >
+            <option value="">All</option>
+            {tours.map((tour) => (
+              <option key={tour} value={tour}>
+                {tour.toUpperCase()}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
       <label className="field">
         <span className="field-label">Tournament</span>
         <select

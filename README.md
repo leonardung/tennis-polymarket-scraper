@@ -1,9 +1,9 @@
-# Polymarket ATP tennis capture
+# Polymarket ATP and WTA tennis capture
 
-Records the Polymarket order book for every ATP tour-level (250 and above) tennis
-match **while it is being played**, every 5 seconds, 3 levels deep on each side,
-into SQLite — with the live score read on the same tick, so a price and the
-point it moved on share a timestamp.
+Records the Polymarket order book for every tour-level (250 and above) ATP and
+WTA singles match **while it is being played**, every 5 seconds, 3 levels deep on
+each side, into SQLite — with the live score read on the same tick, so a price
+and the point it moved on share a timestamp.
 
 ## Commands
 
@@ -45,6 +45,7 @@ triggers an early refresh.
 | `--refresh N` | `300` | seconds between match-list refreshes |
 | `--all-markets` | off | also capture set winner and games/sets over-under |
 | `--include-qualifying` | off | also capture qualifying rounds |
+| `--tour TOUR` | `both` | capture one circuit only: `atp`, `wta` or `both` |
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
@@ -211,9 +212,17 @@ doesn't need a Node toolchain. After changing anything in `frontend/src`, run
 
 ## Which matches are captured
 
-ATP tour level only: Grand Slams, ATP Finals, Masters 1000, ATP 500, ATP 250.
-Men's singles, main draw. Challengers, ITF, WTA, doubles and qualifying are
-excluded.
+Tour level only, both circuits: Grand Slams, the two Finals, Masters 1000 and WTA
+1000, ATP/WTA 500 and 250. Singles, main draw. Challengers, WTA 125s, ITF,
+doubles and qualifying are excluded. `--tour atp` or `--tour wta` narrows the
+capture to one circuit.
+
+A combined event — Cincinnati, Indian Wells, the slams — runs both draws under
+one tournament name, and nothing in the Polymarket payload distinguishes them
+except the event slug's `atp-` / `wta-` prefix. That prefix is what decides which
+calendar the tournament name is looked up on, so the same week is a Masters 1000
+on one side and a WTA 1000 on the other. Every match is stored with its `tour`,
+and the dashboard filters on it.
 
 `run` captures **only matches currently being played**. A finished match keeps
 trading on Polymarket for hours or days until it's resolved, so "still tradeable"
@@ -295,8 +304,10 @@ refresh. `run` reacts by refreshing early, so a finished match stops being
 captured in seconds rather than minutes. Rate-limited to one triggered refresh a
 minute, since a refresh pages the whole tennis catalog.
 
-Pairing a market to a Flashscore match is by tournament and by **both** players
-at once. Polymarket writes "Alex de Minaur" where Flashscore writes "De Minaur
+Pairing a market to a Flashscore match is by tour and tournament and by **both**
+players at once. The day card heads each block with the circuit — `ATP -
+SINGLES`, `WTA - SINGLES` — which is both what keeps a Challenger or a WTA 125
+out and what tells the two draws of a combined event apart. Polymarket writes "Alex de Minaur" where Flashscore writes "De Minaur
 A." and `de-minaur-alex`, so names are compared as folded token sets, ignoring
 initials and bare particles — every Dutch player shares a "van". Requiring both
 sides to agree is what makes a wrong pairing cost two coincidences rather than
@@ -329,9 +340,10 @@ Each match has several markets on Polymarket — the match winner, plus set winn
 and games/sets over-under. Only the **match winner** is captured unless you pass
 `--all-markets`.
 
-The tournament list lives in `TOURNAMENTS` in `src/polymarket/config.py`. The ATP
-calendar shifts a little each year, so if a tournament isn't listed its matches
-won't appear. `discover` is the way to check when a new event starts.
+The tournament lists live in `ATP_TOURNAMENTS` and `WTA_TOURNAMENTS` in
+`src/polymarket/config.py`, one per circuit. Both calendars shift a little each
+year, so if a tournament isn't listed its matches won't appear. `discover` is the
+way to check when a new event starts.
 
 ## What gets stored
 
@@ -339,7 +351,7 @@ Three tables and a view, in one SQLite file.
 
 **`markets`** — one row per match:
 
-`condition_id`, `question`, `tournament`, `tier`, `match_date`, `market_type`,
+`condition_id`, `question`, `tour`, `tournament`, `tier`, `match_date`, `market_type`,
 both player names (`outcome_0`, `outcome_1`) and their token ids, start/end dates,
 and the raw API response.
 

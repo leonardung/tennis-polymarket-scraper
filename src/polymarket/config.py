@@ -1,4 +1,4 @@
-"""Static configuration: ATP calendar whitelist and defaults."""
+"""Static configuration: the ATP and WTA calendar whitelists, and defaults."""
 
 from __future__ import annotations
 
@@ -49,99 +49,196 @@ FLASHSCORE_TZ = 1  # only shifts where the day boundary falls; times are always 
 FLASHSCORE_DAYS = (-1, 0, 1)  # day cards to read, relative to today
 
 
+# Which tours are captured. Both draws of a combined event are recorded, and
+# each is kept on its own calendar below -- the same week at Cincinnati is a
+# Masters 1000 for one tour and a WTA 1000 for the other.
+TOURS: tuple[str, ...] = ("atp", "wta")
+
+
 @dataclass(frozen=True)
 class Tournament:
     name: str
     tier: str
+    tour: str
     patterns: tuple[str, ...]
 
 
-def _t(name: str, tier: str, *patterns: str) -> Tournament:
-    return Tournament(name, tier, patterns or (name.lower(),))
+def _atp(name: str, tier: str, *patterns: str) -> Tournament:
+    return Tournament(name, tier, "atp", patterns or (name.lower(),))
+
+
+def _wta(name: str, tier: str, *patterns: str) -> Tournament:
+    return Tournament(name, tier, "wta", patterns or (name.lower(),))
 
 
 # ATP tour-level calendar. Every entry is ATP 250 or above; tier is informational
 # only, since the filter is really "is this an ATP tour event". Combined events
 # (Indian Wells, Rome, the slams...) also host WTA draws, so matching a tournament
-# here does NOT by itself mean the match is ATP -- see discovery.classify_tour.
-TOURNAMENTS: tuple[Tournament, ...] = (
+# here does NOT by itself mean the match is ATP -- the slug's tour prefix decides
+# that, and it is what picks which of the two calendars is searched.
+ATP_TOURNAMENTS: tuple[Tournament, ...] = (
     # --- Grand Slams ---
-    _t("Australian Open", "grand_slam", "australian open", "aus open", r"\bao\b"),
-    _t("Roland Garros", "grand_slam", "roland garros", "french open"),
-    _t("Wimbledon", "grand_slam", "wimbledon"),
-    _t("US Open", "grand_slam", r"\bus open\b", "usopen"),
+    _atp("Australian Open", "grand_slam", "australian open", "aus open", r"\bao\b"),
+    _atp("Roland Garros", "grand_slam", "roland garros", "french open"),
+    _atp("Wimbledon", "grand_slam", "wimbledon"),
+    _atp("US Open", "grand_slam", r"\bus open\b", "usopen"),
     # --- Season finale ---
-    _t("ATP Finals", "finals", "atp finals", "nitto atp finals", "tour finals"),
+    _atp("ATP Finals", "finals", "atp finals", "nitto atp finals", "tour finals"),
     # --- Masters 1000 ---
-    _t("Indian Wells", "masters", "indian wells", "bnp paribas open"),
-    _t("Miami Open", "masters", "miami open", "miami masters"),
-    _t("Monte-Carlo", "masters", "monte.?carlo", "monaco masters"),
-    _t("Madrid Open", "masters", "madrid"),
-    _t("Italian Open", "masters", "italian open", "rome masters", r"\brome\b", "internazionali"),
-    _t("Canadian Open", "masters", "canadian open", "national bank open", "toronto", "montreal"),
-    _t("Cincinnati Open", "masters", "cincinnati", "western.{0,3}southern"),
-    _t("Shanghai Masters", "masters", "shanghai"),
-    _t("Paris Masters", "masters", "paris masters", "rolex paris", "paris bercy"),
+    _atp("Indian Wells", "masters", "indian wells", "bnp paribas open"),
+    _atp("Miami Open", "masters", "miami open", "miami masters"),
+    _atp("Monte-Carlo", "masters", "monte.?carlo", "monaco masters"),
+    _atp("Madrid Open", "masters", "madrid"),
+    _atp("Italian Open", "masters", "italian open", "rome masters", r"\brome\b", "internazionali"),
+    _atp("Canadian Open", "masters", "canadian open", "national bank open", "toronto", "montreal"),
+    _atp("Cincinnati Open", "masters", "cincinnati", "western.{0,3}southern"),
+    _atp("Shanghai Masters", "masters", "shanghai"),
+    _atp("Paris Masters", "masters", "paris masters", "rolex paris", "paris bercy"),
     # --- ATP 500 ---
-    _t("Rotterdam", "atp_500", "rotterdam", "abn amro"),
-    _t("Qatar Open", "atp_500", "qatar open", "doha"),
-    _t("Dubai", "atp_500", "dubai"),
-    _t("Mexican Open", "atp_500", "mexican open", "acapulco"),
-    _t("Rio Open", "atp_500", "rio open", "rio de janeiro"),
-    _t("Barcelona Open", "atp_500", "barcelona", "godo"),
-    _t("BMW Open", "atp_500", "bmw open", "munich"),
-    _t("Hamburg Open", "atp_500", "hamburg"),
-    _t("Halle", "atp_500", "halle", "terra wortmann"),
-    _t("Queen's Club", "atp_500", "queen.?s club", r"\bqueens\b", "cinch championships"),
-    _t("Washington", "atp_500", "washington", "citi open", "dc open"),
-    _t("China Open", "atp_500", "china open", "beijing"),
-    _t("Japan Open", "atp_500", "japan open", "tokyo"),
-    _t("Vienna", "atp_500", "vienna", "erste bank"),
-    _t("Basel", "atp_500", "basel", "swiss indoors"),
+    _atp("Rotterdam", "atp_500", "rotterdam", "abn amro"),
+    _atp("Qatar Open", "atp_500", "qatar open", "doha"),
+    _atp("Dubai", "atp_500", "dubai"),
+    _atp("Mexican Open", "atp_500", "mexican open", "acapulco"),
+    _atp("Rio Open", "atp_500", "rio open", "rio de janeiro"),
+    _atp("Barcelona Open", "atp_500", "barcelona", "godo"),
+    _atp("BMW Open", "atp_500", "bmw open", "munich"),
+    _atp("Hamburg Open", "atp_500", "hamburg"),
+    _atp("Halle", "atp_500", "halle", "terra wortmann"),
+    _atp("Queen's Club", "atp_500", "queen.?s club", r"\bqueens\b", "cinch championships"),
+    _atp("Washington", "atp_500", "washington", "citi open", "dc open"),
+    _atp("China Open", "atp_500", "china open", "beijing"),
+    _atp("Japan Open", "atp_500", "japan open", "tokyo"),
+    _atp("Vienna", "atp_500", "vienna", "erste bank"),
+    _atp("Basel", "atp_500", "basel", "swiss indoors"),
     # --- ATP 250 ---
-    _t("Brisbane", "atp_250", "brisbane"),
-    _t("Adelaide", "atp_250", "adelaide"),
-    _t("Auckland", "atp_250", "auckland", "asb classic"),
-    _t("Hong Kong", "atp_250", "hong kong"),
-    _t("Montpellier", "atp_250", "montpellier"),
-    _t("Dallas", "atp_250", "dallas"),
-    _t("Delray Beach", "atp_250", "delray"),
-    _t("Marseille", "atp_250", "marseille", "open 13"),
-    _t("Argentina Open", "atp_250", "argentina open", "buenos aires"),
-    _t("Chile Open", "atp_250", "chile open", "santiago"),
-    _t("Cordoba", "atp_250", "cordoba", "córdoba"),
-    _t("Houston", "atp_250", "houston"),
-    _t("Marrakech", "atp_250", "marrakech", "hassan ii"),
-    _t("Bucharest", "atp_250", "bucharest"),
-    _t("Estoril", "atp_250", "estoril"),
-    _t("Geneva", "atp_250", "geneva"),
-    _t("Lyon", "atp_250", "lyon"),
-    _t("Stuttgart", "atp_250", "stuttgart", "boss open"),
-    _t("s-Hertogenbosch", "atp_250", "hertogenbosch", "libema", "rosmalen"),
-    _t("Mallorca", "atp_250", "mallorca"),
-    _t("Eastbourne", "atp_250", "eastbourne"),
-    _t("Newport", "atp_250", "newport", "hall of fame"),
-    _t("Bastad", "atp_250", "bastad", "båstad", "nordea"),
-    _t("Gstaad", "atp_250", "gstaad", "swiss open"),
-    _t("Umag", "atp_250", "umag", "croatia open"),
-    _t("Kitzbuhel", "atp_250", "kitzbuhel", "kitzbühel"),
-    _t("Atlanta", "atp_250", "atlanta"),
-    _t("Los Cabos", "atp_250", "los cabos", "mifel"),
-    _t("Winston-Salem", "atp_250", "winston.?salem"),
-    _t("Chengdu", "atp_250", "chengdu"),
-    _t("Hangzhou", "atp_250", "hangzhou"),
-    _t("Almaty", "atp_250", "almaty"),
-    _t("Stockholm", "atp_250", "stockholm"),
-    _t("Antwerp", "atp_250", "antwerp", "european open"),
-    _t("Brussels", "atp_250", "brussels"),
-    _t("Metz", "atp_250", "metz", "moselle"),
-    _t("Belgrade", "atp_250", "belgrade"),
-    _t("Sofia", "atp_250", "sofia"),
+    _atp("Brisbane", "atp_250", "brisbane"),
+    _atp("Adelaide", "atp_250", "adelaide"),
+    _atp("Auckland", "atp_250", "auckland", "asb classic"),
+    _atp("Hong Kong", "atp_250", "hong kong"),
+    _atp("Montpellier", "atp_250", "montpellier"),
+    _atp("Dallas", "atp_250", "dallas"),
+    _atp("Delray Beach", "atp_250", "delray"),
+    _atp("Marseille", "atp_250", "marseille", "open 13"),
+    _atp("Argentina Open", "atp_250", "argentina open", "buenos aires"),
+    _atp("Chile Open", "atp_250", "chile open", "santiago"),
+    _atp("Cordoba", "atp_250", "cordoba", "córdoba"),
+    _atp("Houston", "atp_250", "houston"),
+    _atp("Marrakech", "atp_250", "marrakech", "hassan ii"),
+    _atp("Bucharest", "atp_250", "bucharest"),
+    _atp("Estoril", "atp_250", "estoril"),
+    _atp("Geneva", "atp_250", "geneva"),
+    _atp("Lyon", "atp_250", "lyon"),
+    _atp("Stuttgart", "atp_250", "stuttgart", "boss open"),
+    _atp("s-Hertogenbosch", "atp_250", "hertogenbosch", "libema", "rosmalen"),
+    _atp("Mallorca", "atp_250", "mallorca"),
+    _atp("Eastbourne", "atp_250", "eastbourne"),
+    _atp("Newport", "atp_250", "newport", "hall of fame"),
+    _atp("Bastad", "atp_250", "bastad", "båstad", "nordea"),
+    _atp("Gstaad", "atp_250", "gstaad", "swiss open"),
+    _atp("Umag", "atp_250", "umag", "croatia open"),
+    _atp("Kitzbuhel", "atp_250", "kitzbuhel", "kitzbühel"),
+    _atp("Atlanta", "atp_250", "atlanta"),
+    _atp("Los Cabos", "atp_250", "los cabos", "mifel"),
+    _atp("Winston-Salem", "atp_250", "winston.?salem"),
+    _atp("Chengdu", "atp_250", "chengdu"),
+    _atp("Hangzhou", "atp_250", "hangzhou"),
+    _atp("Almaty", "atp_250", "almaty"),
+    _atp("Stockholm", "atp_250", "stockholm"),
+    _atp("Antwerp", "atp_250", "antwerp", "european open"),
+    _atp("Brussels", "atp_250", "brussels"),
+    _atp("Metz", "atp_250", "metz", "moselle"),
+    _atp("Belgrade", "atp_250", "belgrade"),
+    _atp("Sofia", "atp_250", "sofia"),
 )
 
-_COMPILED = tuple(
-    (t, tuple(re.compile(p, re.I) for p in t.patterns)) for t in TOURNAMENTS
+# WTA tour-level calendar, on the same terms: WTA 250 or above, which is what
+# drops the 125s and the ITF circuit. A separate list rather than a tier on the
+# entries above, because the two tours share a great many names and agree on
+# nothing else -- Stuttgart is an ATP 250 and a WTA 500, Tokyo is two different
+# tournaments in two different weeks.
+WTA_TOURNAMENTS: tuple[Tournament, ...] = (
+    # --- Grand Slams ---
+    _wta("Australian Open", "grand_slam", "australian open", "aus open", r"\bao\b"),
+    _wta("Roland Garros", "grand_slam", "roland garros", "french open"),
+    _wta("Wimbledon", "grand_slam", "wimbledon"),
+    _wta("US Open", "grand_slam", r"\bus open\b", "usopen"),
+    # --- Season finale ---
+    _wta("WTA Finals", "finals", "wta finals", "tour finals"),
+    # --- WTA 1000 ---
+    _wta("Qatar Open", "wta_1000", "qatar open", "doha"),
+    _wta("Dubai", "wta_1000", "dubai"),
+    _wta("Indian Wells", "wta_1000", "indian wells", "bnp paribas open"),
+    _wta("Miami Open", "wta_1000", "miami open", "miami masters"),
+    _wta("Madrid Open", "wta_1000", "madrid"),
+    _wta("Italian Open", "wta_1000", "italian open", r"\brome\b", "internazionali"),
+    _wta("Canadian Open", "wta_1000", "canadian open", "national bank open", "toronto", "montreal"),
+    _wta("Cincinnati Open", "wta_1000", "cincinnati", "western.{0,3}southern"),
+    _wta("China Open", "wta_1000", "china open", "beijing"),
+    _wta("Wuhan Open", "wta_1000", "wuhan"),
+    # --- WTA 500 ---
+    _wta("Brisbane", "wta_500", "brisbane"),
+    _wta("Adelaide", "wta_500", "adelaide"),
+    _wta("Linz", "wta_500", "linz", "upper austria"),
+    _wta("Abu Dhabi", "wta_500", "abu dhabi", "mubadala"),
+    _wta("Monterrey", "wta_500", "monterrey", "mexican open"),
+    _wta("Merida", "wta_500", "merida", "mérida"),
+    _wta("Charleston", "wta_500", "charleston", "credit one"),
+    _wta("Stuttgart", "wta_500", "stuttgart", "porsche"),
+    _wta("Strasbourg", "wta_500", "strasbourg"),
+    _wta("Berlin", "wta_500", "berlin", "ecotrans"),
+    _wta("Bad Homburg", "wta_500", "bad homburg"),
+    _wta("Eastbourne", "wta_500", "eastbourne"),
+    _wta("Washington", "wta_500", "washington", "citi open", "dc open"),
+    _wta("Guadalajara", "wta_500", "guadalajara", "akron"),
+    _wta("Seoul", "wta_500", "seoul", "korea open"),
+    _wta("Tokyo", "wta_500", "toray", "pan pacific", "tokyo"),
+    _wta("Ningbo", "wta_500", "ningbo"),
+    _wta("Zhengzhou", "wta_500", "zhengzhou"),
+    _wta("San Diego", "wta_500", "san diego"),
+    # --- WTA 250 ---
+    _wta("Auckland", "wta_250", "auckland", "asb classic"),
+    _wta("Hobart", "wta_250", "hobart"),
+    _wta("Cluj-Napoca", "wta_250", "cluj"),
+    _wta("Singapore", "wta_250", "singapore"),
+    _wta("Austin", "wta_250", "austin", r"\batx\b"),
+    _wta("Bogota", "wta_250", "bogota", "bogotá"),
+    _wta("Sao Paulo", "wta_250", "sao paulo", "são paulo", "sp open"),
+    _wta("Rouen", "wta_250", "rouen"),
+    _wta("Rabat", "wta_250", "rabat", "morocco"),
+    _wta("Nottingham", "wta_250", "nottingham"),
+    _wta("Birmingham", "wta_250", "birmingham"),
+    _wta("s-Hertogenbosch", "wta_250", "hertogenbosch", "libema", "rosmalen"),
+    _wta("Lausanne", "wta_250", "lausanne"),
+    _wta("Hamburg", "wta_250", "hamburg"),
+    _wta("Budapest", "wta_250", "budapest"),
+    _wta("Iasi", "wta_250", "iasi", "iaşi", "iași"),
+    _wta("Prague", "wta_250", "prague"),
+    _wta("Warsaw", "wta_250", "warsaw"),
+    _wta("Palermo", "wta_250", "palermo"),
+    _wta("Cleveland", "wta_250", "cleveland", "tennis in the land"),
+    _wta("Monastir", "wta_250", "monastir", "jasmin open"),
+    _wta("Guangzhou", "wta_250", "guangzhou"),
+    _wta("Hua Hin", "wta_250", "hua hin", "thailand open"),
+    _wta("Jiangxi", "wta_250", "jiangxi", "nanchang"),
+    _wta("Osaka", "wta_250", "osaka"),
+    _wta("Hong Kong", "wta_250", "hong kong"),
+    _wta("Chennai", "wta_250", "chennai"),
 )
+
+# Every tour-level event on either calendar. Nothing filters on this -- it is
+# the whole whitelist, for anything that wants to report on it.
+TOURNAMENTS: tuple[Tournament, ...] = ATP_TOURNAMENTS + WTA_TOURNAMENTS
+
+# Compiled once, per tour: a name is only ever looked up on the calendar of the
+# tour that asked about it.
+_COMPILED: dict[str, tuple[tuple[Tournament, tuple[re.Pattern[str], ...]], ...]] = {
+    tour: tuple(
+        (t, tuple(re.compile(p, re.I) for p in t.patterns))
+        for t in TOURNAMENTS
+        if t.tour == tour
+    )
+    for tour in TOURS
+}
 
 # Polymarket slugs every head-to-head as "<tour>-[doubles-]<p1>-<p2>-<YYYY-MM-DD>",
 # e.g. "atp-norrie-navone-2026-05-20" or "wta-doubles-alexgib-chanjoi-2026-07-28".
@@ -151,21 +248,27 @@ MATCH_SLUG = re.compile(
     r"^(?P<tour>atp|wta|itf)-(?P<doubles>doubles-)?.+-(?P<date>\d{4}-\d{2}-\d{2})$"
 )
 
-# The "atp" prefix means men's professional, NOT tour level -- Challengers use it
-# too (Sion, Kingston, Todi...). TOURNAMENTS above is what enforces "250 or above".
+# A tour prefix names the circuit, NOT its level -- Challengers are slugged "atp"
+# (Sion, Kingston, Todi...) and the 125s "wta". The calendars above are what
+# enforce "250 or above" on each side.
 QUALIFYING = re.compile(r"\bqualif\w*\b", re.I)
 
-# Non-tour formats that can still appear under an ATP-level tournament name.
+# Non-tour formats that can still appear under a tour-level tournament name.
 EXCLUDE = re.compile(
     r"\b(juniors?|exhibition|utr|uts|laver cup|next ?gen|legends|wheelchair)\b", re.I
 )
 
 
-def match_tournament(text: str) -> Tournament | None:
-    """Return the ATP tour event whose name appears in `text`, if any."""
+def match_tournament(text: str, tour: str) -> Tournament | None:
+    """Return the tour-level event whose name appears in `text`, if any.
+
+    The tour has to be given rather than inferred from the name: a combined
+    event runs both draws under one title, so "Cincinnati Open" is a Masters
+    1000 or a WTA 1000 depending only on which draw is asking.
+    """
     if not text:
         return None
-    for tournament, patterns in _COMPILED:
+    for tournament, patterns in _COMPILED.get(tour, ()):
         if any(p.search(text) for p in patterns):
             return tournament
     return None

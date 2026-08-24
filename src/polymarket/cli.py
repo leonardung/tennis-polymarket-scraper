@@ -25,6 +25,7 @@ from .config import (
     IDLE_INTERVAL,
     POLL_INTERVAL,
     REFRESH_INTERVAL,
+    TOURS,
 )
 from .discovery import discover
 from .poller import Poller
@@ -43,6 +44,11 @@ def _setup_logging(verbose: bool) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+def _tours(args: argparse.Namespace) -> tuple[str, ...]:
+    """Which circuits this invocation captures. Both unless told otherwise."""
+    return TOURS if args.tour == "both" else (args.tour,)
+
+
 def cmd_discover(args: argparse.Namespace) -> int:
     with Polymarket() as api, Flashscore() as scores:
         kept, skipped = discover(
@@ -51,6 +57,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
             all_markets=args.all_markets,
             include_qualifying=args.include_qualifying,
             live_only=args.live_only,
+            tours=_tours(args),
         )
 
     if args.json:
@@ -62,12 +69,14 @@ def cmd_discover(args: argparse.Namespace) -> int:
         )
         return 0
 
-    print(f"\n{len(kept)} ATP market(s) to capture:\n")
-    by_tournament: dict[str, list] = {}
+    print(f"\n{len(kept)} market(s) to capture:\n")
+    # Keyed by tour as well as name: a combined event runs both draws under one
+    # tournament name, and they are two different draws.
+    by_tournament: dict[tuple[str, str], list] = {}
     for market in kept:
-        by_tournament.setdefault(market.tournament, []).append(market)
-    for tournament, markets in sorted(by_tournament.items()):
-        print(f"  {tournament} ({markets[0].tier}) -- {len(markets)} market(s)")
+        by_tournament.setdefault((market.tour, market.tournament), []).append(market)
+    for (tour, tournament), markets in sorted(by_tournament.items()):
+        print(f"  [{tour.upper()}] {tournament} ({markets[0].tier}) -- {len(markets)} market(s)")
         for market in markets:
             status = market.state.upper() if market.state == "live" else market.state
             detail = f" {market.period} {market.score}" if market.state == "live" else ""
@@ -81,8 +90,8 @@ def cmd_discover(args: argparse.Namespace) -> int:
         if len(skipped) > 20:
             print(f"  ... and {len(skipped) - 20} more")
     if not kept:
-        print("  nothing matched -- no ATP tour matches open right now,")
-        print("  or a tournament is missing from TOURNAMENTS in config.py")
+        print("  nothing matched -- no tour-level matches open right now,")
+        print("  or a tournament is missing from the calendars in config.py")
     print()
     return 0
 
@@ -107,12 +116,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             live_only=not args.include_upcoming,
             only_changes=not args.every_tick,
             heartbeat=args.heartbeat,
+            tours=_tours(args),
         )
         logging.info(
-            "capturing depth-%d books and scores into %s: every %.0fs while a match "
+            "capturing depth-%d %s books and scores into %s: every %.0fs while a match "
             "is in play, every %.0fs before it starts, never once it is over "
             "(%s matches, %s)",
             BOOK_DEPTH,
+            "/".join(t.upper() for t in _tours(args)),
             args.db,
             args.interval,
             args.idle_interval,
@@ -180,9 +191,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"window    {fmt(stats['first_ts'])} -> {fmt(stats['last_ts'])}\n")
     rows = stats["by_tournament"]
     if isinstance(rows, list) and rows:
-        print(f"  {'tournament':<20} {'markets':>8} {'snapshots':>10}")
-        for tournament, markets, snaps in rows:
-            print(f"  {(tournament or '-'):<20} {markets:>8} {snaps:>10}")
+        print(f"  {'tour':<5} {'tournament':<20} {'markets':>8} {'snapshots':>10}")
+        for tour, tournament, markets, snaps in rows:
+            label = (tour or "-").upper()
+            print(f"  {label:<5} {(tournament or '-'):<20} {markets:>8} {snaps:>10}")
     print()
     return 0
 
@@ -273,6 +285,12 @@ def main(argv: list[str] | None = None) -> int:
         help="also capture qualifying-round matches",
     )
     common.add_argument(
+        "--tour",
+        choices=("atp", "wta", "both"),
+        default="both",
+        help="which circuit to capture (default: both)",
+    )
+    common.add_argument(
         "--dns",
         choices=("auto", "always", "never"),
         default="auto",
@@ -281,7 +299,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     parser = argparse.ArgumentParser(
-        prog="polymarket", description="Capture ATP tennis order books from Polymarket"
+        prog="polymarket",
+        description="Capture ATP and WTA tennis order books from Polymarket",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

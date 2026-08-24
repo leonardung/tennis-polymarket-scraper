@@ -12,6 +12,7 @@ import logging
 import signal
 import time
 from dataclasses import dataclass
+from typing import Sequence
 
 import httpx
 
@@ -27,6 +28,7 @@ from .config import (
     REFRESH_INTERVAL,
     SCORE_LEAD,
     START_GRACE,
+    TOURS,
 )
 from .discovery import discover, seconds_from_now
 from .scores import Flashscore, Paired, Ratchet, ScoreBoard
@@ -79,6 +81,7 @@ class Poller:
         only_changes: bool = True,
         heartbeat: float = HEARTBEAT,
         scores: Flashscore | None = None,
+        tours: Sequence[str] = TOURS,
     ) -> None:
         self.api = api
         self.store = store
@@ -93,6 +96,7 @@ class Poller:
         self.refresh_interval = refresh_interval
         self.all_markets = all_markets
         self.include_qualifying = include_qualifying
+        self.tours = tuple(tours)
         self.live_only = live_only
         self.only_changes = only_changes
         self.heartbeat = heartbeat
@@ -133,6 +137,7 @@ class Poller:
             all_markets=self.all_markets,
             include_qualifying=self.include_qualifying,
             live_only=self.live_only,
+            tours=self.tours,
         )
         tracked: dict[str, Tracked] = {}
         for market in kept:

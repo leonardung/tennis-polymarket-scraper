@@ -27,6 +27,8 @@ export interface LastTrade {
 export interface MatchSummary {
   condition_id: string;
   question: string;
+  /** "atp" or "wta" -- the draw, which a combined event's name cannot say. */
+  tour: string | null;
   tournament: string | null;
   tier: string | null;
   market_type: string | null;
@@ -54,6 +56,7 @@ export interface Overview {
   last_tick: number | null;
   capturing: boolean;
   counts: Record<MatchState, number>;
+  tours: string[];
   tournaments: string[];
   matches: MatchSummary[];
 }
@@ -90,6 +93,7 @@ export interface ScoreEvent {
 export interface MatchDetail {
   condition_id: string;
   question: string;
+  tour: string | null;
   tournament: string | null;
   tier: string | null;
   market_type: string | null;
