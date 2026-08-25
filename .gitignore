@@ -22,6 +22,7 @@ frontend/.vite/
 *.tsbuildinfo
 
 screenshots/
+polymarket-history-data/
 
 # The Cloudflare tunnel token. See .env.example for what belongs here.
 .env
