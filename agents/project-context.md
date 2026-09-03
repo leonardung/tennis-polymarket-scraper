@@ -169,9 +169,12 @@ Other conventions:
   the environment, never on a command line. `.env.example` documents the shape.
 - **The tunnel origin is `dashboard:8787`, not `localhost:8787`**, and
   `network_mode: "service:dashboard"` is a trap that 502s after every rebuild.
-- **Polymarket serves a STALE book during an outage rather than failing.** Every
-  request still returns 200 in milliseconds; the book behind it just stops
-  changing. The tick log cannot show it -- "0 rows, all unchanged" is equally what
+- **Polymarket PAUSES TRADING during a CLOB incident, and the API keeps serving
+  the last book.** Every request still returns 200 in milliseconds; the book
+  behind it simply stops changing, because the market it describes is halted.
+  That is also why `book_ts` freezes at a different moment for each token -- it
+  is each market's last trade before the halt, not the halt itself. Their stated
+  root cause is database replica lag (an internal DB issue they took to AWS). The tick log cannot show it -- "0 rows, all unchanged" is equally what
   a calm market looks like -- and their status page has run hours behind, and
   uptime monitors call the CLOB healthy throughout because the endpoint answers.
   `book_ts` (the book's own timestamp) is the only local signal, and the capture
