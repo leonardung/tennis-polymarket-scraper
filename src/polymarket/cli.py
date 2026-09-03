@@ -27,6 +27,7 @@ from .config import (
     POLL_INTERVAL,
     REFRESH_INTERVAL,
     STALE_AFTER,
+    STATS_INTERVAL,
     TOURS,
 )
 from .discovery import discover
@@ -118,6 +119,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             live_only=not args.include_upcoming,
             only_changes=not args.every_tick,
             record_stats=not args.no_stats,
+            stats_interval=args.stats_interval,
             heartbeat=args.heartbeat,
             stale_after=args.stale_after,
             tours=_tours(args),
@@ -383,6 +385,13 @@ def main(argv: list[str] | None = None) -> int:
         help="do not record match statistics -- aces, winners, points won and the rest. "
         "They cost one extra Flashscore read per live match per tick, and a final "
         f"per-set reading {FINAL_STATS_DELAY / 3600:.0f}h after each match ends",
+    )
+    p_run.add_argument(
+        "--stats-interval",
+        type=float,
+        default=STATS_INTERVAL,
+        help="floor between statistics reads of one match, seconds; a point takes about "
+        f"26s, so this is oversampling already (default {STATS_INTERVAL:.0f})",
     )
     p_run.add_argument(
         "--heartbeat",

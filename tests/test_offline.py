@@ -2144,7 +2144,9 @@ def test_stats_poll() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         with Store(Path(tmp) / "s.db") as store:
-            poller = Poller(api, store, scores=feed)
+            # No floor between reads here: these checks poll several times in
+            # the same instant, and the floor gets its own test below.
+            poller = Poller(api, store, scores=feed, stats_interval=0)
             poller.refresh()
             cid = next(iter(poller.watched))
 
@@ -2184,6 +2186,24 @@ def test_stats_poll() -> None:
 
             check("--no-stats records nothing at all",
                   Poller(api, store, scores=feed, record_stats=False).poll_stats() == 0)
+
+    # The floor is on the read, not on the write: it decides how many ticks ask
+    # Flashscore at all. It exists because the reads are sequential on one
+    # connection with the score reads and a point takes about 26 seconds, so at
+    # --interval=2 an unfloored read spends most of a slam-day tick learning
+    # nothing -- and that tick is what the books are written on.
+    feed.stats_by_id["fs0"] = feed_at("9", 100)
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "s.db") as store:
+            poller = Poller(api, store, scores=feed, stats_interval=3600)
+            poller.refresh()
+            check("the first tick reads", poller.poll_stats() == 1)
+            calls = len(feed.stat_calls)
+            feed.stats_by_id["fs0"] = feed_at("10", 101)
+            check("the next tick does not write", poller.poll_stats() == 0)
+            check("because it did not read", len(feed.stat_calls) == calls)
+            poller._last_stat_poll.clear()  # as if the floor had elapsed
+            check("once the floor is up it reads again", poller.poll_stats() == 1)
 
 
 if __name__ == "__main__":

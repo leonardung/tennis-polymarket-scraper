@@ -63,6 +63,16 @@ FLASHSCORE_DAYS = (-1, 0, 1)  # day cards to read, relative to today
 # almost every point, so the overall block is the one recorded live and only
 # where it changed, exactly as a book snapshot is.
 STATS_TIMEOUT = 6.0  # per-match read; same reasoning as SCORE_TIMEOUT
+# A floor between statistics reads of one match, on top of the tick cadence.
+# The score is read every tick because a point can be scored at any moment and
+# the book moves with it; the statistics describe the point that was just
+# played, and a point takes about 26 seconds. At --interval=2 an unfloored read
+# asks thirteen times per point, and those requests are sequential on one
+# connection with the score reads -- at a slam, with sixteen matches on court,
+# that is what pushes a tick past its own budget and starts costing book
+# snapshots. Five seconds still sees every point five times over. Raising
+# --interval above this makes it a no-op.
+STATS_INTERVAL = 5.0
 # Flashscore keeps correcting a finished match's statistics for a while after
 # the last point -- an unforced error becomes a winner, the speed radar's
 # numbers are revised -- so the per-set breakdown is taken once, late, rather

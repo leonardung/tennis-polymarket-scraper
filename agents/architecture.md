@@ -104,11 +104,17 @@ Each iteration, in order:
    `Ratchet`, and written to `markets` (`update_scores`) plus `score_events`
    (`record_score_events`, changes only).
 3. **`poll_stats(due)`** — `_stat_targets(due)` narrows further than the score
-   does: matches in play only, and only those whose pairing is `oriented`. One
-   `df_st_2_<id>` per match, through `StatRatchet`, written to `stat_events`
-   (`record_stat_events`, changes only). Before a match starts this feed answers
-   with a full set of zeros — a shape, not an absence — which is why upcoming
-   matches are excluded rather than merely deduplicated.
+   does: matches in play only, only those whose pairing is `oriented`, and only
+   those not read within `STATS_INTERVAL`=5s. One `df_st_2_<id>` per match,
+   through `StatRatchet`, written to `stat_events` (`record_stat_events`,
+   changes only). Before a match starts this feed answers with a full set of
+   zeros — a shape, not an absence — which is why upcoming matches are excluded
+   rather than merely deduplicated. Like `_due_matches`, it **stamps what it
+   returns**, so call it once a tick. The 5s floor is about the tick budget, not
+   the data: these reads are sequential on one connection with the score reads,
+   and at `--interval=2` (which is what compose runs) sixteen live matches would
+   otherwise spend most of a tick to learn nothing — and that tick is what the
+   books are written on.
 4. **`collect_final_stats()`** — once a minute (`FINAL_STATS_CHECK`), not once a
    tick. `store.matches_awaiting_set_stats` is the queue: matches that ended
    more than `FINAL_STATS_DELAY`=1h ago, less than `FINAL_STATS_WINDOW`=24h ago,
@@ -396,7 +402,10 @@ only activates when the system resolver fails. See `DNS.md`.
 1. **A tick's price, score and statistics share a timestamp.** A match's book,
    score and statistics are read in the same pass, off one `due` set. There is no
    separate score interval (there was; it was removed) -- what varies is which
-   matches a tick reads, not which feed.
+   matches a tick reads, not which feed. `STATS_INTERVAL` is the one
+   qualification, and it does not weaken this: it drops whole statistics reads,
+   so a statistics row is still written on a tick that read that match's book
+   and score. It never lets the three describe different moments.
 2. **Score and statistics reads stay on one connection, sequential.** See
    `Flashscore.__init__`; `stat_readings` is a loop for the same reason
    `readings` is.

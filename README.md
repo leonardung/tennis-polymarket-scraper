@@ -51,6 +51,7 @@ triggers an early refresh.
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--no-stats` | off | don't record match statistics (see [Match statistics](#match-statistics)) |
+| `--stats-interval N` | `5` | floor between statistics reads of one match, on top of `--interval` |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
 | `--stale-after N` | `120` | warn when every in-play book is this far behind its own upstream timestamp |
 | `--dns MODE` | `auto` | see [DNS.md](DNS.md) |
@@ -369,7 +370,13 @@ broken down by set. One request, `df_st_2_<id>`, returns all of it.
 
 The counters move on nearly every point, so the running totals are read on the
 tick with the book and the score, and, like a book snapshot, **only what changed
-is written**. Nothing gets a heartbeat row here: a book that stops moving is
+is written**. There is a floor of `--stats-interval` (5s) between reads of one
+match, and it is there for the tick rather than for the data: these reads are
+sequential on one connection with the score reads, a point takes about 26
+seconds, and at `--interval=2` an unfloored read asks thirteen times per point —
+which at a slam, with sixteen matches on court, is what pushes a tick past its
+own budget and starts costing book snapshots. A tick that does read them still
+reads them beside that tick's book and score. Nothing gets a heartbeat row here: a book that stops moving is
 ambiguous, but a statistic that stops moving is not, because `books` and
 `score_events` are writing on the same tick and already say whether anything was
 running. In practice a match in play produces a row every ten seconds or so —

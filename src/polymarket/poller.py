@@ -37,6 +37,7 @@ from .config import (
     POLL_INTERVAL,
     REFRESH_INTERVAL,
     SCORE_LEAD,
+    STATS_INTERVAL,
     STALE_AFTER,
     STALE_WARN_EVERY,
     START_GRACE,
@@ -98,6 +99,7 @@ class Poller:
         live_only: bool = True,
         only_changes: bool = True,
         record_stats: bool = True,
+        stats_interval: float = STATS_INTERVAL,
         heartbeat: float = HEARTBEAT,
         stale_after: float = STALE_AFTER,
         scores: Flashscore | None = None,
@@ -123,6 +125,7 @@ class Poller:
         self.live_only = live_only
         self.only_changes = only_changes
         self.record_stats = record_stats
+        self.stats_interval = stats_interval
         self.heartbeat = heartbeat
         self.stale_after = stale_after
         self.tracked: dict[str, Tracked] = {}
@@ -139,6 +142,7 @@ class Poller:
         # many times each match in it has been asked for without an answer. The
         # counts are deliberately not persisted: a match Flashscore has nothing
         # for should stop being asked, but a restart is a fair reason to retry.
+        self._last_stat_poll: dict[str, float] = {}  # by condition_id, monotonic
         self._final_checked: float = 0.0
         self._final_tries: dict[str, int] = {}
         self._state_changed = False
@@ -206,6 +210,7 @@ class Poller:
         }
         for condition_id in set(self._last_poll) - self._followed():
             self._last_poll.pop(condition_id, None)
+            self._last_stat_poll.pop(condition_id, None)
             self._retired.discard(condition_id)
         self._state_changed = False
 
@@ -448,7 +453,19 @@ class Poller:
         out too. Its statistics are per player, and a mirrored row is worse
         than no row -- the same call ``Paired.oriented`` already makes for the
         score.
+
+        `stats_interval` is a floor on top of the tick, and the reason it
+        exists is the tick budget rather than the data: the reads are
+        sequential on one connection with the score reads, and a point takes
+        about 26 seconds, so asking every two seconds spends most of a slam-day
+        tick to learn nothing. A tick that does read them still reads them
+        beside that tick's book and score -- what the floor changes is how many
+        ticks do, never whether a statistic and the price beside it describe
+        one moment.
+
+        Stamps what it returns, like ``_due_matches``: call it once a tick.
         """
+        now = time.monotonic()
         targets = []
         for condition_id, watched in self.watched.items():
             if due is not None and condition_id not in due:
@@ -457,6 +474,10 @@ class Poller:
                 continue
             if not watched.pairing.oriented:
                 continue
+            last = self._last_stat_poll.get(condition_id)
+            if last is not None and now - last < self.stats_interval:
+                continue
+            self._last_stat_poll[condition_id] = now
             targets.append(watched)
         return targets
 
