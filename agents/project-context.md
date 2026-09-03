@@ -8,9 +8,9 @@ map, data flow, invariants).
 
 A research capture tool. It records the Polymarket order book for every
 tour-level (250 and above) ATP and WTA singles match **while it is being
-played** — every 5 seconds, 3 levels deep on each side — into SQLite, with the
-live score read on the same tick so a price and the point it moved on carry the
-same timestamp. A match that has not started yet is read once a minute instead,
+played** — every 5 seconds, 10 levels deep on each side — into SQLite, with the
+live score and the match statistics read on the same tick so a price, the point
+it moved on and the aces behind it carry the same timestamp. A match that has not started yet is read once a minute instead,
 and one that has finished is not read again. A read-only web dashboard browses
 what has been recorded.
 
@@ -22,8 +22,16 @@ own calendar.
 The point of the dataset is reading price against play: what does the book do
 when a break point is saved, when a set turns, when a match is stopped for rain.
 That is why the score is timestamped in its own table rather than only kept as a
-current value, and why the book and the score of one match are always read in the
-same pass, on that match's own cadence.
+current value, and why the book, the score and the statistics of one match are
+always read in the same pass, on that match's own cadence.
+
+The statistics are there because the score alone does not say *how* a game was
+won. 30-40 is a break point either way; whether it was saved on an ace or handed
+over on a double fault is in `stat_events`, on the same clock as the price. They
+are recorded like a book snapshot -- every tick, changes only -- and then taken
+again once, an hour after the match, broken down by set, because Flashscore goes
+on revising a finished match and that late reading is the one to check the live
+capture against.
 
 **It only reads.** There is no trading, no wallet, no authentication, no order
 placement anywhere in the codebase, and none of the APIs it touches require auth.
@@ -50,11 +58,18 @@ choose the book.
 A Masters week has a handful of matches in play at once, and a combined week
 roughly twice that, since both draws are on court together. Expect tens of thousands of
 rows a day; a full season fits comfortably inside a gigabyte. The current
-`data/tennis.db` is ~25 MB. A score read is ~200 bytes per live match per tick;
-the day card is ~750 KB every 5 minutes. Points turn over about every 26 seconds,
-so the 5-second tick sees every point with room to spare. Only matches in play
-run at that cadence -- a full day card of matches yet to start costs one poll a
-minute each.
+`data/tennis.db` is ~25 MB. A score read is ~200 bytes per live match per tick
+and a statistics read about a kilobyte on the wire and 50 ms; the day card is
+~750 KB every 5 minutes. Points turn over about every 26 seconds, so the
+5-second tick sees every point with room to spare. Only matches in play run at
+that cadence -- a full day card of matches yet to start costs one poll a minute
+each.
+
+The statistics are the cheapest table by row count and the widest by column
+count: about one row every ten seconds per live match, so a thousand or so over
+a three-set match against the tens of thousands its books produce, at 75
+columns each -- most of them NULL at a tournament without ball tracking. Six
+live matches take the tick from ~0.05 s to ~0.35 s; the budget is five seconds.
 
 ## How to run it
 
@@ -77,7 +92,7 @@ discover`.
 ## How to verify a change
 
 ```bash
-uv run python tests/test_offline.py     # ~355 checks, no network
+uv run python tests/test_offline.py     # ~455 checks, no network
 ```
 
 `tests/test_offline.py` is a **plain script, not pytest** — a flat list of
@@ -147,7 +162,17 @@ Other conventions:
   purpose. Concurrency lands reads on different edge caches (the score appears to
   rewind) and got a burst reset from the host. See `Flashscore.__init__`.
 - **Never write a score without the `Ratchet`.** It removes ~47% of raw recorded
-  score changes, all spurious.
+  score changes, all spurious. The statistics feed comes off the same caches and
+  needs `StatRatchet` for the same reason; it measures points played, the one
+  number in that feed that cannot fall.
+- **The statistics feed answers with a full set of zeros before a match starts.**
+  That is a shape, not an absence, so `_stat_targets` reads matches in play only.
+  Deduplicating it would not help -- the zeros are a genuine "change" from
+  nothing, and every match would get a row of noughts in front of it.
+- **A statistic is only ever stored as its numbers, never its percentage.**
+  `75% (48/64)` is `48` and `64`; the percentage is their quotient. NULL means
+  the tournament does not measure it (serve speed and distance covered need ball
+  tracking) and is not a zero.
 - **`market_last_trade` is per match, not per player.** Tommy Paul's row can read
   0.19 while his own mid is 0.81. Use it per match; the dashboard's orientation
   of it is an inference and is labelled as one.

@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .book import Snapshot
-from .config import BOOK_DEPTH
+from .config import BOOK_DEPTH, STATISTICS
 from .discovery import TennisMarket
+from .scores import StatPeriod
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,45 @@ class ScoreRow:
             market.game,
             market.serving,
         )
+
+
+@dataclass(frozen=True)
+class StatRow:
+    """One period of one match's statistics, ready to be written.
+
+    `values` is keyed by ``STAT_COLUMNS`` and already in the market's own
+    outcome order -- the flip that re-expresses a Flashscore reading as
+    Polymarket lists its players happens in ``of``, once, exactly as it does
+    for the score. A statistic the feed did not report is absent from the dict
+    and stored as NULL; it is not zero.
+    """
+
+    condition_id: str
+    period: str  # "Match", "Set 1", ...
+    values: dict[str, float | None]
+    digest: str | None = None
+
+    @classmethod
+    def of(
+        cls,
+        condition_id: str,
+        period: StatPeriod,
+        flip: bool,
+        digest: str | None = None,
+    ) -> "StatRow":
+        first, second = period.sides(flip)
+        values: dict[str, float | None] = {}
+        for statistic in STATISTICS:
+            for index, side in enumerate((first, second)):
+                entry = side.get(statistic.key)
+                values[f"{statistic.key}_{index}"] = None if entry is None else entry.value
+                if statistic.of:
+                    values[f"{statistic.key}_{index}_of"] = None if entry is None else entry.of
+        return cls(condition_id, period.period, values, digest)
+
+    def row(self) -> tuple[float | None, ...]:
+        """The statistics as ``STAT_COLUMNS`` orders them."""
+        return tuple(self.values.get(col) for col in STAT_COLUMNS)
 
 
 def _depth_columns(depth: int) -> list[str]:
@@ -79,6 +119,27 @@ BOOK_COLUMNS = [
     "book_ts_derived",
 ]
 
+
+def _stat_columns() -> list[str]:
+    """Two columns per statistic per player, generated from the catalogue.
+
+    Named by outcome index, not by Flashscore's home and away, because that is
+    the order everything else in this file is written in -- `books` has an
+    `outcome_index` and `score` reads left to right in the same order. A
+    statistic reported as a made-of-attempted pair gets a second column for the
+    denominator; see ``config.Statistic``.
+    """
+    cols: list[str] = []
+    for statistic in STATISTICS:
+        for index in (0, 1):
+            cols.append(f"{statistic.key}_{index}")
+            if statistic.of:
+                cols.append(f"{statistic.key}_{index}_of")
+    return cols
+
+
+STAT_COLUMNS = _stat_columns()
+
 MARKET_COLUMNS = [
     ("condition_id", "TEXT PRIMARY KEY"),
     ("question", "TEXT"),
@@ -102,6 +163,15 @@ MARKET_COLUMNS = [
     ("end_date", "TEXT"),
     ("first_seen", "REAL"),
     ("last_seen", "REAL"),
+    # Which Flashscore match this is, and whether its home player is this
+    # market's second outcome. Stored rather than re-derived because the
+    # statistics of a finished match are collected an hour after it ends, by
+    # which time the market has usually been resolved and dropped from the API
+    # -- there is nothing left to pair against, only what was written down.
+    # A NULL flip means the two names fitted each other's side equally well, so
+    # nothing that reads home from away may be attributed to a player at all.
+    ("flashscore_id", "TEXT"),
+    ("flashscore_flip", "INTEGER"),
     ("raw", "TEXT"),
 ]
 
@@ -148,6 +218,44 @@ CREATE TABLE IF NOT EXISTS score_events (
     PRIMARY KEY (condition_id, ts)
 ) WITHOUT ROWID;
 
+-- The match's running statistics, appended every time one of them moves. Same
+-- grain and the same reasoning as `books`: the feed is re-read on the tick, the
+-- numbers change on nearly every point, and writing every read unchanged would
+-- bury the changes under thousands of copies. What is stored here is the
+-- feed's "Match" block only -- the totals as they stood at `ts` -- because
+-- that is the block that moves while the match is on.
+--
+-- There is no heartbeat. A book that stops moving is ambiguous (a calm market
+-- and a dead collector look alike), which is why one gets written anyway; a
+-- statistic that stops moving is not, because `books` and `score_events` are
+-- already recording on the same tick and say whether anything was running.
+CREATE TABLE IF NOT EXISTS stat_events (
+    ts             REAL,
+    condition_id   TEXT,
+    -- The feed's own digest of the response this came from. Not what decides a
+    -- write -- that is the stored values -- but it ties a row to one read.
+    digest         TEXT,
+{",".join(chr(10) + f"    {col:<22} REAL" for col in STAT_COLUMNS)},
+    PRIMARY KEY (condition_id, ts)
+) WITHOUT ROWID;
+
+-- The same statistics broken down by period, taken once, an hour after the
+-- match ended. Flashscore goes on revising a finished match for a while --
+-- an unforced error is reclassified as a winner, the radar's serve speeds are
+-- corrected -- so this is the settled version, and the per-set rows sum to the
+-- "Match" row, which is what makes it a check on the live capture above.
+--
+-- One row per period, replaced rather than appended: this is a final reading,
+-- not a history, and re-running it must not accumulate copies.
+CREATE TABLE IF NOT EXISTS set_stats (
+    condition_id   TEXT,
+    period         TEXT,  -- "Match", "Set 1", "Set 2", ...
+    ts             REAL,  -- when it was collected, not when the set was played
+    digest         TEXT,
+{",".join(chr(10) + f"    {col:<22} REAL" for col in STAT_COLUMNS)},
+    PRIMARY KEY (condition_id, period)
+) WITHOUT ROWID;
+
 """
 
 # Applied after _migrate(): indexes and the view both reference columns that an
@@ -161,6 +269,9 @@ CREATE INDEX IF NOT EXISTS score_events_by_market ON score_events (condition_id,
 -- the table. Without it the dashboard's per-match lookups degrade into a full
 -- scan once a season's worth of ticks has accumulated.
 CREATE INDEX IF NOT EXISTS books_by_outcome ON books (condition_id, outcome_index, ts);
+-- stat_events and set_stats get no index: both are WITHOUT ROWID keyed on
+-- exactly what a reader seeks by, so the table *is* that index. (score_events
+-- above has one restating its own primary key; it predates the WITHOUT ROWID.)
 
 DROP VIEW IF EXISTS quotes;
 CREATE VIEW quotes AS
@@ -209,6 +320,15 @@ class Store:
                 for col in BOOK_COLUMNS
             ],
             "score_events": SCORE_EVENT_COLUMNS,
+            "stat_events": [("ts", "REAL"), ("condition_id", "TEXT"), ("digest", "TEXT")]
+            + [(col, "REAL") for col in STAT_COLUMNS],
+            "set_stats": [
+                ("condition_id", "TEXT"),
+                ("period", "TEXT"),
+                ("ts", "REAL"),
+                ("digest", "TEXT"),
+            ]
+            + [(col, "REAL") for col in STAT_COLUMNS],
         }
         for table, columns in expected.items():
             present = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -251,6 +371,11 @@ class Store:
                 m.end_date,
                 now,
                 now,
+                m.pairing.id if m.pairing else None,
+                # None, not 0, when the pairing could not be oriented: nothing
+                # read home-from-away may be attributed to a player then, and a
+                # 0 would say "the two are already the right way round".
+                (int(m.pairing.flip) if m.pairing.oriented else None) if m.pairing else None,
                 json.dumps(m.raw, default=str),
             )
             for m in markets
@@ -269,6 +394,11 @@ class Store:
                 score=excluded.score,
                 end_date=excluded.end_date,
                 last_seen=excluded.last_seen,
+                -- Coalesced, not overwritten: a refresh where the board was
+                -- unavailable pairs nothing, and it must not erase the id the
+                -- deferred statistics collection is going to need.
+                flashscore_id=COALESCE(excluded.flashscore_id, markets.flashscore_id),
+                flashscore_flip=COALESCE(excluded.flashscore_flip, markets.flashscore_flip),
                 raw=excluded.raw
             """,
             rows,
@@ -324,6 +454,109 @@ class Store:
             )
         return len(rows)
 
+    def record_stat_events(self, rows: Iterable[StatRow]) -> int:
+        """Append a row for every match whose statistics have moved.
+
+        Changes only, for the same reason ``record_score_events`` stores
+        changes only: the feed is re-read on the tick and most reads find the
+        rally still going. Resolution is therefore the poll interval, which is
+        finer than a point -- which is what "the statistics at every point"
+        actually needs, since a point is what moves them.
+
+        The comparison is over the stored columns, not the feed's own digest:
+        the digest covers the per-set blocks too, and a row here is the match
+        totals. Comparing what is written is what keeps the table free of rows
+        that differ from their predecessor in nothing.
+        """
+        now = time.time()
+        payload = []
+        for entry in rows:
+            current = entry.row()
+            previous = self.conn.execute(
+                f"SELECT {', '.join(STAT_COLUMNS)} FROM stat_events "
+                "WHERE condition_id = ? ORDER BY ts DESC LIMIT 1",
+                (entry.condition_id,),
+            ).fetchone()
+            if previous is not None and tuple(previous) == current:
+                continue
+            payload.append((now, entry.condition_id, entry.digest, *current))
+
+        if payload:
+            columns = ["ts", "condition_id", "digest", *STAT_COLUMNS]
+            self.conn.executemany(
+                f"INSERT OR REPLACE INTO stat_events ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' * len(columns))})",
+                payload,
+            )
+        return len(payload)
+
+    def record_set_stats(self, rows: Sequence[StatRow], ts: float | None = None) -> int:
+        """Write a finished match's statistics, one row per period.
+
+        Replaced rather than appended: this is the settled reading taken once,
+        an hour after the match, and running it twice must leave one row per
+        period rather than two. `ts` is when it was collected -- there is no
+        timestamp for when a set was played, and pretending otherwise would
+        invite someone to plot it.
+        """
+        if not rows:
+            return 0
+        now = time.time() if ts is None else ts
+        columns = ["condition_id", "period", "ts", "digest", *STAT_COLUMNS]
+        self.conn.executemany(
+            f"INSERT OR REPLACE INTO set_stats ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' * len(columns))})",
+            [(r.condition_id, r.period, now, r.digest, *r.row()) for r in rows],
+        )
+        return len(rows)
+
+    def matches_awaiting_set_stats(
+        self, now: float, delay: float, window: float, limit: int
+    ) -> list[tuple[str, str, int, str]]:
+        """Matches that ended long enough ago to collect their final statistics.
+
+        Returns ``(condition_id, flashscore_id, flip, question)``, oldest first.
+        The question comes along because by this point the match is an hour gone
+        and the poller no longer holds anything that could name it in a log.
+
+        A match qualifies once it has been over for `delay` and has no rows in
+        `set_stats` yet, which is what makes the collection idempotent and
+        survives a restart -- the queue is the database, not a timer held in
+        memory. `window` is the other end of it: a database that has never had
+        this run holds a season of finished matches, and without a bound the
+        first check after an upgrade would ask Flashscore for all of them.
+
+        The end of a match is the *first* score event that called it ended; the
+        ratchet does not let a match come back from that, so the earliest such
+        row is the moment itself rather than the last time it was re-read.
+
+        A match whose pairing could not be oriented is left out. Its statistics
+        exist, but there is no way to say which player each column belongs to,
+        and a mirrored row is worse than no row.
+        """
+        return [
+            (str(cid), str(fid), int(flip), str(question or cid))
+            for cid, fid, flip, question in self.conn.execute(
+                """
+                SELECT m.condition_id, m.flashscore_id, m.flashscore_flip, m.question
+                FROM markets m
+                JOIN (
+                    SELECT condition_id, MIN(ts) AS ended FROM score_events
+                    WHERE state = 'ended' GROUP BY condition_id
+                ) e ON e.condition_id = m.condition_id
+                WHERE m.flashscore_id IS NOT NULL
+                  AND m.flashscore_flip IS NOT NULL
+                  AND e.ended <= ? AND e.ended >= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM set_stats s WHERE s.condition_id = m.condition_id
+                  )
+                ORDER BY e.ended
+                LIMIT ?
+                """,
+                (now - delay, now - window, limit),
+            )
+        ]
+
     def insert_snapshots(
         self, ts: float, rows: Sequence[tuple[Snapshot, str, int, str]]
     ) -> int:
@@ -370,12 +603,21 @@ class Store:
             GROUP BY m.tour, m.tournament ORDER BY 4 DESC
             """
         ).fetchall()
+        stat_rows = cur.execute("SELECT COUNT(*) FROM stat_events").fetchone()[0]
+        # By match rather than by row: the interesting number is how many
+        # finished matches have their settled per-set breakdown, not how many
+        # periods that came to.
+        final = cur.execute(
+            "SELECT COUNT(DISTINCT condition_id) FROM set_stats"
+        ).fetchone()[0]
         return {
             "db": str(self.path),
             "markets": markets,
             "snapshots": snaps,
             "first_ts": first,
             "last_ts": last,
+            "stat_events": stat_rows,
+            "set_stats": final,
             "by_tournament": by_tournament,
         }
 

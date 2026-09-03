@@ -114,6 +114,31 @@ export interface MatchDetail {
   books: [Ladder | null, Ladder | null];
   last_trade: LastTrade | null;
   score_events: ScoreEvent[];
+  stats: MatchStats;
+}
+
+/** One statistic, both players. Mirrors queries._stat_period. */
+export interface StatEntry {
+  key: string;
+  label: string;
+  group: string;
+  /** "%", "km/h", "m", or null for a plain count. */
+  unit: string | null;
+  /**
+   * [value, out of] per player, in outcome order. `of` is null for a count or a
+   * measurement; where it is set, the percentage is the quotient of the two and
+   * is deliberately neither stored nor sent.
+   */
+  values: [[number | null, number | null], [number | null, number | null]];
+}
+
+export interface MatchStats {
+  /** When the live totals below were read, or null if none were. */
+  ts: number | null;
+  live: StatEntry[];
+  /** When the settled per-set reading was collected; null until an hour after. */
+  final_ts: number | null;
+  sets: { period: string; stats: StatEntry[] }[];
 }
 
 export interface OutcomeSeries {

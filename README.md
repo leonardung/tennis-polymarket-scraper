@@ -1,9 +1,10 @@
 # Polymarket ATP and WTA tennis capture
 
 Records the Polymarket order book for every tour-level (250 and above) ATP and
-WTA singles match **while it is being played**, every 5 seconds, 3 levels deep on
-each side, into SQLite — with the live score read on the same tick, so a price
-and the point it moved on share a timestamp.
+WTA singles match **while it is being played**, every 5 seconds, 10 levels deep on
+each side, into SQLite — with the live score and the match statistics read on the
+same tick, so a price, the point it moved on, and the aces count behind it all
+share a timestamp.
 
 ## Commands
 
@@ -49,6 +50,7 @@ triggers an early refresh.
 | `--tour TOUR` | `both` | capture one circuit only: `atp`, `wta` or `both` |
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
+| `--no-stats` | off | don't record match statistics (see [Match statistics](#match-statistics)) |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
 | `--stale-after N` | `120` | warn when every in-play book is this far behind its own upstream timestamp |
 | `--dns MODE` | `auto` | see [DNS.md](DNS.md) |
@@ -78,7 +80,13 @@ which turn over several times a game. Opening a match gives its full history:
 - **Price** — both players' mid over time, with the last traded price overlaid.
 - **Spread** — how far apart the two sides sit, and where quotes went missing.
 - **Depth** — shares resting on each side, so you can see liquidity arrive or leave.
-- **Order book** — the live 3-level ladder for both players.
+- **Match statistics** — aces, winners, points won and the rest, laid out the way
+  Flashscore lays them out, with a bar for who is ahead on each. `Live` is the
+  running total the capture read on the same tick as the book above; once the
+  settled per-set reading has been collected, `Final` and one tab per set appear
+  beside it. The two are kept apart on purpose — where they disagree, `Final` is
+  right, and that disagreement is what the per-set table exists to show.
+- **Order book** — the live 10-level ladder for both players.
 - **Table view** — the same numbers as text, for reading exact values.
 
 Set and game changes are drawn on every chart as vertical rules, and the hover
@@ -252,7 +260,7 @@ minutes of their slot. Each change lands in
 refresh-rate sampling a whole service game fits between two readings; at 10
 seconds none do.
 
-Two feeds are involved, and the split matters:
+Three feeds are involved, and the split matters:
 
 - **The day card** (`f_2_<day>_<tz>_en_1`) lists every match Flashscore has for a
   day. It is read on the market-list refresh, and it is what turns a Polymarket
@@ -268,6 +276,10 @@ Two feeds are involved, and the split matters:
   cached, but briefly: measured against matches in play, `Age` climbs to roughly
   two minutes and resets, and a set change was observed arriving 15 seconds after
   it happened.
+- **The statistics feed** (`df_st_2_<id>`) carries the aces, winners, points won
+  and twenty more, for the match as a whole *and* for each set so far, all in one
+  response of about 4 KB (a kilobyte on the wire). It is read on the tick beside
+  the other two. See [Match statistics](#match-statistics).
 
 That caching is not a simple delay, and it is worth knowing about before
 changing anything here. The requests are answered by a pool of caches holding
@@ -347,9 +359,79 @@ The tournament lists live in `ATP_TOURNAMENTS` and `WTA_TOURNAMENTS` in
 year, so if a tournament isn't listed its matches won't appear. `discover` is the
 way to check when a new event starts.
 
+## Match statistics
+
+Flashscore publishes 23 statistics per match — aces, double faults, first serve
+percentage, points won on each serve, break points saved and converted, winners,
+unforced errors, net points, games won, average serve speed, distance covered —
+and it publishes them **twice over**: once as running match totals, and once
+broken down by set. One request, `df_st_2_<id>`, returns all of it.
+
+The counters move on nearly every point, so the running totals are read on the
+tick with the book and the score, and, like a book snapshot, **only what changed
+is written**. Nothing gets a heartbeat row here: a book that stops moving is
+ambiguous, but a statistic that stops moving is not, because `books` and
+`score_events` are writing on the same tick and already say whether anything was
+running. In practice a match in play produces a row every ten seconds or so —
+comfortably finer than the ~26 seconds a point takes, which is what "the
+statistics at every point" needs.
+
+Two things are true of this feed that are true of the score feed for the same
+reason, and are handled the same way:
+
+- It comes off the same edge caches, so it goes **backwards**. The ratchet here
+  measures progress by *points played* — both players' "Total Points Won" are
+  reported out of it, and it is the one number that cannot fall — and a reading
+  covering fewer points than one already taken is dropped, unless it keeps
+  coming back for `SCORE_PATIENCE` reads, which is a scorer's correction rather
+  than a cache. A reading level with the last one is passed through: a statistic
+  can genuinely change without a point being played, when an unforced error is
+  reclassified as a winner or a serve speed lands a beat late.
+- The statistics are **per player**, so they go through the same flip the score
+  does and are stored in the order the market lists its players. A match whose
+  two names fit each other's side equally well is skipped entirely — a mirrored
+  row is worse than no row.
+
+A value arrives in one of four shapes, and what is stored is always the numbers,
+never the percentage:
+
+| Feed | Stored |
+|---|---|
+| `18` | `aces_0 = 18` |
+| `63%` | `first_serve_pct_0 = 63` |
+| `194 km/h` | `first_serve_speed_0 = 194` |
+| `75% (48/64)` | `first_serve_won_0 = 48`, `first_serve_won_0_of = 64` |
+| `1/3` | `break_points_saved_0 = 1`, `break_points_saved_0_of = 3` |
+
+The percentage is the quotient of two numbers that are already stored, and
+keeping it as well would let a row disagree with itself. A statistic the
+tournament does not measure — serve speed and distance covered need ball
+tracking, and only the big events have it — is **NULL, not zero**: not measured
+is not none. The catalogue is `STATISTICS` in `src/polymarket/config.py`, and it
+generates the columns; a label the feed carries that is not on that list is
+dropped and logged once, which is the notice that the site has added a row.
+
+### The settled per-set version
+
+Flashscore keeps revising a finished match for a while after the last point — an
+unforced error becomes a winner, the radar's serve speeds are corrected — so the
+per-set breakdown is **collected once, an hour after the match ends**, into
+`set_stats`. The per-set rows sum to the `Match` row, and that is the point of
+the table: it is the record to check the live capture against.
+
+That queue is a query, not a timer — a match that has ended, is past the hour,
+and has no `set_stats` rows yet — so a capture that was not running when the hour
+came round picks it up on the next look rather than losing it, and running it
+twice leaves one row per period rather than two. It gives up on a match 24 hours
+after it ended, and after three empty answers (a walkover has no statistics and
+never will).
+
+`--no-stats` turns all of this off. The cost it saves is one extra Flashscore
+read per live match per tick — about 50 ms and a kilobyte each.
+
 ## What gets stored
 
-Three tables and a view, in one SQLite file.
+Five tables and a view, in one SQLite file.
 
 **`markets`** — one row per match:
 
@@ -363,6 +445,14 @@ they hold the latest known state rather than a per-tick history. `score` reads i
 the same order as `outcome_0` and `outcome_1`, and a set won on a tiebreak carries
 the loser's points — `6-7(3)`.
 
+And `flashscore_id` + `flashscore_flip`: which Flashscore match this is, and
+whether that feed's home player is this market's *second* outcome. Stored rather
+than re-derived because the per-set statistics are collected an hour after the
+match ends, by which time the market has usually been resolved and dropped from
+the API — there is nothing left to pair against, only what was written down. A
+NULL `flashscore_flip` means the two names fitted each other's side equally well,
+so nothing that reads home from away may be attributed to a player at all.
+
 **`books`** — one row per player per tick:
 
 | Column | Meaning |
@@ -371,8 +461,8 @@ the loser's points — `6-7(3)`.
 | `outcome` | which player this row is for |
 | `best_bid`, `best_ask` | top of book |
 | `mid`, `spread` | derived from the two above |
-| `bid_px_1..3`, `bid_sz_1..3` | 3 best bids, price and size, best first |
-| `ask_px_1..3`, `ask_sz_1..3` | 3 best asks, price and size, best first |
+| `bid_px_1..10`, `bid_sz_1..10` | 10 best bids, price and size, best first |
+| `ask_px_1..10`, `ask_sz_1..10` | 10 best asks, price and size, best first |
 | `market_last_trade` | last traded price for the **match**, not this player (see below) |
 | `book_hash` | changes when the book changes |
 | `book_ts` | when the book last changed **upstream** (see below) |
@@ -469,6 +559,39 @@ SELECT datetime(ts,'unixepoch') AS t, period, score
 FROM score_events WHERE condition_id = '0x...' ORDER BY ts;
 ```
 
+**`stat_events`** — one row each time the match's running statistics moved:
+
+`ts`, `condition_id`, `digest` (the feed's own hash of the response the row came
+from), and two columns per statistic per player — `aces_0`, `aces_1`,
+`winners_0`, `first_serve_won_0` with `first_serve_won_0_of` beside it, and so
+on for the whole of `STATISTICS`. The `_0` / `_1` suffix is the outcome index,
+the same order `books.outcome_index` and `markets.outcome_0` use.
+
+Only the feed's **overall** block — the running match totals as they stood at
+`ts` — is recorded here. Changes only, no heartbeat, and every reading through
+the ratchet. See [Match statistics](#match-statistics).
+
+```sql
+-- aces against the price, on one clock
+SELECT datetime(s.ts,'unixepoch') AS t, s.aces_0, s.aces_1,
+       s.total_points_won_0_of AS points_played
+FROM stat_events s WHERE s.condition_id = '0x...' ORDER BY s.ts;
+```
+
+**`set_stats`** — the settled statistics, one row per period, taken once an hour
+after the match ended:
+
+`condition_id`, `period` (`Match`, `Set 1`, `Set 2`, …), `ts` (when it was
+*collected*, not when the set was played), `digest`, and the same statistic
+columns as `stat_events`. The per-set rows sum to the `Match` row, which is what
+makes this the record to check the live capture against:
+
+```sql
+-- do the sets add up to the match?
+SELECT period, aces_0, aces_1, total_points_won_0_of AS points
+FROM set_stats WHERE condition_id = '0x...' ORDER BY period;
+```
+
 **`quotes`** — a view that spells out the direction, since bid/ask is easy to
 invert:
 
@@ -492,6 +615,20 @@ FROM books WHERE condition_id = '0x...' ORDER BY ts;
 SELECT m.question, COUNT(*) AS snapshots, MIN(b.ts), MAX(b.ts)
 FROM books b JOIN markets m USING (condition_id)
 GROUP BY m.condition_id ORDER BY snapshots DESC;
+
+-- what the book did on the points around a break point being saved
+SELECT datetime(s.ts,'unixepoch') AS t,
+       s.break_points_saved_0 || '/' || s.break_points_saved_0_of AS saved,
+       (SELECT b.mid FROM books b
+        WHERE b.condition_id = s.condition_id AND b.outcome_index = 0
+          AND b.ts <= s.ts ORDER BY b.ts DESC LIMIT 1) AS mid
+FROM stat_events s WHERE s.condition_id = '0x...' ORDER BY s.ts;
+
+-- live capture against the settled per-set version, for one match
+SELECT (SELECT aces_0 FROM stat_events WHERE condition_id = f.condition_id
+        ORDER BY ts DESC LIMIT 1)              AS captured_live,
+       f.aces_0                                AS settled
+FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
 ```
 
 ## Notes
@@ -502,12 +639,16 @@ GROUP BY m.condition_id ORDER BY snapshots DESC;
   at; raise `--interval` if you would rather have the disk. Only the matches in
   play run at that cadence, so a day card full of matches that haven't started
   costs a poll a minute each, not one every five seconds.
+- Match statistics add roughly a row every ten seconds per match in play — about
+  a thousand rows over a three-set match, against the tens of thousands its books
+  produce — plus one `set_stats` row per period, once. On the wire they cost a
+  kilobyte and about 50 ms per live match per tick. `--no-stats` turns them off.
 - Safe to stop and restart: it reopens the same database and carries on, and
   re-running a tick never duplicates rows.
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 319 checks, no network needed
+uv run python tests/test_offline.py   # 453 checks, no network needed
 ```
 
 ## Working on the dashboard front end

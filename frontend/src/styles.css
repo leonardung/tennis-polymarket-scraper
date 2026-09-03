@@ -330,6 +330,42 @@ main { padding: 20px 24px 56px; }
 
 .note { font-size: 11.5px; color: var(--text-muted); margin: 8px 0 0; line-height: 1.5; }
 
+/* ------------------------------------------------------------ statistics */
+
+/* Flashscore's own layout: the two players either side, the statistic between
+   them, and a bar that says who is ahead on it. Values are tabular so the two
+   columns line up down the table rather than jittering with each digit. */
+.stat-players {
+  display: flex; justify-content: space-between; gap: 12px;
+  font-size: 12px; font-weight: 600; color: var(--text-secondary); margin: 6px 0 2px;
+}
+.stat-players span { display: inline-flex; align-items: center; gap: 6px; }
+
+.stat-group { margin-top: 12px; }
+.stat-group h4 {
+  font-size: 10.5px; font-weight: 500; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 4px;
+}
+
+.stat-row {
+  display: grid; grid-template-columns: minmax(74px, 1fr) minmax(90px, 2fr) minmax(74px, 1fr);
+  align-items: center; gap: 10px; padding: 3px 0;
+}
+.stat-value {
+  font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--text-primary);
+}
+.stat-row .stat-value:first-child { text-align: left; }
+.stat-row .stat-value:last-child { text-align: right; }
+.stat-mid { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.stat-label { font-size: 11.5px; color: var(--text-secondary); text-align: center; line-height: 1.3; }
+.stat-bar { display: flex; width: 100%; height: 4px; border-radius: 2px; overflow: hidden; background: var(--wash); }
+.stat-bar-a { background: var(--series-1); }
+.stat-bar-b { background: var(--series-2); }
+
+@media (max-width: 620px) {
+  .stat-row { grid-template-columns: minmax(64px, 1fr) minmax(70px, 1.6fr) minmax(64px, 1fr); gap: 6px; }
+}
+
 /* ---------------------------------------------------------------- tooltip */
 
 .tooltip {

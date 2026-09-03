@@ -2,8 +2,14 @@
 
 Each match is read at its own cadence -- every tick while it is being played,
 every `idle_interval` before it starts, not at all once it is over. The grid
-itself never changes; `_due_matches` decides who is on it. Books and score for
-one match are read in the same pass, so they share a timestamp.
+itself never changes; `_due_matches` decides who is on it. Books, score and
+match statistics for one match are read in the same pass, so they share a
+timestamp.
+
+One thing does not run on the grid: a finished match's per-set statistics,
+which are collected an hour after it ended because Flashscore goes on revising
+them. That queue lives in the database rather than in this object, so stopping
+the capture does not lose it.
 """
 
 from __future__ import annotations
@@ -19,6 +25,10 @@ import httpx
 from .api import Polymarket
 from .book import Snapshot, parse_book
 from .config import (
+    FINAL_STATS_BATCH,
+    FINAL_STATS_CHECK,
+    FINAL_STATS_DELAY,
+    FINAL_STATS_WINDOW,
     HEARTBEAT,
     IDLE_INTERVAL,
     MIN_REFRESH_GAP,
@@ -33,8 +43,8 @@ from .config import (
     TOURS,
 )
 from .discovery import discover, seconds_from_now
-from .scores import Flashscore, Paired, Ratchet, ScoreBoard
-from .store import ScoreRow, Store
+from .scores import Flashscore, Paired, Ratchet, ScoreBoard, StatRatchet
+from .store import ScoreRow, StatRow, Store
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +65,12 @@ class Watched:
     pairing: Paired
     start_time: str | None
     question: str
+
+
+# How many times a finished match is asked for statistics that never come.
+# A walkover has none and never will; a feed that is briefly down does. There
+# is no way to tell them apart from one answer, so this is the compromise.
+_FINAL_STATS_TRIES = 3
 
 
 def _fingerprint(snap: Snapshot) -> tuple:
@@ -81,6 +97,7 @@ class Poller:
         include_qualifying: bool = False,
         live_only: bool = True,
         only_changes: bool = True,
+        record_stats: bool = True,
         heartbeat: float = HEARTBEAT,
         stale_after: float = STALE_AFTER,
         scores: Flashscore | None = None,
@@ -94,6 +111,9 @@ class Poller:
         # here before it is written, so a stale copy cannot rewind one already
         # recorded. See Ratchet.
         self.ratchet = Ratchet()
+        # The statistics come off the same edge caches and rewind the same way.
+        # Measured on points played rather than on the score; see StatRatchet.
+        self.stat_ratchet = StatRatchet()
         self.interval = interval
         self.idle_interval = idle_interval
         self.refresh_interval = refresh_interval
@@ -102,6 +122,7 @@ class Poller:
         self.tours = tuple(tours)
         self.live_only = live_only
         self.only_changes = only_changes
+        self.record_stats = record_stats
         self.heartbeat = heartbeat
         self.stale_after = stale_after
         self.tracked: dict[str, Tracked] = {}
@@ -114,6 +135,12 @@ class Poller:
         self._stale_since: float | None = None  # when every book last went stale at once
         self._stale_warned: float = 0.0
         self._next_start: float | None = None  # monotonic deadline
+        # When the finished-match statistics queue was last looked at, and how
+        # many times each match in it has been asked for without an answer. The
+        # counts are deliberately not persisted: a match Flashscore has nothing
+        # for should stop being asked, but a restart is a fair reason to retry.
+        self._final_checked: float = 0.0
+        self._final_tries: dict[str, int] = {}
         self._state_changed = False
         self._stop = False
 
@@ -197,6 +224,7 @@ class Poller:
                     market.game = market.pairing.render_game(best)
                     market.serving = market.pairing.render_server(best)
         self.ratchet.forget(m.condition_id for m in kept)
+        self.stat_ratchet.forget(m.condition_id for m in kept)
         self._state = {m.condition_id: m.state for m in kept}
 
         self.store.upsert_markets(kept)
@@ -404,6 +432,146 @@ class Poller:
         )
         return written
 
+    # ---------------- match statistics ----------------
+
+    def _stat_targets(self, due: set[str] | None = None) -> list[Watched]:
+        """Which matches are worth reading the statistics for right now.
+
+        Matches in play, and only those. Before a match starts the feed answers
+        with a full set of zeros -- not an absence, a shape -- and recording
+        that would put a row of noughts in front of every match and call it a
+        change. Once a match is over the numbers are still moving, but they are
+        being corrected rather than played, and that is what the deferred
+        per-set collection is for.
+
+        A match whose two players fit each other's side equally well is left
+        out too. Its statistics are per player, and a mirrored row is worse
+        than no row -- the same call ``Paired.oriented`` already makes for the
+        score.
+        """
+        targets = []
+        for condition_id, watched in self.watched.items():
+            if due is not None and condition_id not in due:
+                continue
+            if self._state.get(condition_id) != "live":
+                continue
+            if not watched.pairing.oriented:
+                continue
+            targets.append(watched)
+        return targets
+
+    def poll_stats(self, due: set[str] | None = None) -> int:
+        """Read the statistics for the matches in play. Returns rows written.
+
+        One more small request per live match on the tick the score is read on,
+        so a statistic and the price beside it share a timestamp. Only the
+        feed's overall block is kept: it is what moves while the match is on,
+        and the per-set breakdown it arrives with is collected properly once
+        the match is over and Flashscore has stopped revising it.
+        """
+        if not self.record_stats:
+            return 0
+        targets = self._stat_targets(due)
+        if not targets:
+            return 0
+
+        readings = self.scores.stat_readings(sorted({w.pairing.id for w in targets}))
+
+        rows = []
+        for watched in targets:
+            reading = readings.get(watched.pairing.id)
+            if reading is None:
+                continue
+            # A read whose match totals cover fewer points than one already
+            # taken is a stale copy of the feed, not a correction.
+            if not self.stat_ratchet.accept(watched.condition_id, reading):
+                continue
+            overall = reading.overall
+            if overall is None:
+                continue
+            rows.append(
+                StatRow.of(
+                    watched.condition_id,
+                    overall,
+                    flip=watched.pairing.flip,
+                    digest=reading.digest,
+                )
+            )
+        if not rows:
+            return 0
+
+        written = self.store.record_stat_events(rows)
+        log.log(
+            logging.INFO if written else logging.DEBUG,
+            "stats: %d match(es) read, %d change(s)",
+            len(targets),
+            written,
+        )
+        return written
+
+    def collect_final_stats(self, now: float | None = None) -> int:
+        """Take the per-set statistics of matches that finished an hour ago.
+
+        Flashscore keeps correcting a match after the last point -- winners and
+        unforced errors get reclassified, the radar's serve speeds are revised
+        -- so the settled figures are worth more than the ones on the tick, and
+        waiting an hour is what gets them. They land in `set_stats`, one row per
+        period, and the per-set rows sum to the "Match" row: that is what makes
+        the table a check on what was captured live.
+
+        The queue is a query, not a timer -- a match that has ended, is past the
+        delay, and has no rows yet -- so a capture that was not running when the
+        hour came round picks it up on the next look rather than losing it.
+
+        A few at a time, because a database that has never had this run comes
+        with a backlog and a tick is five seconds long.
+        """
+        now = time.time() if now is None else now
+        pending = self.store.matches_awaiting_set_stats(
+            now, FINAL_STATS_DELAY, FINAL_STATS_WINDOW, FINAL_STATS_BATCH
+        )
+        written = 0
+        for condition_id, match_id, flip, question in pending:
+            # Some matches simply have no statistics -- a walkover, a retirement
+            # in the first game -- and there is no way to tell that from a feed
+            # that is briefly unavailable. Ask a few times, then stop: the row
+            # will never arrive, and asking every minute for a day is rude.
+            if self._final_tries.get(condition_id, 0) >= _FINAL_STATS_TRIES:
+                continue
+            try:
+                reading = self.scores.stats(match_id)
+            except (httpx.HTTPError, ValueError) as exc:
+                log.debug("stats feed: %s unavailable (%s)", match_id, exc)
+                reading = None
+            if reading is None or not reading.periods:
+                tries = self._final_tries.get(condition_id, 0) + 1
+                self._final_tries[condition_id] = tries
+                if tries >= _FINAL_STATS_TRIES:
+                    log.info(
+                        "final stats: nothing for %s after %d tries, giving up",
+                        question,
+                        tries,
+                    )
+                continue
+            rows = [
+                StatRow.of(condition_id, period, flip=bool(flip), digest=reading.digest)
+                for period in reading.periods
+            ]
+            written += self.store.record_set_stats(rows, ts=now)
+            self._final_tries.pop(condition_id, None)
+            log.info("final stats: %s, %d period(s)", question, len(rows))
+        return written
+
+    def _final_stats_due(self) -> bool:
+        """Once a minute, not once a tick: it is a database query, not a feed read."""
+        if not self.record_stats:
+            return False
+        now = time.monotonic()
+        if now - self._final_checked < FINAL_STATS_CHECK:
+            return False
+        self._final_checked = now
+        return True
+
     # ---------------- one snapshot ----------------
 
     def tick(self, due: set[str] | None = None) -> int:
@@ -553,6 +721,22 @@ class Poller:
                 log.warning("score poll failed (%s), continuing", exc)
             except Exception:  # noqa: BLE001 - the books matter more than the score
                 log.exception("unexpected error in score poll, continuing")
+
+            # Same pass as the book and the score, on the same `due` set, so
+            # the three describe one moment of one match. Wrapped like the
+            # others: nothing here is worth losing a tick over.
+            try:
+                self.poll_stats(due)
+            except httpx.HTTPError as exc:
+                log.warning("stats poll failed (%s), continuing", exc)
+            except Exception:  # noqa: BLE001 - the books matter more than the statistics
+                log.exception("unexpected error in stats poll, continuing")
+
+            if self._final_stats_due():
+                try:
+                    self.collect_final_stats()
+                except Exception:  # noqa: BLE001
+                    log.exception("unexpected error collecting final stats, continuing")
 
             if self._refresh_due(last_refresh):
                 try:

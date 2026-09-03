@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from ..config import BOOK_DEPTH
+from ..config import BOOK_DEPTH, STATISTICS
 
 # A capture refreshes its market list every 5 minutes and writes a heartbeat on
 # the same cadence, so nothing older than this can be from a collector that is
@@ -345,6 +345,78 @@ def match_detail(conn: sqlite3.Connection, condition_id: str) -> dict[str, Any] 
         "books": [_ladder(books.get(i)) for i in (0, 1)],
         "last_trade": _oriented_last_trade(books),
         "score_events": score_events(conn, condition_id),
+        "stats": match_stats(conn, condition_id),
+    }
+
+
+def _stat_period(row: sqlite3.Row, columns: set[str]) -> list[dict[str, Any]]:
+    """One stored statistics row as a list the browser can lay out directly.
+
+    Statistics neither side has a number for are dropped rather than sent as a
+    pair of nulls. A tournament without ball tracking reports no serve speed and
+    no distance covered, and eight empty rows in the table would read as data
+    that failed to arrive rather than a measurement nobody took.
+    """
+    out = []
+    for statistic in STATISTICS:
+        keys = [f"{statistic.key}_{i}" for i in (0, 1)]
+        if any(key not in columns for key in keys):
+            continue  # a statistic added after this database was last written
+        values = [row[key] for key in keys]
+        if all(value is None for value in values):
+            continue
+        totals: list[float | None] = [None, None]
+        if statistic.of:
+            totals = [row[f"{key}_of"] if f"{key}_of" in columns else None for key in keys]
+        out.append(
+            {
+                "key": statistic.key,
+                "label": statistic.label,
+                "group": statistic.group,
+                "unit": statistic.unit,
+                # [value, out of] per player, in outcome order. `of` is null for
+                # a plain count; where it is set the percentage is the quotient,
+                # which is why it is not stored or sent.
+                "values": [[values[i], totals[i]] for i in (0, 1)],
+            }
+        )
+    return out
+
+
+def match_stats(conn: sqlite3.Connection, condition_id: str) -> dict[str, Any]:
+    """The match's statistics: the latest live totals, and the settled per-set set.
+
+    Two different things, and the payload keeps them apart because they are not
+    equally trustworthy. `live` is the last row the capture wrote on the tick --
+    current to within a poll, and whatever Flashscore believed at that moment.
+    `sets` is the reading taken an hour after the match, once the site had
+    stopped reclassifying winners and correcting serve speeds, so its "Match"
+    row can legitimately differ from the last live one. It is absent until then.
+    """
+    empty: dict[str, Any] = {"ts": None, "live": [], "final_ts": None, "sets": []}
+    if not _has_table(conn, "stat_events"):
+        return empty
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(stat_events)")}
+    latest = conn.execute(
+        "SELECT * FROM stat_events WHERE condition_id = ? ORDER BY ts DESC LIMIT 1",
+        (condition_id,),
+    ).fetchone()
+
+    sets: list[dict[str, Any]] = []
+    final_ts: float | None = None
+    if _has_table(conn, "set_stats"):
+        final_columns = {row[1] for row in conn.execute("PRAGMA table_info(set_stats)")}
+        for row in conn.execute(
+            "SELECT * FROM set_stats WHERE condition_id = ? ORDER BY period", (condition_id,)
+        ):
+            final_ts = row["ts"]
+            sets.append({"period": row["period"], "stats": _stat_period(row, final_columns)})
+
+    return {
+        "ts": latest["ts"] if latest is not None else None,
+        "live": _stat_period(latest, columns) if latest is not None else [],
+        "final_ts": final_ts,
+        "sets": sets,
     }
 
 

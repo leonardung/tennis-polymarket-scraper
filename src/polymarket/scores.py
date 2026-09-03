@@ -9,7 +9,7 @@ eight matches on court that is 50 KB/s spent on a handful of strings.
 Flashscore's site is rendered client-side from feeds on
 ``local-global.flashscore.ninja``, and that is what this reads instead. They are
 not JSON: a feed is a flat stream of ``KEY÷VALUE`` pairs joined by ``¬``, split
-into blocks by ``~``. Two of them are used:
+into blocks by ``~``. Three of them are used:
 
 ``f_2_<day>_<tz>_en_1``
     Every tennis match listed for one day -- ids, players, start times, status,
@@ -23,9 +23,16 @@ into blocks by ``~``. Two of them are used:
     roughly two minutes and resets, and a set change was seen arriving 15
     seconds after it happened.
 
+``df_st_2_<id>``
+    One match's statistics -- aces, winners, points won, and twenty more --
+    for the match as a whole and for each set so far, all in one response of
+    about 4 KB. The counters move on nearly every point, so this is read on
+    the tick like the score, and only what changed is written down.
+
 So the day feed is read on the market-list cadence to learn what exists, and
-matches in play are topped up from the per-match feed on the book cadence. A
-ten-second poll costs roughly 200 bytes per live match rather than 60 KB.
+matches in play are topped up from the per-match feeds on the book cadence. A
+ten-second poll costs roughly 200 bytes per live match for the score, plus a
+kilobyte on the wire for the statistics, rather than 60 KB.
 
 The caching is not just a delay, and this is the thing to know before changing
 anything here. Requests are answered by a pool of edge caches holding copies of
@@ -57,6 +64,9 @@ from .config import (
     FLASHSCORE_TZ,
     SCORE_PATIENCE,
     SCORE_TIMEOUT,
+    STATISTICS_BY_LABEL,
+    STATS_OVERALL,
+    STATS_TIMEOUT,
     Tournament,
     match_tournament,
 )
@@ -448,6 +458,183 @@ def parse_reading(raw: str) -> Reading | None:
     return Reading(status[0], status[1], _read_sets(blocks))
 
 
+# ---------------------------------------------------------------- statistics
+#
+# `df_st_2_<id>` is the third feed, and it is shaped differently from the other
+# two: not one flat block of keys but a sequence of headings and rows.
+#
+#     SE=Match              a period -- the running match totals, then each set
+#     SF=Service            a group heading, which carries nothing we keep
+#     SG=Aces SH=18 SI=12   one statistic: its name, home's value, away's
+#     A1=<hash>             the feed's own digest of everything above
+#
+# Every period arrives in the same response, so the running totals and the
+# set-by-set breakdown cost one request between them. The overall block is what
+# moves on a point and what the live capture writes; the sets are taken once,
+# long after the match, because Flashscore keeps revising them.
+
+_STAT_PERIOD, _STAT_GROUP, _STAT_NAME = "SE", "SF", "SG"
+_STAT_HOME, _STAT_AWAY = "SH", "SI"
+_STAT_DIGEST = "A1"
+
+# The four shapes a value arrives in, all of them reducible to a number and,
+# sometimes, what it is out of:
+#
+#     "18"            a count
+#     "63%"           a percentage, on its own
+#     "194 km/h"      a measurement, with its unit written out
+#     "75% (48/64)"   made 48 of 64 attempts; the percentage is the quotient
+#     "1/3"           the same thing without the percentage spelled out
+#
+# The percentage is never what gets stored where the pair is available: it is
+# rounded, and a stored quotient that disagrees with its own numerator is the
+# kind of thing that is discovered two seasons later.
+_STAT_PAIR = re.compile(r"(?:(\d+)%\s*)?\(?(\d+)\s*/\s*(\d+)\)?$")
+_STAT_NUMBER = re.compile(r"^(\d+(?:\.\d+)?)")
+
+# Labels the feed carries that this build does not know about. Logged once each
+# -- the feed is undocumented and the site adds rows, so a new name here is the
+# only notice that something is going unrecorded.
+_unknown_stats: set[str] = set()
+
+
+@dataclass(frozen=True)
+class StatValue:
+    """One statistic for one player: a number, and what it is out of.
+
+    `of` is None for a plain count or a measurement. Where it is set, `value`
+    is how many were made and `of` how many there were -- so a break point
+    statistic of 1/3 is ``StatValue(1, 3)`` and the percentage is derived, not
+    stored.
+    """
+
+    value: float | None
+    of: int | None = None
+
+
+def parse_stat_value(text: str) -> StatValue | None:
+    """Read one ``SH``/``SI`` cell. None when it says nothing at all."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    pair = _STAT_PAIR.search(text)
+    if pair is not None:
+        return StatValue(float(pair[2]), int(pair[3]))
+    number = _STAT_NUMBER.match(text)
+    if number is None:
+        return None
+    return StatValue(float(number[1]))
+
+
+@dataclass(frozen=True)
+class StatPeriod:
+    """Every statistic for one stretch of a match, both players.
+
+    `home` and `away` are keyed by ``config.Statistic.key``, in Flashscore's
+    own order -- which is not necessarily the order Polymarket lists the two
+    players. `sides` is what re-expresses them in that order; nothing else
+    should be reading `home` and `away` directly.
+    """
+
+    period: str  # "Match", "Set 1", ...
+    home: dict[str, StatValue]
+    away: dict[str, StatValue]
+
+    def sides(self, flip: bool = False) -> tuple[dict[str, StatValue], dict[str, StatValue]]:
+        """The two players' statistics as outcome 0 and outcome 1.
+
+        `flip` is ``Paired.flip``: true when Flashscore's home player is the
+        market's second outcome. The same swap the score goes through.
+        """
+        return (self.away, self.home) if flip else (self.home, self.away)
+
+    @property
+    def points_played(self) -> int:
+        """How many points this period covers, or 0 if the feed did not say.
+
+        Both players' "Total Points Won" are reported out of the same total --
+        the points played -- so either denominator answers it. It only ever
+        goes up, which is what makes it the ratchet's measure of progress.
+        """
+        for side in (self.home, self.away):
+            entry = side.get("total_points_won")
+            if entry is not None and entry.of is not None:
+                return entry.of
+        return 0
+
+
+@dataclass(frozen=True)
+class StatReading:
+    """One read of a match's statistics feed: every period it reported.
+
+    ``periods[0]`` is the running match totals when the feed is well formed;
+    `overall` is the one to ask rather than indexing, since a feed that came
+    back with only set blocks is a feed to ignore, not to misread.
+    """
+
+    periods: tuple[StatPeriod, ...] = ()
+    # The feed's own digest of the whole response. Not used to decide whether
+    # to write -- that is done on the values actually stored -- but recorded
+    # with them, so a row can be traced back to the read it came from.
+    digest: str | None = None
+
+    @property
+    def overall(self) -> StatPeriod | None:
+        for period in self.periods:
+            if period.period == STATS_OVERALL:
+                return period
+        return None
+
+    @property
+    def sets(self) -> tuple[StatPeriod, ...]:
+        return tuple(p for p in self.periods if p.period != STATS_OVERALL)
+
+
+def parse_stats(raw: str) -> StatReading | None:
+    """Read a ``df_st_`` response. None when there is nothing in it.
+
+    A statistic whose label is not in ``config.STATISTICS`` is dropped, and its
+    name logged once: there is nowhere to put it, and inventing a column per
+    unrecognised string would let the site's wording change the schema.
+    """
+    periods: list[StatPeriod] = []
+    digest: str | None = None
+    home: dict[str, StatValue] = {}
+    away: dict[str, StatValue] = {}
+    current: str | None = None
+
+    def close() -> None:
+        if current is not None and (home or away):
+            periods.append(StatPeriod(current, dict(home), dict(away)))
+
+    for block in parse_blocks(raw):
+        if _STAT_DIGEST in block:
+            digest = block[_STAT_DIGEST] or None
+        if _STAT_PERIOD in block:
+            close()
+            current, home, away = block[_STAT_PERIOD], {}, {}
+            continue
+        if _STAT_GROUP in block and _STAT_NAME not in block:
+            continue  # "Service", "Return" -- a heading, not a measurement
+        label = block.get(_STAT_NAME)
+        if not label or current is None:
+            continue
+        statistic = STATISTICS_BY_LABEL.get(label.strip().lower())
+        if statistic is None:
+            if label not in _unknown_stats:
+                _unknown_stats.add(label)
+                log.info("stats feed: no column for %r, dropping it", label)
+            continue
+        for side, key in ((home, _STAT_HOME), (away, _STAT_AWAY)):
+            value = parse_stat_value(block.get(key, ""))
+            if value is not None:
+                side[statistic.key] = value
+    close()
+    if not periods:
+        return None
+    return StatReading(tuple(periods), digest)
+
+
 class ScoreBoard:
     """A day's tour-level matches, indexed for pairing with Polymarket markets.
 
@@ -663,6 +850,34 @@ class Flashscore:
                 out[match_id] = reading
         return out
 
+    def stats(self, match_id: str) -> StatReading | None:
+        """One match's statistics: the running totals and every set so far.
+
+        A single request carries every period, so asking for the live figures
+        and asking for the set-by-set breakdown cost the same. Which of them a
+        caller keeps is its own decision -- the capture writes the overall
+        block on the tick and the sets once, an hour after the match.
+        """
+        return parse_stats(self._get(f"df_st_{SPORT}_{match_id}", timeout=STATS_TIMEOUT))
+
+    def stat_readings(self, match_ids: Sequence[str]) -> dict[str, StatReading]:
+        """Read several matches' statistics, one after another.
+
+        Sequential for the same reason the scores are: one connection, one edge
+        cache. Failures are absent rather than raised -- a missing statistic is
+        not worth a tick, and the next one will ask again.
+        """
+        out: dict[str, StatReading] = {}
+        for match_id in match_ids:
+            try:
+                reading = self.stats(match_id)
+            except (httpx.HTTPError, ValueError) as exc:
+                log.debug("stats feed: %s unavailable (%s)", match_id, exc)
+                continue
+            if reading is not None:
+                out[match_id] = reading
+        return out
+
 
 # How far along a match is, ordered so that it can only ever increase. State
 # comes first: a match that has ended is past one still being played, however
@@ -750,6 +965,76 @@ class Ratchet:
             best.line(),
         )
         self._best[key] = reading
+        self._rejected[key] = 0
+        return True
+
+    def forget(self, keys: Iterable[str]) -> None:
+        """Drop every match except these, which are the ones still followed."""
+        keeping = set(keys)
+        for key in list(self._best):
+            if key not in keeping:
+                self._best.pop(key, None)
+                self._rejected.pop(key, None)
+
+
+class StatRatchet:
+    """Keeps each match's statistics moving forwards, like ``Ratchet`` for scores.
+
+    The statistics come off the same edge caches as the score and go backwards
+    the same way -- a read lands on an older copy and the aces count drops by
+    one. Written down as-is that is two changes rather than none, and the
+    record of "the statistics at every point" ends up with points played going
+    3, 4, 3, 4.
+
+    Points played is the measure, because it is the one number here that cannot
+    do anything but rise: both players' "Total Points Won" are reported out of
+    it. A reading whose match totals cover fewer points than the best one seen
+    is a stale copy and is dropped -- unless it keeps coming back, which is a
+    correction by the scorer rather than a cache, and lands after `patience`
+    consecutive reads exactly as a corrected score does.
+
+    A reading that is level -- the same points played, which is every read
+    inside a rally -- is passed through, because a statistic can genuinely
+    change without the point count moving: an unforced error reclassified as a
+    winner, or a serve speed arriving a beat after the point it belongs to.
+    Whether it is written is then a question of whether anything differs, and
+    that is the store's to answer.
+    """
+
+    def __init__(self, patience: int = SCORE_PATIENCE) -> None:
+        self.patience = patience
+        self._best: dict[str, int] = {}
+        self._rejected: dict[str, int] = {}
+
+    def accept(self, key: str, reading: StatReading) -> bool:
+        """True if this reading should be considered for writing."""
+        overall = reading.overall
+        if overall is None:
+            return False  # set blocks without the totals: not a usable read
+        points = overall.points_played
+        best = self._best.get(key)
+        if best is None or points >= best:
+            self._best[key] = points
+            self._rejected[key] = 0
+            return True
+
+        rejected = self._rejected.get(key, 0) + 1
+        if rejected < self.patience:
+            self._rejected[key] = rejected
+            log.debug(
+                "stats feed: ignoring a reading that went backwards (%d points, had %d)",
+                points,
+                best,
+            )
+            return False
+
+        log.info(
+            "stats feed: %d points played has stood for %d reads, taking it over %d",
+            points,
+            rejected,
+            best,
+        )
+        self._best[key] = points
         self._rejected[key] = 0
         return True
 

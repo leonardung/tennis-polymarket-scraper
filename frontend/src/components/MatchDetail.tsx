@@ -14,6 +14,7 @@ import { useAsync } from "../hooks";
 import type { ChartPalette } from "../theme";
 import type { MatchDetail as Detail, ScoreEvent } from "../types";
 import { Legend, Panel, Segmented, StatTile } from "./Chrome";
+import { MatchStats } from "./MatchStats";
 import { OrderBook } from "./OrderBook";
 import { TableView } from "./TableView";
 import { TimeSeriesChart, type ChartMarker } from "./TimeSeriesChart";
@@ -298,6 +299,8 @@ export function MatchDetail({
           </Panel>
         </>
       )}
+
+      <MatchStats stats={match.stats} players={match.players} live={match.state === "live"} />
 
       <Panel
         title="Order book"

@@ -57,6 +57,91 @@ FLASHSCORE_TZ = 1  # only shifts where the day boundary falls; times are always 
 FLASHSCORE_DAYS = (-1, 0, 1)  # day cards to read, relative to today
 
 
+# Match statistics come off a third Flashscore feed, `df_st_2_<id>`, and are read
+# on the tick with the book and the score. One read carries every period at once
+# -- the running match totals and each set so far -- and the counters move on
+# almost every point, so the overall block is the one recorded live and only
+# where it changed, exactly as a book snapshot is.
+STATS_TIMEOUT = 6.0  # per-match read; same reasoning as SCORE_TIMEOUT
+# Flashscore keeps correcting a finished match's statistics for a while after
+# the last point -- an unforced error becomes a winner, the speed radar's
+# numbers are revised -- so the per-set breakdown is taken once, late, rather
+# than on the tick. It is the record to check the live capture against.
+FINAL_STATS_DELAY = 3600.0  # wait this long after a match ends before taking them
+FINAL_STATS_WINDOW = 24 * 3600.0  # and stop trying this long after it ended
+FINAL_STATS_CHECK = 60.0  # seconds between looks for a match that has come due
+FINAL_STATS_BATCH = 4  # matches read per look, so a backlog cannot eat a tick
+
+
+@dataclass(frozen=True)
+class Statistic:
+    """One row of the statistics feed, and the shape of the value it carries.
+
+    `label` is Flashscore's own wording, which is what the feed is keyed by;
+    `key` is the column prefix, and it is what the database is keyed by, so the
+    two can drift apart without a migration if the site renames something.
+
+    `of` says the value arrives as a made-of-attempted pair -- "75% (48/64)" or
+    "1/3" -- and gets a second column holding the denominator. The percentage
+    is not stored: it is the quotient of two numbers that are, and keeping it
+    as well would let a row disagree with itself.
+    """
+
+    key: str
+    label: str
+    group: str  # "Serve", "Return", "Points", "Games" -- the feed's own sections
+    of: bool = False
+    unit: str | None = None  # informational; the value is stored as the number
+
+
+def _stat(
+    key: str, label: str, group: str, of: bool = False, unit: str | None = None
+) -> Statistic:
+    return Statistic(key, label, group, of, unit)
+
+
+# Every statistic the feed has been seen to carry, in the order it lists them,
+# under the section heading (`SF`) the feed files it under -- which the dashboard
+# reads back to lay the table out the way the site does.
+# A tournament without ball tracking simply omits some -- serve speed, distance
+# covered and "last 10 balls" are the ones that come and go -- and an absent
+# statistic is stored as NULL rather than zero: not measured is not none.
+# A label that is not on this list is dropped and logged once. The feed is
+# undocumented and the site does add rows, so that log is the warning.
+STATISTICS: tuple[Statistic, ...] = (
+    _stat("aces", "Aces", "Serve"),
+    _stat("double_faults", "Double Faults", "Serve"),
+    _stat("first_serve_pct", "1st serve percentage", "Serve", unit="%"),
+    _stat("first_serve_won", "1st serve points won", "Serve", of=True),
+    _stat("second_serve_won", "2nd serve points won", "Serve", of=True),
+    _stat("break_points_saved", "Break Points Saved", "Serve", of=True),
+    _stat("first_serve_speed", "Average 1st serve speed", "Serve", unit="km/h"),
+    _stat("second_serve_speed", "Average 2nd serve speed", "Serve", unit="km/h"),
+    _stat("first_return_won", "1st return points won", "Return", of=True),
+    _stat("second_return_won", "2nd return points won", "Return", of=True),
+    _stat("break_points_converted", "Break Points Converted", "Return", of=True),
+    _stat("winners", "Winners", "Points"),
+    _stat("unforced_errors", "Unforced errors", "Points"),
+    _stat("net_points_won", "Net points won", "Points", of=True),
+    _stat("service_points_won", "Service Points Won", "Points", of=True),
+    _stat("return_points_won", "Return Points Won", "Points", of=True),
+    _stat("total_points_won", "Total Points Won", "Points", of=True),
+    _stat("last_10_balls", "Last 10 balls", "Points"),
+    _stat("match_points_saved", "Match points saved", "Points"),
+    _stat("service_games_won", "Service games won", "Games", of=True),
+    _stat("return_games_won", "Return games won", "Games", of=True),
+    _stat("total_games_won", "Total games won", "Games", of=True),
+    _stat("distance_covered", "Distance covered (metres)", "Games", unit="m"),
+)
+
+# Keyed by the feed's own wording, folded, since that is what a block carries.
+STATISTICS_BY_LABEL: dict[str, Statistic] = {s.label.lower(): s for s in STATISTICS}
+
+# The feed names the running totals "Match" and each set "Set 1", "Set 2"...
+# The first is what the live capture records; the rest are the per-set table.
+STATS_OVERALL = "Match"
+
+
 # Which tours are captured. Both draws of a combined event are recorded, and
 # each is kept on its own calendar below -- the same week at Cincinnati is a
 # Masters 1000 for one tour and a WTA 1000 for the other.

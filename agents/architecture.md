@@ -10,7 +10,9 @@ project is for, conventions, workflows).
 A Python CLI (`src/polymarket/`) polls the Polymarket CLOB for ATP and WTA tennis
 order books every 5 seconds while a match is being played -- every 60 seconds
 before it starts, never once it is over -- and, on the same tick, reads the live
-score from Flashscore. Both land in one SQLite file. A FastAPI dashboard
+score and the match statistics from Flashscore. All three land in one SQLite
+file, plus a fourth thing that does not run on the tick at all: a finished
+match's per-set statistics, collected an hour after it ended. A FastAPI dashboard
 (`src/polymarket/dashboard/`) serves that file read-only to a React + Lightweight
 Charts front end (`frontend/`, built into the Python package). `docker compose`
 runs the capture and the dashboard as two containers off one image, plus an
@@ -26,8 +28,8 @@ src/polymarket/            the package; `polymarket` console script -> cli.main
   api.py                   Polymarket: Gamma (catalog) and CLOB (books) HTTP client
   book.py                  Snapshot dataclass; parse_book() normalises a raw book
   discovery.py             TennisMarket; the three gates that pick tour-level singles
-  scores.py                Flashscore feeds, pairing, Ratchet. The subtlest file here.
-  poller.py                Poller: the capture loop (tick, score poll, refresh)
+  scores.py                Flashscore feeds, pairing, Ratchet/StatRatchet. The subtlest file here.
+  poller.py                Poller: the capture loop (tick, score poll, stats poll, refresh)
   store.py                 Store: SQLite schema, migration, writes, prune_score_events
   resolver.py              DNS-over-HTTPS shim for ISPs that NXDOMAIN polymarket.com
   dashboard/
@@ -39,9 +41,9 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/hooks.ts             useDataVersion (pulse poll), useAsync, useRoute, useTicker
   src/api.ts, types.ts     fetch wrappers; TS mirrors of queries.py payloads
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
-  src/components/          Chrome, MatchCard, MatchDetail, TimeSeriesChart, OrderBook,
-                           Sparkline, TableView
-tests/test_offline.py      ~355 assertions, no network, plain `python` script
+  src/components/          Chrome, MatchCard, MatchDetail, MatchStats, TimeSeriesChart,
+                           OrderBook, Sparkline, TableView
+tests/test_offline.py      ~455 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -64,6 +66,10 @@ Flashscore day card f_2_… ───┘         (3 gates + ScoreBoard.pair)
   matches _due_matches() returns:
     CLOB POST /books (batched 50) ──> parse_book ──> Poller._changed ──> books
     Flashscore df_sur_2_<id> (+ dc_2_<id>) ──> Ratchet ──> markets, score_events
+    Flashscore df_st_2_<id> ──> parse_stats ──> StatRatchet ──> stat_events
+                                                │
+  once, 1h after a match ends:                  │
+    Flashscore df_st_2_<id> ──> every period ──> set_stats
                                                 │
                                           data/tennis.db
                                                 │  (mode=ro)
@@ -97,13 +103,27 @@ Each iteration, in order:
    at all). Each is re-read from its own Flashscore feed, run through the
    `Ratchet`, and written to `markets` (`update_scores`) plus `score_events`
    (`record_score_events`, changes only).
-3. **`_refresh_due()`** — refresh when the interval elapses, **or** when a match
+3. **`poll_stats(due)`** — `_stat_targets(due)` narrows further than the score
+   does: matches in play only, and only those whose pairing is `oriented`. One
+   `df_st_2_<id>` per match, through `StatRatchet`, written to `stat_events`
+   (`record_stat_events`, changes only). Before a match starts this feed answers
+   with a full set of zeros — a shape, not an absence — which is why upcoming
+   matches are excluded rather than merely deduplicated.
+4. **`collect_final_stats()`** — once a minute (`FINAL_STATS_CHECK`), not once a
+   tick. `store.matches_awaiting_set_stats` is the queue: matches that ended
+   more than `FINAL_STATS_DELAY`=1h ago, less than `FINAL_STATS_WINDOW`=24h ago,
+   with a stored `flashscore_id`, an oriented `flashscore_flip`, and no
+   `set_stats` rows yet. `FINAL_STATS_BATCH`=4 at a time. The queue is a query
+   over the database rather than a timer in memory, so a restart does not lose
+   it and re-running writes one row per period rather than two.
+5. **`_refresh_due()`** — refresh when the interval elapses, **or** when a match
    changed state (rate-limited to `MIN_REFRESH_GAP`=60s, since a refresh pages
    the whole tennis catalog), **or** at `_next_start`, the scheduled start of the
    next upcoming match plus `START_GRACE`.
 
-Both `tick()` and `poll_scores()` are wrapped so no exception can kill the
-capture; the books matter more than the score.
+`tick()`, `poll_scores()`, `poll_stats()` and `collect_final_stats()` are each
+wrapped so no exception can kill the capture; the books matter more than the
+score, and the score more than the statistics.
 
 `refresh()` reloads the day card, re-runs `discover`, rebuilds `self.tracked`
 (token id -> `Tracked`) and `self.watched` (condition id -> `Watched`, only for
@@ -147,6 +167,7 @@ Feeds are `KEY÷VALUE` pairs joined by `¬`, blocks split by `~` (`parse_blocks`
 | `f_2_<day>_<tz>_en_1` | market-list refresh, 3 days (`FLASHSCORE_DAYS`) | the whole day card: ids, names, slugs, start times, status, set scores. A `ZA` heading names the circuit (`scores.TOUR_HEADINGS`); anything not under `ATP - SINGLES` or `WTA - SINGLES` is skipped |
 | `df_sur_2_<id>` | every tick, per live match | one match's status + set-by-set score |
 | `dc_2_<id>` | every tick, only while a set is in play | points in the game and who is serving; **optional** — a failure must not lose the reading |
+| `df_st_2_<id>` | every tick per live match, and once 1h after it ends | 23 statistics per player, for the match as a whole **and** each set, in one ~4 KB response. Keys are `SE` (period), `SF` (group heading), `SG`/`SH`/`SI` (name, home, away), `A1` (the feed's own digest) |
 
 Three mechanisms, each load-bearing:
 
@@ -165,6 +186,13 @@ Three mechanisms, each load-bearing:
   `points` and `serving`, which legitimately go backwards (deuce, serve
   alternating). Replayed over a day of real capture this removed 47% of recorded
   score changes, all spurious.
+- **`StatRatchet`.** The same mechanism for the statistics feed, measuring
+  progress by *points played* — both players' "Total Points Won" are reported out
+  of it, and it is the only number there that cannot fall. A reading level with
+  the last one is **passed through**, not rejected: a statistic can change
+  without a point being played (an unforced error reclassified as a winner, a
+  serve speed landing late), and whether that is worth a row is
+  `record_stat_events`'s question, not the ratchet's.
 - **Pairing.** `ScoreBoard.pair(tour, tournament, players, start_time)` matches by
   tour and tournament **and both players at once**, comparing folded token sets
   (`name_tokens`: accent-folded, punctuation-split, single letters dropped since
@@ -195,11 +223,17 @@ One SQLite file, WAL, `synchronous=NORMAL`, `isolation_level=None`.
 | `markets` | one row per condition_id | metadata (`tour` included) + **latest** state/period/score; `raw` is the JSON payload |
 | `books` | one row per token per written tick | `PRIMARY KEY (token_id, ts) WITHOUT ROWID`; `INSERT OR REPLACE`, so replaying a tick never duplicates |
 | `score_events` | one row per *change* of (state, period, score, game, serving) | `PRIMARY KEY (condition_id, ts)`; this is the timestamped history `markets` lacks |
+| `stat_events` | one row per *change* of the running match statistics | `PRIMARY KEY (condition_id, ts)`; the feed's **overall** block only. No heartbeat -- `books` and `score_events` are writing on the same tick and already say whether anything was running |
+| `set_stats` | one row per (match, period), written once an hour after the match | `PRIMARY KEY (condition_id, period)`; `INSERT OR REPLACE`, so collecting twice leaves one row. The per-set rows sum to the `Match` row, which is what makes it a check on `stat_events` |
 | `quotes` | view | spells out direction: `buy_price = best_ask`, `sell_price = best_bid` |
 
 Column lists are **generated**: `BOOK_COLUMNS` from `BOOK_DEPTH` via
-`_depth_columns()`, so raising depth changes the schema in one place. `MARKET_COLUMNS`
-and `SCORE_EVENT_COLUMNS` are explicit lists.
+`_depth_columns()`, so raising depth changes the schema in one place, and
+`STAT_COLUMNS` from `config.STATISTICS` via `_stat_columns()` -- two columns per
+statistic per player (`aces_0`, `aces_1`), plus a `_of` column for the ones the
+feed reports as a made-of-attempted pair (`first_serve_won_0_of`). Both
+`stat_events` and `set_stats` use that same list. `MARKET_COLUMNS` and
+`SCORE_EVENT_COLUMNS` are explicit lists.
 
 **Migration.** `Store._migrate()` runs on every open and `ALTER TABLE ... ADD
 COLUMN`s anything missing. `CREATE TABLE IF NOT EXISTS` is a no-op on an existing
@@ -216,6 +250,15 @@ Three column semantics that are easy to get wrong:
   `mid`.
 - **NULL means no quote**, not zero and not missing data. One side of a decided
   match genuinely has no offers.
+- **A statistic's percentage is never stored, only its numbers.** `75% (48/64)`
+  becomes `48` and `64`; the percentage is their quotient and storing it too
+  would let a row disagree with itself. A statistic the tournament does not
+  measure (serve speed, distance covered) is NULL -- not measured is not none.
+- **`markets.flashscore_id` / `flashscore_flip` are stored, not re-derived.**
+  The per-set statistics are collected an hour after the match, by which time
+  the market is usually resolved and gone from the API, so there is nothing left
+  to pair against. A NULL `flashscore_flip` means the pairing was not oriented
+  and nothing per-player may be attributed at all.
 - **`ts` is when we read the book, `book_ts` is when it last changed upstream.**
   `ts - book_ts` is the age of the quote, and it is the only thing in the record
   that separates a market nobody is trading from a CLOB that has stopped serving
@@ -246,7 +289,7 @@ deletions strand, then brings `markets` back in step. Reachable as
 |---|---|
 | `GET /api/overview` | every match with latest prices, sparkline, coverage, tab classification |
 | `GET /api/pulse` | `{last_ts, rows}` — the cheap poll target |
-| `GET /api/match/{cid}` | metadata, both ladders, oriented last trade, full `score_events` |
+| `GET /api/match/{cid}` | metadata, both ladders, oriented last trade, full `score_events`, and `stats` (`match_stats`: the latest `stat_events` row plus every `set_stats` period, kept apart rather than merged) |
 | `GET /api/match/{cid}/series?points=&since=` | both players on one shared forward-filled grid |
 
 `serve()` calls `_ensure_schema()` first, which opens the DB **writable once** to
@@ -308,6 +351,13 @@ Docker image has no Node in it.
 - **`theme.ts`** owns light/dark. CSS custom properties are the single source of
   truth; canvas cannot read them, so `readPalette()` pulls the `CHART_TOKENS` out
   of computed style after a frame and the charts are restyled from that.
+- **`MatchStats`** is plain DOM, no chart: one row per statistic, the two
+  players either side of a two-segment bar. The bar's split is computed on the
+  *rate* where the feed reports one — 49 of 67 first serves against 46 of 54 is
+  the second player ahead, and a bar drawn from 49 against 46 says the opposite
+  — and the percentage shown beside a pair is computed there too, never read
+  back, since it is not stored. `Live` and the settled per-set tabs are separate
+  selections, never merged: their disagreement is the point.
 - **`Sparkline`** is deliberately inline SVG, not a chart instance: a tab can hold
   twenty cards, each Lightweight Chart owns a canvas and a resize observer.
 
@@ -343,13 +393,15 @@ only activates when the system resolver fails. See `DNS.md`.
 
 ## Invariants a change must not break
 
-1. **A tick's price and score share a timestamp.** A match's book and score are
-   read in the same pass, off one `due` set. There is no separate score interval
-   (there was; it was removed) -- what varies is which matches a tick reads, not
-   which feed.
-2. **Score reads stay on one connection, sequential.** See `Flashscore.__init__`.
+1. **A tick's price, score and statistics share a timestamp.** A match's book,
+   score and statistics are read in the same pass, off one `due` set. There is no
+   separate score interval (there was; it was removed) -- what varies is which
+   matches a tick reads, not which feed.
+2. **Score and statistics reads stay on one connection, sequential.** See
+   `Flashscore.__init__`; `stat_readings` is a loop for the same reason
+   `readings` is.
 3. **Every score written passes through the `Ratchet`** — day card and per-match
-   read alike.
+   read alike — **and every statistics reading through the `StatRatchet`.**
 4. **A missing quote is NULL**, never a substituted number, at every layer.
 5. **`market_last_trade` is per match**; orientation is an inference and must
    ship with `last_trade_raw` and a caveat.
@@ -366,6 +418,9 @@ only activates when the system resolver fails. See `DNS.md`.
     restricted to `_state == "live"`.
 11. **Bias toward over-capturing.** A finished match captured for a few hours
     costs disk; a live match called finished loses a book that cannot be recovered.
+12. **Per-player data is stored in the market's outcome order**, through
+    `Paired.flip` — the score via `Paired.render`, the statistics via
+    `StatPeriod.sides`. A pairing that could not be oriented publishes neither.
 
 ## Where to make a change
 
@@ -378,6 +433,8 @@ only activates when the system resolver fails. See `DNS.md`.
 | Capture more book depth | `config.BOOK_DEPTH` — `store` columns and `queries._LEVELS` follow automatically; the DB migrates itself, old rows stay NULL |
 | Capture a new field per tick | `book.Snapshot` + `parse_book` -> `store.BOOK_COLUMNS` + `insert_snapshots` -> `queries._BOOK_FIELDS` -> `types.ts` |
 | Handle a new Flashscore status | `scores._STATUS` / `_STAGE` |
+| Record a statistic the feed has started carrying | add a `Statistic` to `config.STATISTICS` — `store.STAT_COLUMNS` and both tables follow, and the DB migrates itself; the log line "no column for ..." is what tells you one is missing |
+| Change when the per-set statistics are collected | `config.FINAL_STATS_DELAY` / `_WINDOW` / `_CHECK` / `_BATCH` |
 | New API endpoint | `dashboard/app.py` + a function in `queries.py` + `types.ts` + `api.ts` |
 | New chart or panel | `frontend/src/components/`, then `npm run build` and commit `static/` |
 | New CLI subcommand | `cli.py`: a `cmd_*` function plus a `sub.add_parser(..., parents=[common])` with `set_defaults(func=..., needs_network=...)` |

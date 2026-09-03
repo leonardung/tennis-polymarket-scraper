@@ -19,6 +19,7 @@ from .api import Polymarket
 from .config import (
     BOOK_DEPTH,
     CLOB,
+    FINAL_STATS_DELAY,
     FLASHSCORE_HOST,
     GAMMA,
     HEARTBEAT,
@@ -116,16 +117,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             include_qualifying=args.include_qualifying,
             live_only=not args.include_upcoming,
             only_changes=not args.every_tick,
+            record_stats=not args.no_stats,
             heartbeat=args.heartbeat,
             stale_after=args.stale_after,
             tours=_tours(args),
         )
         logging.info(
-            "capturing depth-%d %s books and scores into %s: every %.0fs while a match "
+            "capturing depth-%d %s books, scores%s into %s: every %.0fs while a match "
             "is in play, every %.0fs before it starts, never once it is over "
             "(%s matches, %s)",
             BOOK_DEPTH,
             "/".join(t.upper() for t in _tours(args)),
+            "" if args.no_stats else " and match statistics",
             args.db,
             args.interval,
             args.idle_interval,
@@ -220,6 +223,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"\ndb        {stats['db']}")
     print(f"markets   {stats['markets']}")
     print(f"snapshots {stats['snapshots']}")
+    print(f"stats     {stats['stat_events']} change(s), {stats['set_stats']} match(es) with final per-set")
     print(f"window    {fmt(stats['first_ts'])} -> {fmt(stats['last_ts'])}\n")
     rows = stats["by_tournament"]
     if isinstance(rows, list) and rows:
@@ -372,6 +376,13 @@ def main(argv: list[str] | None = None) -> int:
         "--every-tick",
         action="store_true",
         help="write a snapshot every tick, including when the book has not moved",
+    )
+    p_run.add_argument(
+        "--no-stats",
+        action="store_true",
+        help="do not record match statistics -- aces, winners, points won and the rest. "
+        "They cost one extra Flashscore read per live match per tick, and a final "
+        f"per-set reading {FINAL_STATS_DELAY / 3600:.0f}h after each match ends",
     )
     p_run.add_argument(
         "--heartbeat",

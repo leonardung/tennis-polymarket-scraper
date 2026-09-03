@@ -189,6 +189,8 @@ class FakeFlashscore:
         self._board = board if board is not None else ScoreBoard()
         self.readings_by_id = readings or {}
         self.calls: list[list[str]] = []
+        self.stats_by_id: dict = {}
+        self.stat_calls: list[list[str]] = []
 
     def board(self):
         return self._board
@@ -197,6 +199,15 @@ class FakeFlashscore:
         wanted = list(match_ids)
         self.calls.append(wanted)
         return {i: self.readings_by_id[i] for i in wanted if i in self.readings_by_id}
+
+    def stats(self, match_id):
+        self.stat_calls.append([match_id])
+        return self.stats_by_id.get(match_id)
+
+    def stat_readings(self, match_ids):
+        wanted = list(match_ids)
+        self.stat_calls.append(wanted)
+        return {i: self.stats_by_id[i] for i in wanted if i in self.stats_by_id}
 
 
 def _board(*matches: tuple, tour: str = "atp") -> object:
@@ -1907,6 +1918,274 @@ def test_stale_ignores_upcoming() -> None:
                 log.setLevel(previous)
 
 
+# --------------------------------------------------------------------------
+# match statistics
+# --------------------------------------------------------------------------
+
+
+def _stats_feed(*periods: tuple) -> str:
+    """Build a `df_st_` response: (period name, [(label, home, away), ...])."""
+    chunks = []
+    for name, rows in periods:
+        chunks.append(f"SE\u00f7{name}\u00ac")
+        chunks.append("SF\u00f7Service\u00ac")  # a group heading, carrying nothing
+        for label, home, away in rows:
+            chunks.append(f"SG\u00f7{label}\u00acSH\u00f7{home}\u00acSI\u00f7{away}\u00ac")
+    chunks.append("A1\u00f7deadbeef\u00ac")
+    return "~".join(chunks)
+
+
+def test_stats_feed() -> None:
+    print("\nstatistics feed")
+    from polymarket.scores import StatValue, parse_stat_value, parse_stats
+
+    # The four shapes the feed writes a value in, and the one it does not.
+    check("a count reads as a number", parse_stat_value("18") == StatValue(18.0, None))
+    check("a percentage keeps the number", parse_stat_value("63%").value == 63.0)
+    check("a percentage has nothing to be out of", parse_stat_value("63%").of is None)
+    check("a measurement drops its unit", parse_stat_value("194 km/h").value == 194.0)
+    made = parse_stat_value("75% (48/64)")
+    check("made-of keeps the pair, not the percentage", (made.value, made.of) == (48.0, 64.0))
+    bare = parse_stat_value("1/3")
+    check("a bare fraction is the same pair", (bare.value, bare.of) == (1.0, 3.0))
+    check("an empty cell is nothing at all", parse_stat_value("") is None)
+    check("a dash is not a zero", parse_stat_value("-") is None)
+
+    raw = _stats_feed(
+        ("Match", [("Aces", "18", "12"), ("Total Points Won", "51% (94/185)", "49% (91/185)"),
+                   ("Break Points Saved", "1/1", "1/3"), ("Sportsball index", "7", "7")]),
+        ("Set 1", [("Aces", "6", "0"), ("Total Points Won", "60% (29/48)", "40% (19/48)")]),
+    )
+    reading = parse_stats(raw)
+    check("every period comes back from one read", len(reading.periods) == 2)
+    check("the overall block is found by name", reading.overall.period == "Match")
+    check("the sets are what is left", [p.period for p in reading.sets] == ["Set 1"])
+    check("the feed's own digest is kept", reading.digest == "deadbeef")
+    check("a group heading is not a statistic", "sportsball index" not in reading.overall.home)
+    check("an unknown label is dropped", len(reading.overall.home) == 3)
+    check("home and away are read separately", reading.overall.away["aces"].value == 12.0)
+    check("points played is the shared denominator", reading.overall.points_played == 185)
+    check("each set counts its own points", reading.sets[0].points_played == 48)
+
+    # The same flip the score goes through: Flashscore's home player is the
+    # market's second outcome, so every value has to swap with it.
+    first, second = reading.overall.sides(flip=False)
+    check("unflipped, home is outcome 0", first["aces"].value == 18.0)
+    first, second = reading.overall.sides(flip=True)
+    check("flipped, home is outcome 1", second["aces"].value == 18.0)
+    check("and away is outcome 0", first["aces"].value == 12.0)
+
+    check("a feed with nothing in it is nothing", parse_stats("") is None)
+    check("so is one that is only a digest", parse_stats("A1\u00f7x\u00ac") is None)
+
+
+def test_stats_ratchet() -> None:
+    """A stale copy of the statistics feed must not rewind the counters."""
+    print("\nstatistics ratchet")
+    from polymarket.scores import StatRatchet, parse_stats
+
+    def at(points: int, aces: str = "5"):
+        return parse_stats(
+            _stats_feed(("Match", [("Aces", aces, "1"),
+                                   ("Total Points Won", f"50% (1/{points})", f"50% (1/{points})")]))
+        )
+
+    ratchet = StatRatchet(patience=3)
+    check("the first reading is always taken", ratchet.accept("m", at(40)))
+    check("a reading that moved on is taken", ratchet.accept("m", at(41)))
+    check("a rewind is dropped", not ratchet.accept("m", at(40)))
+    check("and again", not ratchet.accept("m", at(40)))
+    check("but a reading that keeps coming back is a correction", ratchet.accept("m", at(40)))
+
+    # A statistic can change without a point being played: an unforced error
+    # reclassified as a winner, a serve speed landing a beat late. Level is
+    # not backwards, and the store decides whether anything actually differs.
+    ratchet = StatRatchet()
+    check("a level reading is passed through", ratchet.accept("n", at(40)))
+    check("and still is when only a statistic moved", ratchet.accept("n", at(40, aces="6")))
+
+    check("set blocks with no totals are not a reading",
+          not ratchet.accept("n", parse_stats(_stats_feed(("Set 1", [("Aces", "1", "1")])))))
+
+    ratchet.forget(["n"])
+    check("forgetting a match forgets its progress", "n" in ratchet._best and "m" not in ratchet._best)
+
+
+def test_stat_events() -> None:
+    print("\nstatistics history")
+    from polymarket.scores import parse_stats
+    from polymarket.store import StatRow
+
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]), _live_board())
+    market = kept[0]
+    reading = parse_stats(
+        _stats_feed(("Match", [("Aces", "9", "4"), ("Winners", "20", "18"),
+                               ("Total Points Won", "52% (52/100)", "48% (48/100)")]))
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "s.db") as store:
+            store.upsert_markets([market])
+            row = StatRow.of(market.condition_id, reading.overall, flip=False,
+                             digest=reading.digest)
+            check("the first reading is written", store.record_stat_events([row]) == 1)
+            check("an unchanged reading is not", store.record_stat_events([row]) == 0)
+
+            moved = parse_stats(
+                _stats_feed(("Match", [("Aces", "10", "4"), ("Winners", "20", "18"),
+                                       ("Total Points Won", "52% (53/101)", "48% (48/101)")]))
+            )
+            check("an ace is a change",
+                  store.record_stat_events(
+                      [StatRow.of(market.condition_id, moved.overall, flip=False)]) == 1)
+
+            stored = store.conn.execute(
+                "SELECT aces_0, aces_1, winners_0, total_points_won_0, total_points_won_0_of, "
+                "digest FROM stat_events ORDER BY ts"
+            ).fetchall()
+            check("history is the sequence of changes", len(stored) == 2)
+            check("the pair is stored, not the percentage", stored[0][3:5] == (52.0, 100.0))
+            check("the feed's digest rides along", stored[0][5] == "deadbeef")
+            check("the second row is the one that moved", stored[1][0] == 10.0)
+
+            missing = store.conn.execute(
+                "SELECT double_faults_0, first_serve_speed_1 FROM stat_events LIMIT 1"
+            ).fetchone()
+            check("a statistic the feed did not report is NULL, not zero",
+                  tuple(missing) == (None, None))
+
+            # Flipped, the same reading has to come out the other way round.
+            flipped = StatRow.of("other", reading.overall, flip=True)
+            check("flip swaps the two players", flipped.values["aces_0"] == 4.0)
+
+
+def test_final_stats() -> None:
+    """The per-set breakdown is taken once, an hour after the match ends."""
+    print("\nfinal per-set statistics")
+    from polymarket.poller import Poller
+    from polymarket.scores import parse_stats
+    from polymarket.store import ScoreRow
+
+    api = FakeAPI([_cincinnati_atp()])
+    api.books = lambda token_ids: {}
+    feed = FakeFlashscore(_live_board())
+    reading = parse_stats(
+        _stats_feed(
+            ("Match", [("Aces", "9", "4"), ("Total Points Won", "52% (52/100)", "48% (48/100)")]),
+            ("Set 1", [("Aces", "5", "1"), ("Total Points Won", "56% (28/50)", "44% (22/50)")]),
+            ("Set 2", [("Aces", "4", "3"), ("Total Points Won", "48% (24/50)", "52% (26/50)")]),
+        )
+    )
+    feed.stats_by_id["fs0"] = reading
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "s.db") as store:
+            poller = Poller(api, store, scores=feed)
+            poller.refresh()
+            cid = next(iter(poller.watched))
+            check("the pairing is stored on the market", store.conn.execute(
+                "SELECT flashscore_id, flashscore_flip FROM markets WHERE condition_id = ?",
+                (cid,)).fetchone() == ("fs0", 0))
+
+            now = time.time()
+            check("a match still being played is not due",
+                  store.matches_awaiting_set_stats(now, 3600.0, 86400.0, 4) == [])
+
+            store.record_score_events([ScoreRow(cid, "ended", "FT", "6-3, 6-4")])
+            check("nor is one that ended a minute ago",
+                  store.matches_awaiting_set_stats(now, 3600.0, 86400.0, 4) == [])
+
+            # The queue is a query over what is stored, so moving the clock
+            # forward is all it takes to make the match due.
+            later = now + 3700
+            due = store.matches_awaiting_set_stats(later, 3600.0, 86400.0, 4)
+            check("an hour later it is", [d[:3] for d in due] == [(cid, "fs0", 0)])
+            check("and it comes with a name to log", due[0][3].startswith("Cincinnati"))
+            check("a match that ended a week ago is out of the window",
+                  store.matches_awaiting_set_stats(now + 8 * 86400, 3600.0, 86400.0, 4) == [])
+
+            check("every period is collected", poller.collect_final_stats(later) == 3)
+            check("the feed was asked once", feed.stat_calls[-1] == ["fs0"])
+            check("and only once -- it is not due again",
+                  store.matches_awaiting_set_stats(later, 3600.0, 86400.0, 4) == [])
+
+            rows = dict(store.conn.execute(
+                "SELECT period, total_points_won_0_of FROM set_stats WHERE condition_id = ?",
+                (cid,)).fetchall())
+            check("the match row and both sets are there",
+                  set(rows) == {"Match", "Set 1", "Set 2"})
+            check("the sets add up to the match, which is the point of the table",
+                  rows["Set 1"] + rows["Set 2"] == rows["Match"])
+
+            # A walkover has no statistics and never will; asking forever is rude.
+            store.conn.execute("DELETE FROM set_stats")
+            feed.stats_by_id.pop("fs0")
+            for _ in range(4):
+                poller.collect_final_stats(later)
+            check("a match with nothing to collect is dropped after a few tries",
+                  poller._final_tries[cid] == 3)
+
+
+def test_stats_poll() -> None:
+    print("\nstatistics poll")
+    from polymarket.poller import Poller
+    from polymarket.scores import parse_stats
+
+    def feed_at(aces: str, points: int) -> object:
+        return parse_stats(
+            _stats_feed(("Match", [("Aces", aces, "4"),
+                                   ("Total Points Won", f"50% (1/{points})", f"50% (1/{points})")]))
+        )
+
+    api = FakeAPI([_cincinnati_atp()])
+    api.books = lambda token_ids: {}
+    feed = FakeFlashscore(_live_board())
+    feed.stats_by_id["fs0"] = feed_at("9", 100)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "s.db") as store:
+            poller = Poller(api, store, scores=feed)
+            poller.refresh()
+            cid = next(iter(poller.watched))
+
+            check("the first read is written", poller.poll_stats() == 1)
+            check("an unchanged read is not", poller.poll_stats() == 0)
+
+            feed.stats_by_id["fs0"] = feed_at("10", 101)
+            check("a point going by is recorded", poller.poll_stats() == 1)
+
+            # The same stale-cache rewind the score gets, and the same answer.
+            feed.stats_by_id["fs0"] = feed_at("9", 100)
+            check("a rewind is not recorded", poller.poll_stats() == 0)
+
+            # Cadence: statistics ride the tick the book and score ride.
+            feed.stats_by_id["fs0"] = feed_at("11", 102)
+            check("a match not due this tick is not read", poller.poll_stats(due=set()) == 0)
+            check("one that is, is", poller.poll_stats(due={cid}) == 1)
+
+            # Before the start the feed answers with a full set of zeros, which
+            # is a shape rather than an absence, so it is not asked at all.
+            poller._state[cid] = "upcoming"
+            feed.stats_by_id["fs0"] = feed_at("12", 103)
+            check("a match that has not started is not read", poller.poll_stats() == 0)
+            poller._state[cid] = "ended"
+            check("nor is one that is over", poller.poll_stats() == 0)
+            poller._state[cid] = "live"
+
+            # A pairing that could not be told apart cannot attribute a column
+            # to a player, and a mirrored row is worse than no row.
+            from dataclasses import replace as _replace
+            watched = poller.watched[cid]
+            poller.watched[cid] = _replace(
+                watched, pairing=_replace(watched.pairing, oriented=False)
+            )
+            check("an unoriented match is left out", poller.poll_stats() == 0)
+            poller.watched[cid] = watched
+
+            check("--no-stats records nothing at all",
+                  Poller(api, store, scores=feed, record_stats=False).poll_stats() == 0)
+
+
 if __name__ == "__main__":
     test_book()
     test_filters()
@@ -1934,4 +2213,9 @@ if __name__ == "__main__":
     test_stale_warning()
     test_backfill_book_ts()
     test_stale_ignores_upcoming()
+    test_stats_feed()
+    test_stats_ratchet()
+    test_stat_events()
+    test_final_stats()
+    test_stats_poll()
     print(f"\n{PASSED} checks passed\n")
