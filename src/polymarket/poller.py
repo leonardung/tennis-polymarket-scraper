@@ -27,6 +27,8 @@ from .config import (
     POLL_INTERVAL,
     REFRESH_INTERVAL,
     SCORE_LEAD,
+    STALE_AFTER,
+    STALE_WARN_EVERY,
     START_GRACE,
     TOURS,
 )
@@ -80,6 +82,7 @@ class Poller:
         live_only: bool = True,
         only_changes: bool = True,
         heartbeat: float = HEARTBEAT,
+        stale_after: float = STALE_AFTER,
         scores: Flashscore | None = None,
         tours: Sequence[str] = TOURS,
     ) -> None:
@@ -100,6 +103,7 @@ class Poller:
         self.live_only = live_only
         self.only_changes = only_changes
         self.heartbeat = heartbeat
+        self.stale_after = stale_after
         self.tracked: dict[str, Tracked] = {}
         self.watched: dict[str, Watched] = {}  # by condition_id
         self._state: dict[str, str] = {}  # last seen live/upcoming/ended
@@ -107,6 +111,8 @@ class Poller:
         self._last_write: dict[str, float] = {}
         self._last_poll: dict[str, float] = {}  # by condition_id: when it was last read
         self._retired: set[str] = set()  # condition ids already logged as finished
+        self._stale_since: float | None = None  # when every book last went stale at once
+        self._stale_warned: float = 0.0
         self._next_start: float | None = None  # monotonic deadline
         self._state_changed = False
         self._stop = False
@@ -419,14 +425,24 @@ class Poller:
         books = self.api.books(tokens)
 
         rows = []
+        ages = []
         for token, book in books.items():
             meta = self.tracked.get(token)
             if meta is None:
                 continue
             snap = parse_book(token, book)
+            # Books of matches in play only, and every one read rather than only
+            # the ones written -- a frozen feed writes nothing, so the skipped
+            # books are the evidence. Restricted to live matches because the
+            # cadences share this loop: the idle tick sweeps in a whole day card
+            # of not-yet-started markets, and one fresh book among those would
+            # otherwise pass for a feed that is moving.
+            if snap.book_ts is not None and self._state.get(meta.condition_id) == "live":
+                ages.append(ts - snap.book_ts)
             if self.only_changes and not self._changed(token, snap, ts):
                 continue
             rows.append((snap, meta.condition_id, meta.outcome_index, meta.outcome))
+        self._check_stale(ts, ages)
 
         written = self.store.insert_snapshots(ts, rows) if rows else 0
         missing = len(tokens) - len(books)
@@ -443,6 +459,43 @@ class Poller:
             f", {waiting} token(s) not due" if waiting else "",
         )
         return written
+
+    def _check_stale(self, ts: float, ages: list[float]) -> None:
+        """Warn while the upstream books have stopped moving.
+
+        `ages` is how far behind the book of each match *in play* says it is. One
+        stale book is just a market nobody is trading, so the test is the
+        *freshest* of them: if even that is behind, the feed itself has stopped,
+        and the tick log alone cannot show it -- every request still succeeded,
+        and "0 rows, all unchanged" is equally what a calm market looks like.
+
+        Polymarket serves stale books during a CLOB outage rather than failing,
+        and its status page has run hours behind the data, so this is the only
+        local warning that a capture is recording prices that no longer move.
+        """
+        if len(ages) < 2:  # too few to tell a dead feed from a quiet market
+            return
+        freshest = min(ages)
+        if freshest < self.stale_after:
+            if self._stale_since is not None:
+                log.info("books moving again after %.0fs stale", ts - self._stale_since)
+                self._stale_since = None
+                self._stale_warned = 0.0
+            return
+        if self._stale_since is None:
+            self._stale_since = ts
+        if ts - self._stale_warned < STALE_WARN_EVERY:
+            return
+        self._stale_warned = ts
+        ages.sort()
+        log.warning(
+            "upstream books frozen: all %d live stale, freshest %.0fs behind, "
+            "median %.0fs, oldest %.0fs -- prices recorded now are not moving",
+            len(ages),
+            freshest,
+            ages[len(ages) // 2],
+            ages[-1],
+        )
 
     def _changed(self, token: str, snap: Snapshot, ts: float) -> bool:
         """True if this snapshot should be written.

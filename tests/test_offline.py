@@ -88,6 +88,15 @@ def test_book() -> None:
     check(f"depth capped at {BOOK_DEPTH} asks", len(deep.asks) == BOOK_DEPTH)
     check("the cap keeps the best levels", deep.bids[0][0] == 0.50 and deep.asks[0][0] == 0.51)
 
+    # The book's own timestamp, in ms, is what separates a quiet market from a
+    # frozen feed -- see Snapshot.book_ts.
+    check("upstream timestamp read as seconds", snap.book_ts == 1700000000.0)
+    check("integer milliseconds accepted", parse_book("1", {"timestamp": 1700000000000}).book_ts
+          == 1700000000.0)
+    check("a book with no timestamp has none", parse_book("1", {}).book_ts is None)
+    check("an unparseable timestamp is not fatal",
+          parse_book("1", {"timestamp": "soon"}).book_ts is None)
+
 
 # --------------------------------------------------------------------------
 # tournament + slug parsing
@@ -492,6 +501,12 @@ def test_store() -> None:
             check("depth level 3 stored", (row[4], row[5]) == (0.62, 300.0))
             check("outcome label stored", row[6] == "Botic van de Zandschulp")
             check("market last trade stored", row[7] == 0.56)
+            stored = store.conn.execute(
+                "SELECT book_ts, book_ts_derived FROM books WHERE token_id = ?",
+                (market.tokens[0],),
+            ).fetchone()
+            check("upstream book timestamp stored", stored[0] == 1700000000.0)
+            check("stored timestamp is marked as measured, not derived", stored[1] == 0)
             # The API reports one last-trade price per market on BOTH tokens,
             # oriented to whichever side traded last -- so it must never be read
             # as "this outcome's" price. Verified against live Cincinnati books.
@@ -1710,6 +1725,188 @@ def test_decimation() -> None:
     check("every kept point is real", kept <= set(grid))
 
 
+# --------------------------------------------------------------------------
+# staleness warning + book_ts backfill
+# --------------------------------------------------------------------------
+
+
+def test_stale_warning() -> None:
+    """A frozen upstream book must be logged, not silently recorded as calm."""
+    print("\nstaleness warning")
+    import logging
+
+    from polymarket.poller import Poller
+
+    poller = Poller.__new__(Poller)  # only _check_stale is under test
+    poller.stale_after = 120.0
+    poller._stale_since = None
+    poller._stale_warned = 0.0
+
+    class Trap(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    trap = Trap()
+    log = logging.getLogger("polymarket.poller")
+    log.addHandler(trap)
+    previous = log.level
+    log.setLevel(logging.INFO)  # the recovery notice is INFO, not a warning
+    try:
+        now = 1_000_000.0
+        poller._check_stale(now, [5.0, 400.0, 900.0])
+        check("one fresh book means the feed is alive", not trap.records)
+        check("and nothing is marked stale", poller._stale_since is None)
+
+        poller._check_stale(now, [400.0, 900.0, 1500.0])
+        check("every book stale at once warns", len(trap.records) == 1)
+        check("the warning is a warning", trap.records[0].levelno == logging.WARNING)
+        check("it reports the freshest book", "400s behind" in trap.records[0].getMessage())
+        check("stale start recorded", poller._stale_since == now)
+
+        poller._check_stale(now + 5, [410.0, 910.0, 1510.0])
+        check("it does not warn again every tick", len(trap.records) == 1)
+        poller._check_stale(now + 61, [470.0, 970.0, 1570.0])
+        check("but repeats once the interval has passed", len(trap.records) == 2)
+
+        poller._check_stale(now + 70, [2.0, 970.0])
+        check("recovery is logged", len(trap.records) == 3)
+        check("recovery is not a warning", trap.records[2].levelno == logging.INFO)
+        check("and clears the stale mark", poller._stale_since is None)
+
+        poller._check_stale(now + 80, [900.0])
+        check("a single book is too few to judge", len(trap.records) == 3)
+    finally:
+        log.removeHandler(trap)
+        log.setLevel(previous)
+
+
+def test_backfill_book_ts() -> None:
+    """Rows written before book_ts existed get it back from runs of equal hash."""
+    print("\nbook_ts backfill")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "fill.db"
+        with Store(path) as store:
+            # One token: the book moves at 100, holds until 400 (two heartbeats),
+            # moves again at 500. A second token stays put throughout.
+            rows = [
+                ("tok", 100.0, "h1"), ("tok", 200.0, "h1"), ("tok", 300.0, "h1"),
+                ("tok", 500.0, "h2"), ("tok", 600.0, "h2"),
+                ("other", 150.0, "k1"), ("other", 450.0, "k1"),
+            ]
+            store.conn.executemany(
+                "INSERT INTO books (token_id, ts, book_hash) VALUES (?, ?, ?)",
+                [(t, ts, h) for t, ts, h in rows],
+            )
+            dry = store.backfill_book_ts()
+            check("dry run counts what is missing", dry["pending"] == 7)
+            check("dry run changes nothing", store.conn.execute(
+                "SELECT COUNT(*) FROM books WHERE book_ts IS NOT NULL").fetchone()[0] == 0)
+
+            summary = store.backfill_book_ts(apply=True, batch=3)
+            check("every row filled", summary["filled"] == 7)
+
+            got = dict(store.conn.execute(
+                "SELECT ts, book_ts FROM books WHERE token_id = 'tok'").fetchall())
+            check("a run is dated to its first row", got[100.0] == 100.0)
+            check("later rows in the run share it", got[200.0] == 100.0 and got[300.0] == 100.0)
+            check("a new hash starts a new run", got[500.0] == 500.0)
+            check("and carries forward", got[600.0] == 500.0)
+            check("tokens are independent", store.conn.execute(
+                "SELECT book_ts FROM books WHERE token_id='other' AND ts=450.0"
+            ).fetchone()[0] == 150.0)
+            check("derived rows are marked", store.conn.execute(
+                "SELECT COUNT(*) FROM books WHERE book_ts_derived = 1").fetchone()[0] == 7)
+
+            again = store.backfill_book_ts(apply=True)
+            check("re-running finds nothing left", again["pending"] == 0)
+
+            # A measured value must never be overwritten by a derived one.
+            store.conn.execute(
+                "INSERT INTO books (token_id, ts, book_hash, book_ts, book_ts_derived)"
+                " VALUES ('tok', 700.0, 'h2', 42.0, 0)")
+            store.backfill_book_ts(apply=True)
+            check("a measured book_ts survives a backfill", store.conn.execute(
+                "SELECT book_ts, book_ts_derived FROM books WHERE ts=700.0").fetchone()
+                == (42.0, 0))
+
+
+def test_stale_ignores_upcoming() -> None:
+    """A fresh not-yet-started book must not pass for a feed that is moving.
+
+    Both cadences share one loop, so the idle tick sweeps in a whole day card of
+    upcoming markets. Counting those, a single fresh one among them would clear
+    the warning every time that tick came round -- which is exactly what it did
+    before the check was restricted to matches in play.
+    """
+    print("\nstaleness ignores upcoming markets")
+    import logging
+
+    from polymarket.poller import Poller, Tracked
+
+    class Trap(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    api = FakeAPI([_cincinnati_atp()])
+    feed = FakeFlashscore(_live_board())
+    now = time.time()
+    stale_ms = str(int((now - 3000) * 1000))
+    fresh_ms = str(int(now * 1000))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "s.db") as store:
+            poller = Poller(api, store, scores=feed)
+            api.books = lambda token_ids: {
+                tid: dict(BOOK, asset_id=tid, timestamp=stale_ms) for tid in token_ids
+            }
+            poller.refresh()
+            live_cid = next(iter(poller.tracked.values())).condition_id
+            check("the live match is tracked", poller._state[live_cid] == "live")
+
+            # a day-card market that has not started, with a book that just moved
+            poller.tracked["upcoming-token"] = Tracked("cid-upcoming", 0, "X", "not started")
+            poller._state["cid-upcoming"] = "upcoming"
+            api.books = lambda token_ids: {
+                tid: dict(
+                    BOOK,
+                    asset_id=tid,
+                    timestamp=fresh_ms if tid == "upcoming-token" else stale_ms,
+                )
+                for tid in token_ids
+            }
+
+            trap = Trap()
+            log = logging.getLogger("polymarket.poller")
+            log.addHandler(trap)
+            previous = log.level
+            log.setLevel(logging.INFO)
+            try:
+                poller.tick(due={live_cid, "cid-upcoming"})
+                frozen = [r for r in trap.records if "frozen" in r.getMessage()]
+                check("a fresh upcoming book does not hide the live freeze", len(frozen) == 1)
+                check("only the in-play books are counted", "all 2 live stale" in frozen[0].getMessage())
+
+                # and the live books moving again is what clears it
+                api.books = lambda token_ids: {
+                    tid: dict(BOOK, asset_id=tid, timestamp=str(int(time.time() * 1000)))
+                    for tid in token_ids
+                }
+                poller.tick(due={live_cid, "cid-upcoming"})
+                check("live books moving again clears the warning",
+                      poller._stale_since is None)
+            finally:
+                log.removeHandler(trap)
+                log.setLevel(previous)
+
+
 if __name__ == "__main__":
     test_book()
     test_filters()
@@ -1734,4 +1931,7 @@ if __name__ == "__main__":
     test_last_trade_orientation()
     test_dashboard_series()
     test_decimation()
+    test_stale_warning()
+    test_backfill_book_ts()
+    test_stale_ignores_upcoming()
     print(f"\n{PASSED} checks passed\n")

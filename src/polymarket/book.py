@@ -22,6 +22,20 @@ class Snapshot:
     api_timestamp: str | None
 
     @property
+    def book_ts(self) -> float | None:
+        """When the book last changed upstream, in epoch seconds.
+
+        The API reports this in milliseconds, sometimes as a string. It is the
+        only field that separates a quiet market from a frozen feed: the endpoint
+        answers normally either way, and a book that no longer moves is otherwise
+        indistinguishable from one nobody is trading.
+        """
+        try:
+            return float(self.api_timestamp) / 1000.0  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def mid(self) -> float | None:
         if self.best_bid is None or self.best_ask is None:
             return None

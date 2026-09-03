@@ -208,7 +208,7 @@ The schema only ever grows; SQLite backfills NULL. Indexes and the view are in
 `VIEWS`, applied *after* the migration because they reference new columns; the
 view is dropped and recreated every open (free, keeps it in step with the code).
 
-Two column semantics that are easy to get wrong:
+Three column semantics that are easy to get wrong:
 
 - **`market_last_trade` is per MATCH, not per player.** The API reports one
   last-traded price on both tokens, oriented to whichever side traded last, so on
@@ -216,6 +216,20 @@ Two column semantics that are easy to get wrong:
   `mid`.
 - **NULL means no quote**, not zero and not missing data. One side of a decided
   match genuinely has no offers.
+- **`ts` is when we read the book, `book_ts` is when it last changed upstream.**
+  `ts - book_ts` is the age of the quote, and it is the only thing in the record
+  that separates a market nobody is trading from a CLOB that has stopped serving
+  fresh books. `book_ts_derived = 1` marks a value reconstructed by
+  `backfill-book-ts` rather than read from the API — good to one polling
+  interval, and it understates staleness across a capture outage.
+
+`backfill_book_ts(apply=False)` fills `book_ts` for rows written before it was
+recorded. Snapshots are only written when the book changed, so a run of
+consecutive rows sharing a `book_hash` is one unchanged book seen repeatedly (the
+heartbeat writing it out) and the book last moved at the first row of the run.
+Batched with a commit between each so a concurrent capture is never blocked long;
+only fills NULLs, so it is safe to re-run. Reachable as
+`polymarket backfill-book-ts`, same idle guard as below.
 
 `prune_score_events(apply=False)` replays stored history through the same
 `Ratchet` and deletes what would not have been accepted, plus the repeats those
@@ -345,7 +359,12 @@ only activates when the system resolver fails. See `DNS.md`.
 8. **The dashboard is read-only** apart from the one startup migration.
 9. **The committed bundle under `dashboard/static/` must match `frontend/src`** —
    rebuild and commit it, or the served UI silently lags the source.
-10. **Bias toward over-capturing.** A finished match captured for a few hours
+10. **Staleness is judged on in-play books only.** Both cadences share one loop,
+    so an idle tick sweeps in a whole day card of not-yet-started markets. Count
+    those in `_check_stale` and one fresh upcoming book clears the warning every
+    time that tick comes round — which is exactly what happened before it was
+    restricted to `_state == "live"`.
+11. **Bias toward over-capturing.** A finished match captured for a few hours
     costs disk; a live match called finished loses a book that cannot be recovered.
 
 ## Where to make a change

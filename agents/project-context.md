@@ -66,6 +66,7 @@ uv run polymarket dashboard             # http://127.0.0.1:8787
 uv run polymarket stats                 # summarise the database
 uv run polymarket sql "SELECT ..."      # any query, read-only
 uv run polymarket clean-scores          # repair pre-ratchet score history
+uv run polymarket backfill-book-ts      # reconstruct book_ts for older rows
 ```
 
 `dashboard`, `stats` and `sql` open the file read-only and are safe to run beside
@@ -168,6 +169,18 @@ Other conventions:
   the environment, never on a command line. `.env.example` documents the shape.
 - **The tunnel origin is `dashboard:8787`, not `localhost:8787`**, and
   `network_mode: "service:dashboard"` is a trap that 502s after every rebuild.
+- **Polymarket serves a STALE book during an outage rather than failing.** Every
+  request still returns 200 in milliseconds; the book behind it just stops
+  changing. The tick log cannot show it -- "0 rows, all unchanged" is equally what
+  a calm market looks like -- and their status page has run hours behind, and
+  uptime monitors call the CLOB healthy throughout because the endpoint answers.
+  `book_ts` (the book's own timestamp) is the only local signal, and the capture
+  warns on it; see `Poller._check_stale`. This has cost real data: clean through
+  2026-08-25, then from 2026-08-30 onwards a recurring daily failure that froze
+  live books for 25, 40, 95, 155 and 72 minutes at a stretch on 08-30 to 09-03,
+  roughly 58-61% of live capture time on the worst days. Polymarket published no
+  root cause and is rebuilding the CLOB in Rust, so expect it to recur. When
+  reading price against play, filter on `ts - book_ts` first.
 - **DNS**: several ISP resolvers NXDOMAIN `polymarket.com`. Handled automatically
   by `resolver.py`; `DNS.md` is the user-facing writeup. A `cannot reach the
   Polymarket API` error is almost always this.

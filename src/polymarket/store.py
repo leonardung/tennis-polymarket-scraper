@@ -68,6 +68,15 @@ BOOK_COLUMNS = [
     # is wrong for one of the two rows. See parse_book.
     "market_last_trade",
     "book_hash",
+    # When the book last changed *upstream*, as opposed to `ts`, which is when we
+    # read it. `ts - book_ts` is the staleness of the quote, and the only way to
+    # tell a market nobody is trading from a feed that has stopped moving.
+    "book_ts",
+    # 0 when book_ts came from the API, 1 when `backfill-book-ts` reconstructed it
+    # from runs of equal book_hash -- accurate only to one polling interval, and
+    # blind to changes that happened while nothing was being recorded. NULL for
+    # rows written before this column existed and never backfilled.
+    "book_ts_derived",
 ]
 
 MARKET_COLUMNS = [
@@ -107,7 +116,7 @@ SCORE_EVENT_COLUMNS = [
 ]
 
 _TEXT_COLUMNS = {"condition_id", "token_id", "outcome", "book_hash"}
-_INT_COLUMNS = {"outcome_index"}
+_INT_COLUMNS = {"outcome_index", "book_ts_derived"}
 
 
 def _books_ddl() -> str:
@@ -336,7 +345,7 @@ class Store:
                 for i in range(BOOK_DEPTH):
                     price, size = side[i] if i < len(side) else (None, None)
                     values += [price, size]
-            values += [snap.market_last_trade, snap.book_hash]
+            values += [snap.market_last_trade, snap.book_hash, snap.book_ts, 0]
             payload.append(tuple(values))
 
         placeholders = ",".join("?" * len(BOOK_COLUMNS))
@@ -442,4 +451,82 @@ class Store:
             """
         )
         self.conn.execute("COMMIT")
+        return summary
+
+    def backfill_book_ts(
+        self, apply: bool = False, batch: int = 50_000
+    ) -> dict[str, object]:
+        """Reconstruct `book_ts` for rows written before it was recorded.
+
+        The true upstream timestamp of a past read is gone -- Polymarket keeps no
+        book history -- but it can be inferred from what is stored. Snapshots are
+        only written when the book changed, so a run of consecutive rows sharing a
+        `book_hash` is one unchanged book seen repeatedly: the heartbeat writing
+        it out. The book therefore last moved at the *first* row of that run, and
+        every row in the run gets that timestamp.
+
+        Two limits, which is why these rows are marked ``book_ts_derived = 1``:
+        the value is the first time the hash was *seen*, so it is late by up to
+        one polling interval (2-5s live, 60s before a match starts); and a change
+        that happened while nothing was being recorded looks like it happened at
+        the next read, understating the staleness across a capture outage.
+
+        Only fills rows where `book_ts` is NULL, so it is safe to re-run and
+        never overwrites a value the API actually reported. Applied in batches
+        with a commit between each, so a capture writing new rows to the same
+        file is never blocked for long.
+        """
+        pending = self.conn.execute(
+            "SELECT COUNT(*) FROM books WHERE book_ts IS NULL"
+        ).fetchone()[0]
+        summary: dict[str, object] = {
+            "rows": self.conn.execute("SELECT COUNT(*) FROM books").fetchone()[0],
+            "pending": pending,
+            "filled": 0,
+            "applied": apply,
+        }
+        if not pending or not apply:
+            return summary
+
+        # The run boundaries have to be computed over a token's whole history, not
+        # just the NULL rows, or a run split by an already-filled row would restart
+        # and date the second half to the wrong read.
+        self.conn.executescript(
+            """
+            DROP TABLE IF EXISTS _book_ts_fill;
+            CREATE TEMP TABLE _book_ts_fill AS
+            WITH marked AS (
+                SELECT token_id, ts, book_ts, book_hash,
+                       LAG(book_hash) OVER w AS previous_hash
+                FROM books
+                WINDOW w AS (PARTITION BY token_id ORDER BY ts)
+            ), runs AS (
+                SELECT token_id, ts, book_ts,
+                       SUM(book_hash IS NOT previous_hash) OVER (
+                           PARTITION BY token_id ORDER BY ts
+                       ) AS run
+                FROM marked
+            )
+            SELECT token_id, ts, MIN(ts) OVER (PARTITION BY token_id, run) AS derived
+            FROM runs
+            WHERE book_ts IS NULL;
+            """
+        )
+        total = self.conn.execute("SELECT COUNT(*) FROM _book_ts_fill").fetchone()[0]
+        filled = 0
+        for start in range(0, total, batch):
+            self.conn.execute("BEGIN IMMEDIATE")
+            cur = self.conn.execute(
+                """
+                UPDATE books SET book_ts = f.derived, book_ts_derived = 1
+                FROM _book_ts_fill f
+                WHERE books.token_id = f.token_id AND books.ts = f.ts
+                  AND f.rowid > ? AND f.rowid <= ?
+                """,
+                (start, start + batch),
+            )
+            filled += cur.rowcount if cur.rowcount > 0 else 0
+            self.conn.execute("COMMIT")
+        self.conn.execute("DROP TABLE IF EXISTS _book_ts_fill")
+        summary["filled"] = filled
         return summary

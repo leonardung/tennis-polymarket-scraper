@@ -25,6 +25,7 @@ from .config import (
     IDLE_INTERVAL,
     POLL_INTERVAL,
     REFRESH_INTERVAL,
+    STALE_AFTER,
     TOURS,
 )
 from .discovery import discover
@@ -116,6 +117,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             live_only=not args.include_upcoming,
             only_changes=not args.every_tick,
             heartbeat=args.heartbeat,
+            stale_after=args.stale_after,
             tours=_tours(args),
         )
         logging.info(
@@ -131,6 +133,36 @@ def cmd_run(args: argparse.Namespace) -> int:
             "every tick" if args.every_tick else "on change",
         )
         poller.run()
+    return 0
+
+
+def cmd_backfill_book_ts(args: argparse.Namespace) -> int:
+    """Reconstruct book_ts for rows recorded before it was stored."""
+    if args.apply and not _capture_is_idle(args.db):
+        print(
+            "\na capture looks like it is writing to this database.\n"
+            "stop it first: two writers would fight over the same rows.\n",
+            file=sys.stderr,
+        )
+        return 2
+
+    with Store(args.db) as store:
+        summary = store.backfill_book_ts(apply=args.apply, batch=args.batch)
+
+    rows, pending = int(summary["rows"]), int(summary["pending"])
+    if not rows:
+        print("\nno books recorded yet\n")
+        return 0
+    if not pending:
+        print(f"\n{rows} book rows, all already carry book_ts -- nothing to do\n")
+        return 0
+    if args.apply:
+        print(f"\n{rows} book rows, filled {summary['filled']} from runs of equal book_hash")
+        print("marked book_ts_derived = 1: accurate to one polling interval,")
+        print("and it cannot see a change that happened while nothing was recording\n")
+    else:
+        print(f"\n{rows} book rows, {pending} without book_ts")
+        print("nothing changed -- pass --apply to do it\n")
     return 0
 
 
@@ -347,6 +379,13 @@ def main(argv: list[str] | None = None) -> int:
         default=HEARTBEAT,
         help=f"write an unchanged book at least this often, seconds (default {HEARTBEAT:.0f})",
     )
+    p_run.add_argument(
+        "--stale-after",
+        type=float,
+        default=STALE_AFTER,
+        help="warn when every in-play book on a tick is at least this far behind its own"
+        f" upstream timestamp, seconds (default {STALE_AFTER:.0f})",
+    )
     p_run.set_defaults(func=cmd_run, needs_network=True)
 
     p_stats = sub.add_parser(
@@ -365,6 +404,25 @@ def main(argv: list[str] | None = None) -> int:
         help="actually delete them; without this it only reports what it would do",
     )
     p_clean.set_defaults(func=cmd_clean_scores, needs_network=False)
+
+    p_fill = sub.add_parser(
+        "backfill-book-ts",
+        parents=[common],
+        help="reconstruct book_ts for rows recorded before it was stored",
+    )
+    p_fill.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write them; without this it only reports what it would do",
+    )
+    p_fill.add_argument(
+        "--batch",
+        type=int,
+        default=50_000,
+        help="rows per transaction, so a running capture is never blocked for long"
+        " (default 50000)",
+    )
+    p_fill.set_defaults(func=cmd_backfill_book_ts, needs_network=False)
 
     p_sql = sub.add_parser(
         "sql", parents=[common], help="query the database (read-only, safe while recording)"

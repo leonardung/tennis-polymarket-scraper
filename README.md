@@ -15,6 +15,7 @@ uv run polymarket stats        # summarise the database
 uv run polymarket sql          # latest quote for every match
 uv run polymarket sql "SELECT ..."   # any query
 uv run polymarket clean-scores # repair a score history recorded before the ratchet
+uv run polymarket backfill-book-ts   # reconstruct book_ts for older rows
 ```
 
 Or run the capture and the dashboard as two containers — see [Docker](#docker).
@@ -49,6 +50,7 @@ triggers an early refresh.
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
+| `--stale-after N` | `120` | warn when every in-play book is this far behind its own upstream timestamp |
 | `--dns MODE` | `auto` | see [DNS.md](DNS.md) |
 | `-v` | off | verbose logging |
 
@@ -373,6 +375,8 @@ the loser's points — `6-7(3)`.
 | `ask_px_1..3`, `ask_sz_1..3` | 3 best asks, price and size, best first |
 | `market_last_trade` | last traded price for the **match**, not this player (see below) |
 | `book_hash` | changes when the book changes |
+| `book_ts` | when the book last changed **upstream** (see below) |
+| `book_ts_derived` | `0` if `book_ts` came from the API, `1` if reconstructed |
 
 Each match writes 2 rows per tick, one per player. Prices are probabilities
 between 0 and 1; the two players' prices sum to roughly 1.
@@ -385,6 +389,25 @@ distinguishable from a collector that stopped. `--every-tick` disables it.
 
 A missing quote is stored as NULL rather than a made-up number — normal on a match
 that's effectively decided, where one side has no offers left.
+
+`ts` is when the book was read; `book_ts` is when it last actually changed, as
+reported by the API. The difference is the age of the quote:
+
+```sql
+SELECT ts - book_ts AS stale_seconds FROM books WHERE token_id = ?;
+```
+
+That matters because Polymarket's CLOB serves a **stale** book during an outage
+rather than failing — every request still returns 200 in milliseconds, the book
+behind it just stops moving. Nothing else in the record can tell that apart from
+a market nobody is trading, so a price whose `stale_seconds` is large was real
+once but was not the price at `ts`. Filter on it before reading price against
+play. The capture warns in its log while it is happening — see `--stale-after`.
+
+`book_ts_derived = 1` marks a row whose `book_ts` was reconstructed after the
+fact by `backfill-book-ts` rather than read from the API, which is accurate only
+to one polling interval and understates staleness across a capture outage. Rows
+recorded before this column existed and never backfilled have `book_ts` NULL.
 
 `market_last_trade` is the one column that is **not** about the player named in
 `outcome`. The API reports a single last-traded price per match on both tokens,
@@ -417,6 +440,22 @@ the capture now uses, drops what it would not have accepted along with the
 repeats those left stranded, and brings `markets` back in step with what
 survives. It refuses to run while a capture is writing, and does nothing at all
 without `--apply`.
+
+```bash
+uv run polymarket backfill-book-ts           # report how many rows lack book_ts
+uv run polymarket backfill-book-ts --apply   # reconstruct it
+```
+
+Rows recorded before `book_ts` was stored can have it inferred from what is
+already there. Snapshots are only written when the book changed, so a run of
+consecutive rows sharing a `book_hash` is one unchanged book seen repeatedly —
+the heartbeat writing it out — and the book last moved at the first row of that
+run. Every row in the run gets that timestamp and is marked
+`book_ts_derived = 1`, because the value is the first time the hash was *seen*:
+late by up to one polling interval, and blind to a change that happened while
+nothing was recording. It only fills rows where `book_ts` is NULL, so it is safe
+to re-run and never overwrites what the API reported. Like `clean-scores`, it
+refuses to run while a capture is writing and does nothing without `--apply`.
 
 `markets` holds only the latest score, which says where a match stands but not
 when it got there — so a price move can't be read against the point that caused

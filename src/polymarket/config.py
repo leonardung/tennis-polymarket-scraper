@@ -24,6 +24,14 @@ POLL_INTERVAL = 5.0  # seconds between polls of a match in play
 IDLE_INTERVAL = 60.0  # seconds between polls of a match that is not in play
 REFRESH_INTERVAL = 300.0  # seconds between market-list refreshes
 HEARTBEAT = 300.0  # force a snapshot this often even if the book has not moved
+
+# Polymarket's CLOB serves a stale book during an outage rather than failing:
+# every request still returns 200 in milliseconds, the book behind it just stops
+# moving. Row counts cannot catch that -- "0 rows, all unchanged" is also what a
+# calm market looks like -- so the book's own timestamp is what gets watched.
+# One quiet market means nothing; every book stale at once is the outage.
+STALE_AFTER = 120.0  # warn once even the freshest book is this far behind
+STALE_WARN_EVERY = 60.0  # seconds between repeats while it stays that way
 START_GRACE = 20.0  # wait this long after a scheduled start before re-checking
 OVERDUE_RECHECK = 60.0  # re-check this often while a match is past its start time
 OVERDUE_WINDOW = 6 * 3600.0  # stop expecting a match this long after its start time
