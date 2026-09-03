@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from polymarket.book import parse_book  # noqa: E402
-from polymarket.config import MATCH_SLUG, match_tournament  # noqa: E402
+from polymarket.config import BOOK_DEPTH, MATCH_SLUG, match_tournament  # noqa: E402
 from polymarket.discovery import discover  # noqa: E402
 from polymarket.store import Store  # noqa: E402
 
@@ -59,8 +59,8 @@ def test_book() -> None:
     snap = parse_book("111", BOOK)
     check("best bid is the highest bid", snap.best_bid == 0.55)
     check("best ask is the lowest ask", snap.best_ask == 0.57)
-    check("depth capped at 3 bids", len(snap.bids) == 3)
-    check("bids descending, best first", [p for p, _ in snap.bids] == [0.55, 0.50, 0.44])
+    check("every non-zero bid kept when the book is shallower than the cap", len(snap.bids) == 4)
+    check("bids descending, best first", [p for p, _ in snap.bids] == [0.55, 0.50, 0.44, 0.40])
     check("asks ascending, best first", [p for p, _ in snap.asks] == [0.57, 0.60, 0.62])
     check("zero-size level dropped", 0.45 not in [p for p, _ in snap.bids])
     check("sizes preserved", snap.bids[0][1] == 100.0)
@@ -77,6 +77,16 @@ def test_book() -> None:
     one_sided = parse_book("333", {"bids": [{"price": "0.9", "size": "10"}], "asks": []})
     check("one-sided book keeps the bid", one_sided.best_bid == 0.9)
     check("one-sided book has no mid", one_sided.mid is None)
+
+    # A live book runs to dozens of levels a side, so the cap -- not the book --
+    # is what decides how much gets stored. Exercise it with more than we keep.
+    deep = parse_book("444", {
+        "bids": [{"price": f"{0.50 - i / 100:.2f}", "size": "10"} for i in range(BOOK_DEPTH + 5)],
+        "asks": [{"price": f"{0.51 + i / 100:.2f}", "size": "10"} for i in range(BOOK_DEPTH + 5)],
+    })
+    check(f"depth capped at {BOOK_DEPTH} bids", len(deep.bids) == BOOK_DEPTH)
+    check(f"depth capped at {BOOK_DEPTH} asks", len(deep.asks) == BOOK_DEPTH)
+    check("the cap keeps the best levels", deep.bids[0][0] == 0.50 and deep.asks[0][0] == 0.51)
 
 
 # --------------------------------------------------------------------------
@@ -1636,13 +1646,13 @@ def test_dashboard_series() -> None:
         # An emptied book is a stored NULL and must stay NULL, not carry forward.
         check("emptied book reads as no quote", second["bid"][2] is None)
         check("no mid without both sides", second["mid"][2] is None)
-        check("depth summed across levels", first["bid_depth"][0] == 100.0 + 250.0 + 900.0)
+        check("depth summed across levels", first["bid_depth"][0] == 100.0 + 250.0 + 900.0 + 500.0)
         check("last trade oriented to outcome 0", abs(series["last_trade"][0] - 0.56) < 1e-9)
         check("raw last trade preserved", series["last_trade_raw"][0] == 0.56)
 
         detail = queries.match_detail(conn, market.condition_id)
         check("detail found", detail is not None)
-        check("detail reports capture depth", detail["depth"] == 3)
+        check("detail reports capture depth", detail["depth"] == BOOK_DEPTH)
         # The latest outcome-0 book has one bid; the other two slots are stored
         # NULL padding and must not surface as empty ladder rows.
         check("ladder drops NULL padding", len(detail["books"][0]["bids"]) == 1)

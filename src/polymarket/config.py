@@ -27,7 +27,7 @@ HEARTBEAT = 300.0  # force a snapshot this often even if the book has not moved
 START_GRACE = 20.0  # wait this long after a scheduled start before re-checking
 OVERDUE_RECHECK = 60.0  # re-check this often while a match is past its start time
 OVERDUE_WINDOW = 6 * 3600.0  # stop expecting a match this long after its start time
-BOOK_DEPTH = 3  # levels captured per side
+BOOK_DEPTH = 10  # levels captured per side
 BOOKS_CHUNK = 50  # token_ids per batched /books request
 
 # Scores come from Flashscore, not from Polymarket -- see scores.py for why.
