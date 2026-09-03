@@ -411,7 +411,16 @@ never the percentage:
 | `1/3` | `break_points_saved_0 = 1`, `break_points_saved_0_of = 3` |
 
 The percentage is the quotient of two numbers that are already stored, and
-keeping it as well would let a row disagree with itself. A statistic the
+keeping it as well would let a row disagree with itself.
+
+Flashscore's own arithmetic is worth not trusting here. A live match has been
+seen reporting `800% (8/1)` for second-serve points won — 13 of 14 first serves
+in, so one second serve, credited with eight points — while every other row on
+the same read was sound. What is stored is what the feed said, because the
+alternative is a capture that quietly disagrees with its source and cannot be
+checked against it. Read `stat_events` as "what Flashscore was showing at that
+moment", which is also what the market was reacting to; read `set_stats` for
+what actually happened. A statistic the
 tournament does not measure — serve speed and distance covered need ball
 tracking, and only the big events have it — is **NULL, not zero**: not measured
 is not none. The catalogue is `STATISTICS` in `src/polymarket/config.py`, and it

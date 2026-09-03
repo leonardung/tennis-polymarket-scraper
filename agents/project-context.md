@@ -165,6 +165,11 @@ Other conventions:
   score changes, all spurious. The statistics feed comes off the same caches and
   needs `StatRatchet` for the same reason; it measures points played, the one
   number in that feed that cannot fall.
+- **The statistics feed's own arithmetic can be wrong mid-match.** `800% (8/1)`
+  for second-serve points won, observed live, with every other row on the same
+  read sound. The parser is faithful and stores it as 8 out of 1: a capture that
+  silently corrects its source cannot be checked against it, and `set_stats` an
+  hour later is the correction. Do not add a sanity clamp.
 - **The statistics feed answers with a full set of zeros before a match starts.**
   That is a shape, not an absence, so `_stat_targets` reads matches in play only.
   Deduplicating it would not help -- the zeros are a genuine "change" from
