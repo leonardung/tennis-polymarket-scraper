@@ -94,6 +94,12 @@ DEPTH_COLUMNS = _depth_columns(BOOK_DEPTH)
 
 BOOK_COLUMNS = [
     "ts",
+    # One id made by the capture loop and handed to the book, score and
+    # statistics writes in that pass. Unlike their individual `ts` values it
+    # is exactly equal across feeds, so joining a point to its market read does
+    # not need a nearest-time guess. NULL marks rows written before it existed
+    # and score rows written by a discovery refresh rather than a capture tick.
+    "tick_id",
     "condition_id",
     "token_id",
     "outcome_index",
@@ -177,6 +183,7 @@ MARKET_COLUMNS = [
 
 SCORE_EVENT_COLUMNS = [
     ("ts", "REAL"),
+    ("tick_id", "INTEGER"),
     ("condition_id", "TEXT"),
     ("state", "TEXT"),
     ("period", "TEXT"),
@@ -186,7 +193,7 @@ SCORE_EVENT_COLUMNS = [
 ]
 
 _TEXT_COLUMNS = {"condition_id", "token_id", "outcome", "book_hash"}
-_INT_COLUMNS = {"outcome_index", "book_ts_derived"}
+_INT_COLUMNS = {"tick_id", "outcome_index", "book_ts_derived"}
 
 
 def _books_ddl() -> str:
@@ -231,6 +238,7 @@ CREATE TABLE IF NOT EXISTS score_events (
 -- already recording on the same tick and say whether anything was running.
 CREATE TABLE IF NOT EXISTS stat_events (
     ts             REAL,
+    tick_id        INTEGER,
     condition_id   TEXT,
     -- The feed's own digest of the response this came from. Not what decides a
     -- write -- that is the stored values -- but it ties a row to one read.
@@ -277,6 +285,7 @@ DROP VIEW IF EXISTS quotes;
 CREATE VIEW quotes AS
 SELECT
     b.ts,
+    b.tick_id,
     datetime(b.ts, 'unixepoch') AS utc_time,
     m.tournament,
     m.match_date,
@@ -320,7 +329,12 @@ class Store:
                 for col in BOOK_COLUMNS
             ],
             "score_events": SCORE_EVENT_COLUMNS,
-            "stat_events": [("ts", "REAL"), ("condition_id", "TEXT"), ("digest", "TEXT")]
+            "stat_events": [
+                ("ts", "REAL"),
+                ("tick_id", "INTEGER"),
+                ("condition_id", "TEXT"),
+                ("digest", "TEXT"),
+            ]
             + [(col, "REAL") for col in STAT_COLUMNS],
             "set_stats": [
                 ("condition_id", "TEXT"),
@@ -423,7 +437,9 @@ class Store:
         )
         return len(rows)
 
-    def record_score_events(self, scores: Iterable[ScoreRow]) -> int:
+    def record_score_events(
+        self, scores: Iterable[ScoreRow], tick_id: int | None = None
+    ) -> int:
         """Append a row for every match whose state, period or score has moved.
 
         Only changes are stored: the score feed is re-read on every poll, so
@@ -443,18 +459,20 @@ class Store:
             ).fetchone()
             if previous is not None and tuple(previous) == current:
                 continue
-            rows.append((now, entry.condition_id, *current))
+            rows.append((now, tick_id, entry.condition_id, *current))
 
         if rows:
             self.conn.executemany(
                 "INSERT OR REPLACE INTO score_events "
-                "(ts, condition_id, state, period, score, game, serving) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(ts, tick_id, condition_id, state, period, score, game, serving) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
         return len(rows)
 
-    def record_stat_events(self, rows: Iterable[StatRow]) -> int:
+    def record_stat_events(
+        self, rows: Iterable[StatRow], tick_id: int | None = None
+    ) -> int:
         """Append a row for every match whose statistics have moved.
 
         Changes only, for the same reason ``record_score_events`` stores
@@ -479,16 +497,35 @@ class Store:
             ).fetchone()
             if previous is not None and tuple(previous) == current:
                 continue
-            payload.append((now, entry.condition_id, entry.digest, *current))
+            payload.append((now, tick_id, entry.condition_id, entry.digest, *current))
 
         if payload:
-            columns = ["ts", "condition_id", "digest", *STAT_COLUMNS]
+            columns = ["ts", "tick_id", "condition_id", "digest", *STAT_COLUMNS]
             self.conn.executemany(
                 f"INSERT OR REPLACE INTO stat_events ({', '.join(columns)}) "
                 f"VALUES ({', '.join('?' * len(columns))})",
                 payload,
             )
         return len(payload)
+
+    def latest_stat_points(self, condition_ids: Iterable[str]) -> dict[str, int]:
+        """The persisted monotonic floor for each requested match.
+
+        The live ratchet is memory, while the history must remain monotonic
+        across process restarts too. The table's primary key makes these one-row
+        backward seeks; doing them for the handful of watched matches is cheaper
+        and clearer than a window over the full statistics history.
+        """
+        out = {}
+        for condition_id in condition_ids:
+            row = self.conn.execute(
+                "SELECT COALESCE(total_points_won_0_of, total_points_won_1_of) "
+                "FROM stat_events WHERE condition_id = ? ORDER BY ts DESC LIMIT 1",
+                (condition_id,),
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                out[condition_id] = int(row[0])
+        return out
 
     def record_set_stats(self, rows: Sequence[StatRow], ts: float | None = None) -> int:
         """Write a finished match's statistics, one row per period.
@@ -558,13 +595,17 @@ class Store:
         ]
 
     def insert_snapshots(
-        self, ts: float, rows: Sequence[tuple[Snapshot, str, int, str]]
+        self,
+        ts: float,
+        rows: Sequence[tuple[Snapshot, str, int, str]],
+        tick_id: int | None = None,
     ) -> int:
         """rows: (snapshot, condition_id, outcome_index, outcome_label)."""
         payload = []
         for snap, condition_id, index, outcome in rows:
             values: list[object] = [
                 ts,
+                tick_id,
                 condition_id,
                 snap.token_id,
                 index,

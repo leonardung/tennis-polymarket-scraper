@@ -393,7 +393,13 @@ def match_stats(conn: sqlite3.Connection, condition_id: str) -> dict[str, Any]:
     stopped reclassifying winners and correcting serve speeds, so its "Match"
     row can legitimately differ from the last live one. It is absent until then.
     """
-    empty: dict[str, Any] = {"ts": None, "live": [], "final_ts": None, "sets": []}
+    empty: dict[str, Any] = {
+        "ts": None,
+        "tick_id": None,
+        "live": [],
+        "final_ts": None,
+        "sets": [],
+    }
     if not _has_table(conn, "stat_events"):
         return empty
     columns = {row[1] for row in conn.execute("PRAGMA table_info(stat_events)")}
@@ -414,6 +420,9 @@ def match_stats(conn: sqlite3.Connection, condition_id: str) -> dict[str, Any]:
 
     return {
         "ts": latest["ts"] if latest is not None else None,
+        "tick_id": (
+            latest["tick_id"] if latest is not None and "tick_id" in columns else None
+        ),
         "live": _stat_period(latest, columns) if latest is not None else [],
         "final_ts": final_ts,
         "sets": sets,
@@ -432,6 +441,7 @@ def _ladder(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
     return {
         "ts": row["ts"],
+        "tick_id": row["tick_id"],
         "outcome": row["outcome"],
         "bid": row["best_bid"],
         "ask": row["best_ask"],
@@ -456,10 +466,14 @@ def score_events(conn: sqlite3.Connection, condition_id: str) -> list[dict[str, 
     # `game` and `serving` arrived after the table did, so a capture recorded
     # before them simply has no points to show rather than failing to open.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(score_events)")}
-    extra = ", ".join(c if c in columns else f"NULL AS {c}" for c in ("game", "serving"))
+    extra = ", ".join(
+        c if c in columns else f"NULL AS {c}"
+        for c in ("tick_id", "game", "serving")
+    )
     return [
         {
             "ts": r["ts"],
+            "tick_id": r["tick_id"],
             "state": r["state"],
             "period": r["period"],
             "score": r["score"],

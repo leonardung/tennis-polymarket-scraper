@@ -9,8 +9,9 @@ map, data flow, invariants).
 A research capture tool. It records the Polymarket order book for every
 tour-level (250 and above) ATP and WTA singles match **while it is being
 played** — every 5 seconds, 10 levels deep on each side — into SQLite, with the
-live score and the match statistics read on the same tick so a price, the point
-it moved on and the aces behind it carry the same timestamp. A match that has not started yet is read once a minute instead,
+live score and the match statistics read on the same tick. Their individual
+timestamps say when each sequential read happened; their shared `tick_id` is
+the exact join key. A match that has not started yet is read once a minute instead,
 and one that has finished is not read again. A read-only web dashboard browses
 what has been recorded.
 
@@ -164,7 +165,9 @@ Other conventions:
 - **Never write a score without the `Ratchet`.** It removes ~47% of raw recorded
   score changes, all spurious. The statistics feed comes off the same caches and
   needs `StatRatchet` for the same reason; it measures points played, the one
-  number in that feed that cannot fall.
+  number in that feed that cannot fall, and rejects every lower reading rather
+  than treating persistence as a correction. Its floor is restored from the
+  latest stored row when a process starts or refreshes.
 - **The statistics feed's own arithmetic can be wrong mid-match.** `800% (8/1)`
   for second-serve points won, observed live, with every other row on the same
   read sound. The parser is faithful and stores it as 8 out of 1: a capture that

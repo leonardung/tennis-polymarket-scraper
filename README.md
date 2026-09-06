@@ -4,7 +4,7 @@ Records the Polymarket order book for every tour-level (250 and above) ATP and
 WTA singles match **while it is being played**, every 5 seconds, 10 levels deep on
 each side, into SQLite — with the live score and the match statistics read on the
 same tick, so a price, the point it moved on, and the aces count behind it all
-share a timestamp.
+share a `tick_id` while retaining their individual read timestamps.
 
 ## Commands
 
@@ -376,7 +376,10 @@ sequential on one connection with the score reads, a point takes about 26
 seconds, and at `--interval=2` an unfloored read asks thirteen times per point —
 which at a slam, with sixteen matches on court, is what pushes a tick past its
 own budget and starts costing book snapshots. A tick that does read them still
-reads them beside that tick's book and score. Nothing gets a heartbeat row here: a book that stops moving is
+reads them beside that tick's book and score. When the score declares the match
+finished, that finishing tick forces one last statistics read even if the floor
+has not elapsed; otherwise the final point can fall between the last live read
+and retirement. Nothing gets a heartbeat row here: a book that stops moving is
 ambiguous, but a statistic that stops moving is not, because `books` and
 `score_events` are writing on the same tick and already say whether anything was
 running. In practice a match in play produces a row every ten seconds or so —
@@ -389,11 +392,13 @@ reason, and are handled the same way:
 - It comes off the same edge caches, so it goes **backwards**. The ratchet here
   measures progress by *points played* — both players' "Total Points Won" are
   reported out of it, and it is the one number that cannot fall — and a reading
-  covering fewer points than one already taken is dropped, unless it keeps
-  coming back for `SCORE_PATIENCE` reads, which is a scorer's correction rather
-  than a cache. A reading level with the last one is passed through: a statistic
-  can genuinely change without a point being played, when an unforced error is
-  reclassified as a winner or a serve speed lands a beat late.
+  covering fewer points than one already taken is always dropped. A forward
+  correction can skip a number and is accepted normally; the settled per-set
+  reading is where post-match corrections belong. The ratchet restores its floor
+  from the latest stored row after a process restart. A reading level with the
+  last one is passed through: a statistic can genuinely change without a point
+  being played, when an unforced error is reclassified as a winner or a serve
+  speed lands a beat late.
 - The statistics are **per player**, so they go through the same flip the score
   does and are stored in the order the market lists its players. A match whose
   two names fit each other's side equally well is skipped entirely — a mirrored
@@ -443,7 +448,7 @@ after it ended, and after three empty answers (a walkover has no statistics and
 never will).
 
 `--no-stats` turns all of this off. The cost it saves is one extra Flashscore
-read per live match per tick — about 50 ms and a kilobyte each.
+read per live match per statistics-due tick — about 50 ms and a kilobyte each.
 
 ## What gets stored
 
@@ -473,7 +478,8 @@ so nothing that reads home from away may be attributed to a player at all.
 
 | Column | Meaning |
 |---|---|
-| `ts` | unix timestamp of the tick |
+| `ts` | unix timestamp at which this book read began |
+| `tick_id` | exact identifier shared with changed score/statistic rows from this capture pass |
 | `outcome` | which player this row is for |
 | `best_bid`, `best_ask` | top of book |
 | `mid`, `spread` | derived from the two above |
@@ -523,8 +529,8 @@ Use it per match, and don't compare it to that row's `mid`. Everything else in t
 table is genuinely per-player.
 
 **`score_events`** — one row each time a match's `state`, `period`, `score`,
-`game` or `serving` changes: `ts`, `condition_id`, `state`, `period`, `score`,
-`game`, `serving`.
+`game` or `serving` changes: `ts`, `tick_id`, `condition_id`, `state`, `period`,
+`score`, `game`, `serving`.
 
 `game` is the points inside the game being played — `30-40`, or plain counts
 during a tiebreak — in the same player order as `score`, and `serving` is which
@@ -577,8 +583,8 @@ FROM score_events WHERE condition_id = '0x...' ORDER BY ts;
 
 **`stat_events`** — one row each time the match's running statistics moved:
 
-`ts`, `condition_id`, `digest` (the feed's own hash of the response the row came
-from), and two columns per statistic per player — `aces_0`, `aces_1`,
+`ts`, `tick_id`, `condition_id`, `digest` (the feed's own hash of the response
+the row came from), and two columns per statistic per player — `aces_0`, `aces_1`,
 `winners_0`, `first_serve_won_0` with `first_serve_won_0_of` beside it, and so
 on for the whole of `STATISTICS`. The `_0` / `_1` suffix is the outcome index,
 the same order `books.outcome_index` and `markets.outcome_0` use.
@@ -593,6 +599,13 @@ SELECT datetime(s.ts,'unixepoch') AS t, s.aces_0, s.aces_1,
        s.total_points_won_0_of AS points_played
 FROM stat_events s WHERE s.condition_id = '0x...' ORDER BY s.ts;
 ```
+
+`ts` remains the time each individual feed was read. `tick_id` is one integer
+made at the beginning of the loop pass and copied into any `books`,
+`score_events`, and `stat_events` rows that pass writes. It is therefore the
+exact join key for the three feeds even though changes-only storage means a tick
+need not have a row in every table. Old rows, and score rows created by a market
+refresh outside the capture tick, have NULL `tick_id`.
 
 **`set_stats`** — the settled statistics, one row per period, taken once an hour
 after the match ended:
@@ -658,7 +671,8 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
 - Match statistics add roughly a row every ten seconds per match in play — about
   a thousand rows over a three-set match, against the tens of thousands its books
   produce — plus one `set_stats` row per period, once. On the wire they cost a
-  kilobyte and about 50 ms per live match per tick. `--no-stats` turns them off.
+  kilobyte and about 50 ms per live match per statistics-due tick. `--no-stats`
+  turns them off.
 - Safe to stop and restart: it reopens the same database and carries on, and
   re-running a tick never duplicates rows.
 - If the API can't be reached, see [DNS.md](DNS.md).

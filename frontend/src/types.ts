@@ -68,6 +68,8 @@ export interface BookLevel {
 
 export interface Ladder {
   ts: number;
+  /** Exact join key shared with score/statistic changes from this capture pass. */
+  tick_id: number | null;
   outcome: string;
   bid: number | null;
   ask: number | null;
@@ -81,6 +83,8 @@ export interface Ladder {
 
 export interface ScoreEvent {
   ts: number;
+  /** Exact join key shared with book and statistic rows from this capture pass. */
+  tick_id: number | null;
   state: string | null;
   period: string | null;
   score: string | null;
@@ -135,6 +139,8 @@ export interface StatEntry {
 export interface MatchStats {
   /** When the live totals below were read, or null if none were. */
   ts: number | null;
+  /** Exact join key shared with book/score rows from the live totals' pass. */
+  tick_id: number | null;
   live: StatEntry[];
   /** When the settled per-set reading was collected; null until an hour after. */
   final_ts: number | null;

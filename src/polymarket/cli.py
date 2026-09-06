@@ -383,7 +383,8 @@ def main(argv: list[str] | None = None) -> int:
         "--no-stats",
         action="store_true",
         help="do not record match statistics -- aces, winners, points won and the rest. "
-        "They cost one extra Flashscore read per live match per tick, and a final "
+        "They cost one extra Flashscore read per live match per statistics-due tick, "
+        "and a final "
         f"per-set reading {FINAL_STATS_DELAY / 3600:.0f}h after each match ends",
     )
     p_run.add_argument(

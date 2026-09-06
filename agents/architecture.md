@@ -91,7 +91,7 @@ Each iteration, in order:
    match that has ended is never due again and is logged once as retired. This
    is the only thing that varies -- the loop grid stays at `--interval`, and a
    match's book and score are still read in the same pass, so they share a
-   timestamp.
+   `tick_id`.
 1. **`tick(due)`** — one batched `POST /books` for the due token ids.
    `parse_book` normalises each; `_changed()` decides whether to write.
    Deduplication compares `_fingerprint()` (best bid/ask, both ladders,
@@ -114,7 +114,9 @@ Each iteration, in order:
    the data: these reads are sequential on one connection with the score reads,
    and at `--interval=2` (which is what compose runs) sixteen live matches would
    otherwise spend most of a tick to learn nothing — and that tick is what the
-   books are written on.
+   books are written on. A match that moved from live to ended in the preceding
+   score poll gets one forced statistics read, bypassing the floor, so its final
+   point is not lost when the next tick retires it.
 4. **`collect_final_stats()`** — once a minute (`FINAL_STATS_CHECK`), not once a
    tick. `store.matches_awaiting_set_stats` is the queue: matches that ended
    more than `FINAL_STATS_DELAY`=1h ago, less than `FINAL_STATS_WINDOW`=24h ago,
@@ -173,7 +175,7 @@ Feeds are `KEY÷VALUE` pairs joined by `¬`, blocks split by `~` (`parse_blocks`
 | `f_2_<day>_<tz>_en_1` | market-list refresh, 3 days (`FLASHSCORE_DAYS`) | the whole day card: ids, names, slugs, start times, status, set scores. A `ZA` heading names the circuit (`scores.TOUR_HEADINGS`); anything not under `ATP - SINGLES` or `WTA - SINGLES` is skipped |
 | `df_sur_2_<id>` | every tick, per live match | one match's status + set-by-set score |
 | `dc_2_<id>` | every tick, only while a set is in play | points in the game and who is serving; **optional** — a failure must not lose the reading |
-| `df_st_2_<id>` | every tick per live match, and once 1h after it ends | 23 statistics per player, for the match as a whole **and** each set, in one ~4 KB response. Keys are `SE` (period), `SF` (group heading), `SG`/`SH`/`SI` (name, home, away), `A1` (the feed's own digest) |
+| `df_st_2_<id>` | every statistics-due tick per live match, forced once on its finishing tick, and once 1h after it ends | 23 statistics per player, for the match as a whole **and** each set, in one ~4 KB response. Keys are `SE` (period), `SF` (group heading), `SG`/`SH`/`SI` (name, home, away), `A1` (the feed's own digest) |
 
 Three mechanisms, each load-bearing:
 
@@ -194,11 +196,14 @@ Three mechanisms, each load-bearing:
   score changes, all spurious.
 - **`StatRatchet`.** The same mechanism for the statistics feed, measuring
   progress by *points played* — both players' "Total Points Won" are reported out
-  of it, and it is the only number there that cannot fall. A reading level with
-  the last one is **passed through**, not rejected: a statistic can change
-  without a point being played (an unforced error reclassified as a winner, a
-  serve speed landing late), and whether that is worth a row is
-  `record_stat_events`'s question, not the ratchet's.
+  of it, and it is the only number there that cannot fall. Every lower reading
+  is rejected; a forward jump is accepted, including a correction such as 78
+  to 80. On refresh its floor is seeded from the latest `stat_events` row, so a
+  process restart cannot admit a rewind. A reading level with the last one is
+  **passed through**, not rejected:
+  a statistic can change without a point being played (an unforced error
+  reclassified as a winner, a serve speed landing late), and whether that is
+  worth a row is `record_stat_events`'s question, not the ratchet's.
 - **Pairing.** `ScoreBoard.pair(tour, tournament, players, start_time)` matches by
   tour and tournament **and both players at once**, comparing folded token sets
   (`name_tokens`: accent-folded, punctuation-split, single letters dropped since
@@ -227,9 +232,9 @@ One SQLite file, WAL, `synchronous=NORMAL`, `isolation_level=None`.
 | Object | Grain | Notes |
 |---|---|---|
 | `markets` | one row per condition_id | metadata (`tour` included) + **latest** state/period/score; `raw` is the JSON payload |
-| `books` | one row per token per written tick | `PRIMARY KEY (token_id, ts) WITHOUT ROWID`; `INSERT OR REPLACE`, so replaying a tick never duplicates |
-| `score_events` | one row per *change* of (state, period, score, game, serving) | `PRIMARY KEY (condition_id, ts)`; this is the timestamped history `markets` lacks |
-| `stat_events` | one row per *change* of the running match statistics | `PRIMARY KEY (condition_id, ts)`; the feed's **overall** block only. No heartbeat -- `books` and `score_events` are writing on the same tick and already say whether anything was running |
+| `books` | one row per token per written tick | `PRIMARY KEY (token_id, ts) WITHOUT ROWID`; `tick_id` joins the pass to score/stat rows; `INSERT OR REPLACE`, so replaying a tick never duplicates |
+| `score_events` | one row per *change* of (state, period, score, game, serving) | `PRIMARY KEY (condition_id, ts)`; `tick_id` is NULL for refresh-created rows outside a capture tick |
+| `stat_events` | one row per *change* of the running match statistics | `PRIMARY KEY (condition_id, ts)`; `tick_id` joins the pass to books/scores; the feed's **overall** block only. No heartbeat |
 | `set_stats` | one row per (match, period), written once an hour after the match | `PRIMARY KEY (condition_id, period)`; `INSERT OR REPLACE`, so collecting twice leaves one row. The per-set rows sum to the `Match` row, which is what makes it a check on `stat_events` |
 | `quotes` | view | spells out direction: `buy_price = best_ask`, `sell_price = best_bid` |
 
@@ -399,13 +404,14 @@ only activates when the system resolver fails. See `DNS.md`.
 
 ## Invariants a change must not break
 
-1. **A tick's price, score and statistics share a timestamp.** A match's book,
+1. **A tick's price, score and statistics share a `tick_id`.** A match's book,
    score and statistics are read in the same pass, off one `due` set. There is no
    separate score interval (there was; it was removed) -- what varies is which
    matches a tick reads, not which feed. `STATS_INTERVAL` is the one
    qualification, and it does not weaken this: it drops whole statistics reads,
    so a statistics row is still written on a tick that read that match's book
-   and score. It never lets the three describe different moments.
+   and score. Each feed keeps its own `ts`; the integer `tick_id` made once at
+   the start of the pass is the exact join key.
 2. **Score and statistics reads stay on one connection, sequential.** See
    `Flashscore.__init__`; `stat_readings` is a loop for the same reason
    `readings` is.

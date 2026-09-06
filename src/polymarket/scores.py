@@ -989,9 +989,10 @@ class StatRatchet:
     Points played is the measure, because it is the one number here that cannot
     do anything but rise: both players' "Total Points Won" are reported out of
     it. A reading whose match totals cover fewer points than the best one seen
-    is a stale copy and is dropped -- unless it keeps coming back, which is a
-    correction by the scorer rather than a cache, and lands after `patience`
-    consecutive reads exactly as a corrected score does.
+    is therefore always a stale copy and is dropped. A feed correcting itself
+    forwards -- 78 points followed by 80 -- still lands normally; only a lower
+    total is impossible in this live history. The settled per-set read is where
+    a genuine post-match correction belongs.
 
     A reading that is level -- the same points played, which is every read
     inside a rally -- is passed through, because a statistic can genuinely
@@ -1001,10 +1002,8 @@ class StatRatchet:
     that is the store's to answer.
     """
 
-    def __init__(self, patience: int = SCORE_PATIENCE) -> None:
-        self.patience = patience
+    def __init__(self) -> None:
         self._best: dict[str, int] = {}
-        self._rejected: dict[str, int] = {}
 
     def accept(self, key: str, reading: StatReading) -> bool:
         """True if this reading should be considered for writing."""
@@ -1015,28 +1014,18 @@ class StatRatchet:
         best = self._best.get(key)
         if best is None or points >= best:
             self._best[key] = points
-            self._rejected[key] = 0
             return True
 
-        rejected = self._rejected.get(key, 0) + 1
-        if rejected < self.patience:
-            self._rejected[key] = rejected
-            log.debug(
-                "stats feed: ignoring a reading that went backwards (%d points, had %d)",
-                points,
-                best,
-            )
-            return False
-
-        log.info(
-            "stats feed: %d points played has stood for %d reads, taking it over %d",
+        log.debug(
+            "stats feed: ignoring a reading that went backwards (%d points, had %d)",
             points,
-            rejected,
             best,
         )
-        self._best[key] = points
-        self._rejected[key] = 0
-        return True
+        return False
+
+    def seed(self, key: str, points: int) -> None:
+        """Restore a persisted floor without ever lowering one held in memory."""
+        self._best[key] = max(points, self._best.get(key, points))
 
     def forget(self, keys: Iterable[str]) -> None:
         """Drop every match except these, which are the ones still followed."""
@@ -1044,7 +1033,6 @@ class StatRatchet:
         for key in list(self._best):
             if key not in keeping:
                 self._best.pop(key, None)
-                self._rejected.pop(key, None)
 
 
 # A rendered set, read back: "6-4", "7-6(3)", "0-0".

@@ -230,6 +230,10 @@ class Poller:
                     market.serving = market.pairing.render_server(best)
         self.ratchet.forget(m.condition_id for m in kept)
         self.stat_ratchet.forget(m.condition_id for m in kept)
+        for condition_id, points in self.store.latest_stat_points(
+            m.condition_id for m in kept
+        ).items():
+            self.stat_ratchet.seed(condition_id, points)
         self._state = {m.condition_id: m.state for m in kept}
 
         self.store.upsert_markets(kept)
@@ -373,7 +377,9 @@ class Poller:
                 targets.append(watched)
         return targets
 
-    def poll_scores(self, due: set[str] | None = None) -> int:
+    def poll_scores(
+        self, due: set[str] | None = None, tick_id: int | None = None
+    ) -> int:
         """Re-read the score for the matches in play. Returns rows written.
 
         `due` comes from `_due_matches`; see `_score_targets`.
@@ -412,7 +418,7 @@ class Poller:
             return 0
 
         self.store.update_scores(rows)
-        written = self.store.record_score_events(rows)
+        written = self.store.record_score_events(rows, tick_id=tick_id)
 
         moved = []
         for row in rows:
@@ -439,15 +445,19 @@ class Poller:
 
     # ---------------- match statistics ----------------
 
-    def _stat_targets(self, due: set[str] | None = None) -> list[Watched]:
+    def _stat_targets(
+        self,
+        due: set[str] | None = None,
+        finishing: set[str] | None = None,
+    ) -> list[Watched]:
         """Which matches are worth reading the statistics for right now.
 
-        Matches in play, and only those. Before a match starts the feed answers
-        with a full set of zeros -- not an absence, a shape -- and recording
-        that would put a row of noughts in front of every match and call it a
-        change. Once a match is over the numbers are still moving, but they are
-        being corrected rather than played, and that is what the deferred
-        per-set collection is for.
+        Matches in play, plus the one forced read on a finishing tick. Before a
+        match starts the feed answers with a full set of zeros -- not an
+        absence, a shape -- and recording that would put a row of noughts in
+        front of every match and call it a change. Once the finishing read is
+        done the numbers can still move, but they are being corrected rather
+        than played, and that is what the deferred per-set collection is for.
 
         A match whose two players fit each other's side equally well is left
         out too. Its statistics are per player, and a mirrored row is worse
@@ -466,33 +476,50 @@ class Poller:
         Stamps what it returns, like ``_due_matches``: call it once a tick.
         """
         now = time.monotonic()
+        finishing = finishing or set()
         targets = []
         for condition_id, watched in self.watched.items():
             if due is not None and condition_id not in due:
                 continue
-            if self._state.get(condition_id) != "live":
+            if (
+                self._state.get(condition_id) != "live"
+                and condition_id not in finishing
+            ):
                 continue
             if not watched.pairing.oriented:
                 continue
             last = self._last_stat_poll.get(condition_id)
-            if last is not None and now - last < self.stats_interval:
+            # The score poll runs first. When it has just seen the match end,
+            # this is the last chance to put the final point in the live
+            # history, so it bypasses both the new ended state and the cadence
+            # floor exactly once.
+            if (
+                condition_id not in finishing
+                and last is not None
+                and now - last < self.stats_interval
+            ):
                 continue
             self._last_stat_poll[condition_id] = now
             targets.append(watched)
         return targets
 
-    def poll_stats(self, due: set[str] | None = None) -> int:
+    def poll_stats(
+        self,
+        due: set[str] | None = None,
+        tick_id: int | None = None,
+        finishing: set[str] | None = None,
+    ) -> int:
         """Read the statistics for the matches in play. Returns rows written.
 
         One more small request per live match on the tick the score is read on,
-        so a statistic and the price beside it share a timestamp. Only the
+        so a statistic and the price beside it share a tick id. Only the
         feed's overall block is kept: it is what moves while the match is on,
         and the per-set breakdown it arrives with is collected properly once
         the match is over and Flashscore has stopped revising it.
         """
         if not self.record_stats:
             return 0
-        targets = self._stat_targets(due)
+        targets = self._stat_targets(due, finishing)
         if not targets:
             return 0
 
@@ -521,7 +548,7 @@ class Poller:
         if not rows:
             return 0
 
-        written = self.store.record_stat_events(rows)
+        written = self.store.record_stat_events(rows, tick_id=tick_id)
         log.log(
             logging.INFO if written else logging.DEBUG,
             "stats: %d match(es) read, %d change(s)",
@@ -595,7 +622,7 @@ class Poller:
 
     # ---------------- one snapshot ----------------
 
-    def tick(self, due: set[str] | None = None) -> int:
+    def tick(self, due: set[str] | None = None, tick_id: int | None = None) -> int:
         """Snapshot every book due this tick. Returns rows written.
 
         `due` comes from `_due_matches`, which the loop calls once and hands to
@@ -633,7 +660,7 @@ class Poller:
             rows.append((snap, meta.condition_id, meta.outcome_index, meta.outcome))
         self._check_stale(ts, ages)
 
-        written = self.store.insert_snapshots(ts, rows) if rows else 0
+        written = self.store.insert_snapshots(ts, rows, tick_id=tick_id) if rows else 0
         missing = len(tokens) - len(books)
         unchanged = len(books) - written
         waiting = len(self.tracked) - len(tokens)
@@ -727,27 +754,43 @@ class Poller:
             # by both or by neither, so its price and its score never drift
             # onto different clocks.
             due = self._due_matches()
+            # A wall-clock microsecond value is compact in SQLite, remains
+            # unique at this loop's cadence across restarts, and stays exactly
+            # representable when the dashboard parses it as a JavaScript
+            # number. It is made once here so every row from this pass has an
+            # exact join key even though each feed retains its own timestamp.
+            tick_id = time.time_ns() // 1_000
+            live_before_score = {
+                condition_id
+                for condition_id in due
+                if self._state.get(condition_id) == "live"
+            }
             try:
-                self.tick(due)
+                self.tick(due, tick_id=tick_id)
             except httpx.HTTPError as exc:
                 log.error("tick failed (%s), continuing", exc)
             except Exception:  # noqa: BLE001 - a bad tick must not kill the capture
                 log.exception("unexpected error in tick, continuing")
 
             # In the same pass as the books, so a price and the point it moved
-            # on share a timestamp.
+            # on share an exact tick id.
             try:
-                self.poll_scores(due)
+                self.poll_scores(due, tick_id=tick_id)
             except httpx.HTTPError as exc:
                 log.warning("score poll failed (%s), continuing", exc)
             except Exception:  # noqa: BLE001 - the books matter more than the score
                 log.exception("unexpected error in score poll, continuing")
 
-            # Same pass as the book and the score, on the same `due` set, so
-            # the three describe one moment of one match. Wrapped like the
-            # others: nothing here is worth losing a tick over.
+            # Same pass as the book and the score, on the same `due` set and
+            # tick id, so the three describe one moment of one match. Wrapped
+            # like the others: nothing here is worth losing a tick over.
+            finishing = {
+                condition_id
+                for condition_id in live_before_score
+                if self._state.get(condition_id) == "ended"
+            }
             try:
-                self.poll_stats(due)
+                self.poll_stats(due, tick_id=tick_id, finishing=finishing)
             except httpx.HTTPError as exc:
                 log.warning("stats poll failed (%s), continuing", exc)
             except Exception:  # noqa: BLE001 - the books matter more than the statistics

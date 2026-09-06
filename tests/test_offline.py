@@ -498,6 +498,7 @@ def test_store() -> None:
                     (snap_a, market.condition_id, 0, market.outcomes[0]),
                     (snap_b, market.condition_id, 1, market.outcomes[1]),
                 ],
+                tick_id=123456,
             )
             check("two snapshots written", written == 2)
 
@@ -518,6 +519,9 @@ def test_store() -> None:
             ).fetchone()
             check("upstream book timestamp stored", stored[0] == 1700000000.0)
             check("stored timestamp is marked as measured, not derived", stored[1] == 0)
+            check("book rows carry the capture tick", store.conn.execute(
+                "SELECT DISTINCT tick_id FROM books"
+            ).fetchall() == [(123456,)])
             # The API reports one last-trade price per market on BOTH tokens,
             # oriented to whichever side traded last -- so it must never be read
             # as "this outcome's" price. Verified against live Cincinnati books.
@@ -1560,7 +1564,8 @@ def test_score_events() -> None:
             check("unchanged reading not repeated", store.record_score_events(opening) == 0)
 
             moved = [ScoreRow(cid, "live", "S2", "6-3, 4-1")]
-            check("changed score recorded", store.record_score_events(moved) == 1)
+            check("changed score recorded",
+                  store.record_score_events(moved, tick_id=7001) == 1)
             check("changed period recorded", store.record_score_events([ScoreRow(cid, "ended", "FT", "6-3, 4-1")]) == 1)
 
             rows = store.conn.execute(
@@ -1569,6 +1574,9 @@ def test_score_events() -> None:
             ).fetchall()
             check("history kept in order", [r[1] for r in rows] == ["6-3, 3-1", "6-3, 4-1", "6-3, 4-1"])
             check("final state recorded", rows[-1][0] == "FT")
+            check("score changes carry the capture tick", store.conn.execute(
+                "SELECT tick_id FROM score_events WHERE score = '6-3, 4-1' ORDER BY ts LIMIT 1"
+            ).fetchone()[0] == 7001)
 
             # Points move within a game, so they are a change worth a row even
             # when the score has not moved -- that is what the chart reads out
@@ -1990,12 +1998,17 @@ def test_stats_ratchet() -> None:
                                    ("Total Points Won", f"50% (1/{points})", f"50% (1/{points})")]))
         )
 
-    ratchet = StatRatchet(patience=3)
+    ratchet = StatRatchet()
     check("the first reading is always taken", ratchet.accept("m", at(40)))
     check("a reading that moved on is taken", ratchet.accept("m", at(41)))
     check("a rewind is dropped", not ratchet.accept("m", at(40)))
     check("and again", not ratchet.accept("m", at(40)))
-    check("but a reading that keeps coming back is a correction", ratchet.accept("m", at(40)))
+    check("and remains dropped however often it comes back", not ratchet.accept("m", at(40)))
+    check("a forward correction may skip a point", ratchet.accept("m", at(43)))
+    ratchet.seed("m", 45)
+    check("a persisted floor is restored", not ratchet.accept("m", at(44)))
+    ratchet.seed("m", 42)
+    check("seeding can never lower the in-memory floor", not ratchet.accept("m", at(44)))
 
     # A statistic can change without a point being played: an unforced error
     # reclassified as a winner, a serve speed landing a beat late. Level is
@@ -2028,7 +2041,8 @@ def test_stat_events() -> None:
             store.upsert_markets([market])
             row = StatRow.of(market.condition_id, reading.overall, flip=False,
                              digest=reading.digest)
-            check("the first reading is written", store.record_stat_events([row]) == 1)
+            check("the first reading is written",
+                  store.record_stat_events([row], tick_id=7001) == 1)
             check("an unchanged reading is not", store.record_stat_events([row]) == 0)
 
             moved = parse_stats(
@@ -2047,6 +2061,13 @@ def test_stat_events() -> None:
             check("the pair is stored, not the percentage", stored[0][3:5] == (52.0, 100.0))
             check("the feed's digest rides along", stored[0][5] == "deadbeef")
             check("the second row is the one that moved", stored[1][0] == 10.0)
+            check("statistics carry the capture tick", store.conn.execute(
+                "SELECT tick_id FROM stat_events ORDER BY ts LIMIT 1"
+            ).fetchone()[0] == 7001)
+            check("the stored total can seed a restarted ratchet",
+                  store.latest_stat_points([market.condition_id]) == {
+                      market.condition_id: 101
+                  })
 
             missing = store.conn.execute(
                 "SELECT double_faults_0, first_serve_speed_1 FROM stat_events LIMIT 1"
@@ -2186,6 +2207,37 @@ def test_stats_poll() -> None:
 
             check("--no-stats records nothing at all",
                   Poller(api, store, scores=feed, record_stats=False).poll_stats() == 0)
+
+            # One real turn of the loop's three reads. The score changes the
+            # state to ended before the statistics poll, which must still make
+            # its forced final read and must carry the same exact identifier as
+            # both the books and the finishing score.
+            from polymarket.scores import Reading, SetScore
+
+            api.books = lambda token_ids: {
+                token_id: dict(BOOK, asset_id=token_id) for token_id in token_ids
+            }
+            feed.readings_by_id["fs0"] = Reading(
+                "ended", "FT", (SetScore(6, 3), SetScore(6, 4))
+            )
+            feed.stats_by_id["fs0"] = feed_at("13", 104)
+            poller._last_stat_poll[cid] = time.monotonic()
+            due = {cid}
+            tick_id = 7002
+            check("the finishing tick records both books",
+                  poller.tick(due, tick_id=tick_id) == 2)
+            check("the finishing tick records its score",
+                  poller.poll_scores(due, tick_id=tick_id) == 1)
+            finishing = {cid} if poller._state[cid] == "ended" else set()
+            check("a just-finished match gets its final statistics read",
+                  poller.poll_stats(
+                      due, tick_id=tick_id, finishing=finishing
+                  ) == 1)
+            for table in ("books", "score_events", "stat_events"):
+                check(f"{table} retains the shared finishing tick", store.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE condition_id = ? AND tick_id = ?",
+                    (cid, tick_id),
+                ).fetchone()[0] > 0)
 
     # The floor is on the read, not on the write: it decides how many ticks ask
     # Flashscore at all. It exists because the reads are sequential on one
