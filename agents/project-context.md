@@ -11,9 +11,12 @@ tour-level (250 and above) ATP and WTA singles match **while it is being
 played** — every 5 seconds, 10 levels deep on each side — into SQLite, with the
 live score and the match statistics read on the same tick. Their individual
 timestamps say when each sequential read happened; their shared `tick_id` is
-the exact join key. A match that has not started yet is read once a minute instead,
-and one that has finished is not read again. A read-only web dashboard browses
-what has been recorded.
+the exact join key. The trade tape is recorded on the same tick cadence but
+under the venue's own timestamps — every taker fill with price, size and
+direction, so a resting order's fill model can be replayed against what
+actually crossed the book. A match that has not started yet is read once a
+minute instead, and one that has finished is not read again. A read-only web
+dashboard browses what has been recorded.
 
 Both circuits are captured by default; `--tour atp` / `--tour wta` narrows it to
 one. A combined event runs both draws under one tournament name, so the event
@@ -64,7 +67,8 @@ and a statistics read about a kilobyte on the wire and 50 ms; the day card is
 ~750 KB every 5 minutes. Points turn over about every 26 seconds, so the
 5-second tick sees every point with room to spare. Only matches in play run at
 that cadence -- a full day card of matches yet to start costs one poll a minute
-each.
+each. The trade tape adds a few hundred to a couple thousand rows per match and
+one batched request per tick.
 
 The statistics are the cheapest table by row count and the widest by column
 count: about one row every ten seconds per live match, so a thousand or so over
@@ -83,6 +87,7 @@ uv run polymarket stats                 # summarise the database
 uv run polymarket sql "SELECT ..."      # any query, read-only
 uv run polymarket clean-scores          # repair pre-ratchet score history
 uv run polymarket backfill-book-ts      # reconstruct book_ts for older rows
+uv run polymarket backfill-trades --apply  # walk the trade tape for stored markets
 ```
 
 `dashboard`, `stats` and `sql` open the file read-only and are safe to run beside
@@ -93,7 +98,7 @@ discover`.
 ## How to verify a change
 
 ```bash
-uv run python tests/test_offline.py     # ~455 checks, no network
+uv run python tests/test_offline.py     # ~496 checks, no network
 ```
 
 `tests/test_offline.py` is a **plain script, not pytest** — a flat list of
@@ -184,6 +189,16 @@ Other conventions:
 - **`market_last_trade` is per match, not per player.** Tommy Paul's row can read
   0.19 while his own mid is 0.81. Use it per match; the dashboard's orientation
   of it is an inference and is labelled as one.
+- **The trade tape is taker prints only, on purpose.** `takerOnly` is the Data
+  API's default and the reading the capture keeps: the taker is the aggressor,
+  so its fills are the ones that trade through a resting price. A maker row is
+  available on the endpoint (`takerOnly=false`) but describes the same trade as
+  one wallet's leg; storing both would double-count every match. Anything that
+  needs maker volume can aggregate it later from taker sizes — a crossing print
+  is both sides' liquidity by definition.
+- **`trades.ts` is the venue's clock, never the capture's.** A print happened
+  when Polymarket settled it; `tick_id` is when we noticed. Reading price
+  against prints joins on the venue clock by time window, not on `tick_id`.
 - **NULL means "no quote"**, which is real information about a decided market.
   Never fill it with a number at any layer.
 - **The Flashscore feed is undocumented.** `FLASHSCORE_SIGN` (`x-fsign`) is a

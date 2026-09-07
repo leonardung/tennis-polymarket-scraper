@@ -4,7 +4,10 @@ Records the Polymarket order book for every tour-level (250 and above) ATP and
 WTA singles match **while it is being played**, every 5 seconds, 10 levels deep on
 each side, into SQLite — with the live score and the match statistics read on the
 same tick, so a price, the point it moved on, and the aces count behind it all
-share a `tick_id` while retaining their individual read timestamps.
+share a `tick_id` while retaining their individual read timestamps. The trade
+tape is recorded on the same tick cadence but under the venue's own timestamps:
+every taker fill, with its price, size and direction, so a resting order's fill
+model can be replayed against what actually crossed the book.
 
 ## Commands
 
@@ -17,6 +20,7 @@ uv run polymarket sql          # latest quote for every match
 uv run polymarket sql "SELECT ..."   # any query
 uv run polymarket clean-scores # repair a score history recorded before the ratchet
 uv run polymarket backfill-book-ts   # reconstruct book_ts for older rows
+uv run polymarket backfill-trades --apply  # fill the trade tape of finished matches
 ```
 
 Or run the capture and the dashboard as two containers — see [Docker](#docker).
@@ -51,6 +55,7 @@ triggers an early refresh.
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--no-stats` | off | don't record match statistics (see [Match statistics](#match-statistics)) |
+| `--no-trades` | off | don't record trade prints (see [The trade tape](#the-trade-tape)) |
 | `--stats-interval N` | `5` | floor between statistics reads of one match, on top of `--interval` |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
 | `--stale-after N` | `120` | warn when every in-play book is this far behind its own upstream timestamp |
@@ -450,9 +455,30 @@ never will).
 `--no-stats` turns all of this off. The cost it saves is one extra Flashscore
 read per live match per statistics-due tick — about 50 ms and a kilobyte each.
 
+## The trade tape
+
+Every tick also asks Polymarket's Data API (public, no auth) for the **trade
+prints** of the matches it is reading: each taker fill, with its price, its size
+in shares, and which direction it was attacked from. This is the one thing the
+CLOB cannot give you after the fact — its book carries only the newest trade's
+price, and never the size or the side — and it is what a maker-fill model needs:
+the taker is the aggressor, so taker prints are the trades that pass through a
+resting order.
+
+```bash
+uv run polymarket backfill-trades --apply     # walk the tape for every stored market
+uv run polymarket backfill-trades --apply --limit 20   # oldest markets first
+```
+
+The tape goes back before the capture does: the Data API keeps a market's whole
+trade history, including matches that ended long ago, so `backfill-trades` fills
+in markets that were recorded before prints were. It is idempotent and safe to
+run beside a live capture. Prints are stored under the venue's own timestamps —
+see [What gets stored](#what-gets-stored).
+
 ## What gets stored
 
-Five tables and a view, in one SQLite file.
+Six tables and a view, in one SQLite file.
 
 **`markets`** — one row per match:
 
@@ -621,6 +647,35 @@ SELECT period, aces_0, aces_1, total_points_won_0_of AS points
 FROM set_stats WHERE condition_id = '0x...' ORDER BY period;
 ```
 
+**`trades`** — the trade tape, one row per taker fill:
+
+| Column | Meaning |
+|---|---|
+| `ts` | when the **venue** settled the print, epoch seconds — not when the capture noticed it |
+| `tick_id` | the capture tick that first recorded it (the observation time, not the trade time) |
+| `condition_id` | which market |
+| `transaction_hash` | the venue's own identity for the trade — the primary key, so replays never duplicate |
+| `wallet` | the taker's Polymarket wallet (anonymous enough to be a *different* wallet across a market) |
+| `side` | the taker's side: `BUY` or `SELL` |
+| `price`, `size` | the price it filled at, and how many shares it took |
+| `outcome_index`, `outcome` | which side of the match was traded, in the same outcome order as `books` |
+
+This is the one table whose `ts` is not the capture's clock. A print happened
+when Polymarket settled it; the capture observes it on the tick and stores both
+moments, with the venue's own taking precedence in every read. Joining a print
+to the book it moved is a time-window seek on the venue clock — see the index
+`trades_by_market (condition_id, ts)` — deliberately unlike the `tick_id` joins
+above. Primary key `(transaction_hash, wallet, side, outcome_index)` reflects
+what the venue reports per trade; with taker prints only, one row is one trade.
+
+```sql
+-- the last minute of prints, newest first, with the book beside them
+SELECT datetime(t.ts,'unixepoch') AS t, t.side, t.size, t.price,
+       (SELECT b.spread FROM books b
+        WHERE b.condition_id = t.condition_id AND b.ts <= t.ts ORDER BY b.ts DESC LIMIT 1)
+FROM trades t WHERE t.condition_id = '0x...' ORDER BY t.ts DESC LIMIT 20;
+```
+
 **`quotes`** — a view that spells out the direction, since bid/ask is easy to
 invert:
 
@@ -673,12 +728,18 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
   produce — plus one `set_stats` row per period, once. On the wire they cost a
   kilobyte and about 50 ms per live match per statistics-due tick. `--no-stats`
   turns them off.
+- Trade prints run a few hundred to a couple of thousand per match. On the wire
+  they cost one batched request per tick (the whole day card's due markets in
+  one call), plus more only while the store is being caught up. `--no-trades`
+  turns them off, and `backfill-trades --apply` fills any gap afterwards — the
+  Data API keeps the history, so a print missed while the capture was down is
+  recoverable, unlike a book.
 - Safe to stop and restart: it reopens the same database and carries on, and
   re-running a tick never duplicates rows.
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 453 checks, no network needed
+uv run python tests/test_offline.py   # ~496 checks, no network needed
 ```
 
 ## Working on the dashboard front end

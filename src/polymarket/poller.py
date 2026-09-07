@@ -6,10 +6,18 @@ itself never changes; `_due_matches` decides who is on it. Books, score and
 match statistics for one match are read in the same pass, so they share a
 timestamp.
 
-One thing does not run on the grid: a finished match's per-set statistics,
-which are collected an hour after it ended because Flashscore goes on revising
-them. That queue lives in the database rather than in this object, so stopping
-the capture does not lose it.
+One thing runs on the grid but not on its clock: the trade tape. Each tick
+also asks the Data API for every print the matches on it produced, and stores
+those under the venue's own timestamps -- a print is when the venue settled it,
+not when we noticed. That is the only stream with more than one timestamp and
+no `ts` of ours, and it is why the tape is polled rather than parsed off the
+book: the CLOB's `last_trade_price` says what the most recent print *cost* but
+neither how large it was nor which way it was attacked.
+
+One thing does not run on the grid at all: a finished match's per-set
+statistics, which are collected an hour after it ended because Flashscore goes
+on revising them. That queue lives in the database rather than in this object,
+so stopping the capture does not lose it.
 """
 
 from __future__ import annotations
@@ -42,10 +50,12 @@ from .config import (
     STALE_WARN_EVERY,
     START_GRACE,
     TOURS,
+    TRADES_PAGE,
+    TRADES_TICK_PAGES,
 )
 from .discovery import discover, seconds_from_now
 from .scores import Flashscore, Paired, Ratchet, ScoreBoard, StatRatchet
-from .store import ScoreRow, StatRow, Store
+from .store import ScoreRow, StatRow, Store, TradeRow
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +109,7 @@ class Poller:
         live_only: bool = True,
         only_changes: bool = True,
         record_stats: bool = True,
+        record_trades: bool = True,
         stats_interval: float = STATS_INTERVAL,
         heartbeat: float = HEARTBEAT,
         stale_after: float = STALE_AFTER,
@@ -125,6 +136,7 @@ class Poller:
         self.live_only = live_only
         self.only_changes = only_changes
         self.record_stats = record_stats
+        self.record_trades = record_trades
         self.stats_interval = stats_interval
         self.heartbeat = heartbeat
         self.stale_after = stale_after
@@ -557,6 +569,50 @@ class Poller:
         )
         return written
 
+    # ---------------- trade prints ----------------
+
+    def poll_trades(self, due: set[str] | None = None, tick_id: int | None = None) -> int:
+        """Read the trade tape of the matches this tick is reading. Returns new rows.
+
+        The tape is a fifth stream beside book, score and statistics -- and the
+        one that does not share their clock. Each row is stored under the venue's
+        own timestamp, not this tick's, because a print happened when Polymarket
+        settled it, and a fill model needs that time rather than the observation
+        time. The `due` set is the cadence only: which matches get asked, not
+        when their prints are said to have happened.
+
+        One batched request per tick -- `market` accepts a comma-separated list
+        -- unless the page comes back full of rows the store has never seen, in
+        which case the walk continues: after a restart, or behind an outage, the
+        gap can be thousands of prints deep. Each row lands in the store
+        idempotently keyed on the venue's own trade identity, so a page re-fetched
+        is not a duplicate; "nothing new on this page" is what stops the walk, and
+        it needs no memory between ticks or restarts.
+        """
+        if not self.record_trades or not due:
+            return 0
+        condition_ids = sorted(due)
+        inserted = 0
+        for page in range(TRADES_TICK_PAGES):
+            payload = self.api.trades(condition_ids, offset=page * TRADES_PAGE)
+            if not payload:
+                break
+            rows = [TradeRow.of(item) for item in payload]
+            fresh = [row for row in rows if row is not None]
+            malformed = len(rows) - len(fresh)
+            if malformed:
+                log.warning("trades: %d malformed row(s) refused", malformed)
+            inserted += self.store.record_trades(fresh, tick_id=tick_id)
+            if len(payload) < TRADES_PAGE:
+                break  # the tape is caught up to the venue's newest print
+        log.log(
+            logging.INFO if inserted else logging.DEBUG,
+            "trades: %d market(s) polled, %d print(s) new",
+            len(condition_ids),
+            inserted,
+        )
+        return inserted
+
     def collect_final_stats(self, now: float | None = None) -> int:
         """Take the per-set statistics of matches that finished an hour ago.
 
@@ -795,6 +851,17 @@ class Poller:
                 log.warning("stats poll failed (%s), continuing", exc)
             except Exception:  # noqa: BLE001 - the books matter more than the statistics
                 log.exception("unexpected error in stats poll, continuing")
+
+            # The trade tape is polled on the same `due` set but deliberately not
+            # stamped with this tick: each print carries the venue's own
+            # settlement time, which is the time a fill model reads it at. It
+            # rides the tick's cadence without joining its clock.
+            try:
+                self.poll_trades(due, tick_id=tick_id)
+            except httpx.HTTPError as exc:
+                log.warning("trades poll failed (%s), continuing", exc)
+            except Exception:  # noqa: BLE001 - the books matter more than the tape
+                log.exception("unexpected error in trades poll, continuing")
 
             if self._final_stats_due():
                 try:

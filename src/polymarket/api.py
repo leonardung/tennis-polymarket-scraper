@@ -8,7 +8,7 @@ from typing import Any, Iterator
 
 import httpx
 
-from .config import BOOKS_CHUNK, CLOB, GAMMA
+from .config import BOOKS_CHUNK, CLOB, DATA_API, GAMMA, TRADES_PAGE
 
 log = logging.getLogger(__name__)
 
@@ -112,3 +112,27 @@ class Polymarket:
         resp = self._client.get(f"{CLOB}/book", params={"token_id": token_id})
         resp.raise_for_status()
         return resp.json()
+
+    # ---------------- Data API (trade prints) ----------------
+
+    def trades(self, condition_ids: list[str], offset: int = 0) -> list[dict[str, Any]]:
+        """Page the trade tape, newest first. Public, no auth, no key.
+
+        Rows are taker fills only (`takerOnly` is the endpoint's default, and it
+        is the reading a maker-fill model wants: the taker is the aggressor whose
+        order crossed the book, so *these* are the prints that trade through a
+        resting price). `market` accepts a comma-separated list of condition ids,
+        which is what keeps a tick's whole trade poll to one request.
+        """
+        resp = self._client.get(
+            f"{DATA_API}/trades",
+            params={
+                "market": ",".join(condition_ids),
+                "takerOnly": "true",
+                "limit": TRADES_PAGE,
+                "offset": offset,
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return payload if isinstance(payload, list) else []

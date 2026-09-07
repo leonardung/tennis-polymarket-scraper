@@ -7,6 +7,11 @@ from dataclasses import dataclass
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
+# The public Data API: aggregate views over what the venue has settled on chain.
+# Unlike Gamma and the CLOB it needs no auth for read endpoints like /trades, and
+# it is the only Polymarket source that keeps trade history -- the CLOB prints
+# the newest one on each book and nothing older.
+DATA_API = "https://data-api.polymarket.com"
 
 TENNIS_TAG_ID = "864"  # Gamma tag slug "tennis"; resolved at runtime, this is the fallback
 
@@ -37,6 +42,14 @@ OVERDUE_RECHECK = 60.0  # re-check this often while a match is past its start ti
 OVERDUE_WINDOW = 6 * 3600.0  # stop expecting a match this long after its start time
 BOOK_DEPTH = 10  # levels captured per side
 BOOKS_CHUNK = 50  # token_ids per batched /books request
+
+# Trade prints come off the Data API's /trades, not the CLOB: the CLOB's book
+# carries only the newest trade's price, and a maker-fill model needs the whole
+# tape -- price, size and taker direction per print. /trades pages newest-first,
+# so a poll fetches page zero and keeps walking while everything it saw was new;
+# five thousand rows a tick is already a burst no single match produces.
+TRADES_PAGE = 1000  # rows per /trades request
+TRADES_TICK_PAGES = 5  # pages one poll may walk before stopping, all-new or not
 
 # Scores come from Flashscore, not from Polymarket -- see scores.py for why.
 # They are read with the books, on the same cadence as the match they belong to,

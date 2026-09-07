@@ -7,7 +7,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from .book import Snapshot
 from .config import BOOK_DEPTH, STATISTICS
@@ -192,6 +192,84 @@ SCORE_EVENT_COLUMNS = [
     ("serving", "INTEGER"),
 ]
 
+
+@dataclass(frozen=True)
+class TradeRow:
+    """One taker fill, in what the Data API reported it in.
+
+    `ts` is the venue's own timestamp, not the capture's -- a print exists on the
+    datetime Polymarket settled it, and the capture may only learn of it seconds
+    later. `side` is the taker's side (BUY/SELL) on the outcome named by
+    `outcome_index`; the same match's complementary half lives on the other
+    token and is *not* a second row, so one row is one trade, not two.
+
+    A print is the venue's record of a crossing: `size` at `price` took
+    liquidity *from the side the taker attacked*. There is no maker fill model
+    without per-print size and direction, which is why this row carries both
+    rather than only the price the CLOB's `last_trade_price` offers.
+    """
+
+    condition_id: str
+    transaction_hash: str
+    wallet: str | None
+    side: str  # "BUY" / "SELL"
+    price: float
+    size: float
+    outcome_index: int | None
+    outcome: str | None
+    ts: float
+
+    @classmethod
+    def of(cls, payload: dict[str, Any]) -> "TradeRow | None":
+        """Parse one Data-API trade, tolerating a malformed row by refusing it.
+
+        The endpoint is not a strict contract and a row missing its own hash
+        cannot be deduplicated against its neighbours, so an unparseable row is
+        dropped and counted rather than stored half-known.
+        """
+        try:
+            tx = str(payload["transactionHash"])
+            side = str(payload["side"])
+            price = float(payload["price"])
+            size = float(payload["size"])
+            ts = float(payload["timestamp"])
+            if not tx or side not in ("BUY", "SELL") or price <= 0 or size <= 0 or ts <= 0:
+                return None
+            wallet = payload.get("proxyWallet") or None
+            outcome = payload.get("outcome") or None
+            index = payload.get("outcomeIndex")
+            return cls(
+                condition_id=str(payload["conditionId"]),
+                transaction_hash=tx,
+                wallet=str(wallet) if wallet else None,
+                side=side,
+                price=price,
+                size=size,
+                outcome_index=int(index) if index is not None else None,
+                outcome=str(outcome) if outcome else None,
+                ts=ts,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+TRADE_COLUMNS = [
+    # The venue's own timestamp for the print, in epoch seconds -- one-second
+    # resolution. NOT the capture tick's clock: prints are a stream the capture
+    # observes, and forcing them onto the tick grid would fold the timing
+    # structure a fill model reads into whatever moment the poll landed on.
+    ("ts", "REAL"),
+    ("tick_id", "INTEGER"),  # the tick that first recorded it, if any
+    ("condition_id", "TEXT"),
+    ("transaction_hash", "TEXT"),
+    ("wallet", "TEXT"),
+    ("side", "TEXT"),
+    ("price", "REAL"),
+    ("size", "REAL"),
+    ("outcome_index", "INTEGER"),
+    ("outcome", "TEXT"),
+]
+
 _TEXT_COLUMNS = {"condition_id", "token_id", "outcome", "book_hash"}
 _INT_COLUMNS = {"tick_id", "outcome_index", "book_ts_derived"}
 
@@ -264,6 +342,28 @@ CREATE TABLE IF NOT EXISTS set_stats (
     PRIMARY KEY (condition_id, period)
 ) WITHOUT ROWID;
 
+-- The trade tape: every taker fill on a tracked market, as the venue recorded
+-- it. The CLOB book's `last_trade_price` says that *something* traded and at
+-- what price; it says neither how much nor which side, and a fill model that
+-- asks "would a resting order at this price have been filled?" needs exactly
+-- those two. Taker rows only (`takerOnly` on the source): the taker is the
+-- aggressor, so these are the prints that trade through a resting price --
+-- which is both what the question needs and the adverse-selection bias recorded
+-- rather than hidden: a fill you get is one the market chose to move through.
+--
+-- NOT the capture tick's clock. `tick_id` is when we first saw the row; `ts` is
+-- when the venue settled it. Reading price against trades joins on the venue
+-- clock by time window, deliberately unlike the books/score/stat joins, which
+-- use `tick_id` -- here the facts being joined are all venue-time facts.
+--
+-- Primary key on the venue's own trade identity, so replaying a poll or a
+-- backfill neither duplicates nor overwrites: the same print twice is one
+-- print, and that is why the write is INSERT OR IGNORE.
+CREATE TABLE IF NOT EXISTS trades (
+{", ".join(f"    {name:<18} {kind}" for name, kind in TRADE_COLUMNS)},
+    PRIMARY KEY (transaction_hash, wallet, side, outcome_index)
+) WITHOUT ROWID;
+
 """
 
 # Applied after _migrate(): indexes and the view both reference columns that an
@@ -277,9 +377,15 @@ CREATE INDEX IF NOT EXISTS score_events_by_market ON score_events (condition_id,
 -- the table. Without it the dashboard's per-match lookups degrade into a full
 -- scan once a season's worth of ticks has accumulated.
 CREATE INDEX IF NOT EXISTS books_by_outcome ON books (condition_id, outcome_index, ts);
+-- The trade tape is read by market against its own clock: "what the book looked
+-- like when this print went through" is a condition-id + venue-timestamp seek.
+CREATE INDEX IF NOT EXISTS trades_by_market ON trades (condition_id, ts);
 -- stat_events and set_stats get no index: both are WITHOUT ROWID keyed on
 -- exactly what a reader seeks by, so the table *is* that index. (score_events
 -- above has one restating its own primary key; it predates the WITHOUT ROWID.)
+-- `trades` is the same shape but gets the index above for the opposite reason:
+-- its primary key is the venue's trade identity, while the join a reader makes
+-- is (condition_id, venue-time window) to the book it moved.
 
 DROP VIEW IF EXISTS quotes;
 CREATE VIEW quotes AS
@@ -343,6 +449,7 @@ class Store:
                 ("digest", "TEXT"),
             ]
             + [(col, "REAL") for col in STAT_COLUMNS],
+            "trades": TRADE_COLUMNS,
         }
         for table, columns in expected.items():
             present = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -629,6 +736,61 @@ class Store:
         )
         return len(payload)
 
+    def record_trades(self, rows: Iterable[TradeRow], tick_id: int | None = None) -> int:
+        """Record taker prints. Returns how many were new.
+
+        INSERT OR IGNORE keyed on the venue's own trade identity: a print the
+        poll has seen before is left exactly as it was, so replaying any page --
+        or walking the whole history in a backfill -- is idempotent. That also
+        makes the return count the honest dedupe signal: zero means every row
+        this page carried was already known, which is what lets a poll stop
+        walking pages without remembering anything between ticks, or across
+        restarts.
+
+        A malformed row is refused upstream (``TradeRow.of`` returns None), so
+        everything reaching here is insertable whole.
+        """
+        rows = [row for row in rows if row is not None]
+        if not rows:
+            return 0
+        names = [name for name, _ in TRADE_COLUMNS]
+        cursor = self.conn.executemany(
+            f"INSERT OR IGNORE INTO trades ({', '.join(names)}) "
+            f"VALUES ({', '.join('?' * len(names))})",
+            [(
+                row.ts,
+                tick_id,
+                row.condition_id,
+                row.transaction_hash,
+                row.wallet,
+                row.side,
+                row.price,
+                row.size,
+                row.outcome_index,
+                row.outcome,
+            ) for row in rows],
+        )
+        return cursor.rowcount if cursor.rowcount > 0 else 0
+
+    def markets_for_trade_backfill(
+        self, tour: str | None = None, limit: int | None = None
+    ) -> list[str]:
+        """Condition ids to walk for `backfill-trades`, oldest market first.
+
+        Ordered so a partial run interrupted by rate limits advances steadily
+        from the beginning of the record rather than scattered through it.
+        """
+        if tour:
+            query = "SELECT condition_id FROM markets WHERE tour = ? ORDER BY first_seen"
+            params: tuple = (tour,)
+        else:
+            query = "SELECT condition_id FROM markets ORDER BY first_seen"
+            params = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            params += (limit,)
+        return [str(row[0]) for row in self.conn.execute(query, params)]
+
     def stats(self) -> dict[str, object]:
         cur = self.conn.cursor()
         markets = cur.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
@@ -645,6 +807,7 @@ class Store:
             """
         ).fetchall()
         stat_rows = cur.execute("SELECT COUNT(*) FROM stat_events").fetchone()[0]
+        trade_rows = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
         # By match rather than by row: the interesting number is how many
         # finished matches have their settled per-set breakdown, not how many
         # periods that came to.
@@ -658,6 +821,7 @@ class Store:
             "first_ts": first,
             "last_ts": last,
             "stat_events": stat_rows,
+            "trades": trade_rows,
             "set_stats": final,
             "by_tournament": by_tournament,
         }

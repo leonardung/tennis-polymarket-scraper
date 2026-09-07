@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from polymarket.book import parse_book  # noqa: E402
 from polymarket.config import BOOK_DEPTH, MATCH_SLUG, match_tournament  # noqa: E402
 from polymarket.discovery import discover  # noqa: E402
-from polymarket.store import Store  # noqa: E402
+from polymarket.poller import Poller  # noqa: E402
+from polymarket.store import Store, TradeRow  # noqa: E402
 
 PASSED = 0
 
@@ -2258,6 +2259,130 @@ def test_stats_poll() -> None:
             check("once the floor is up it reads again", poller.poll_stats() == 1)
 
 
+# The shape a Data-API /trades row arrives in: camelCase keys, string numbers.
+TRADE = {
+    "transactionHash": "0xabc1",
+    "side": "BUY",
+    "asset": "token111",
+    "conditionId": "0xcid0",
+    "proxyWallet": "0xwallet1",
+    "size": 200,
+    "price": 0.69,
+    "timestamp": 1788813120,
+    "outcomeIndex": 0,
+    "outcome": "Botic van de Zandschulp",
+}
+
+
+class FakeTradesAPI(FakeAPI):
+    """Serves fixed /trades pages under the discovery Duck-typing, recording requests."""
+
+    def __init__(self, pages: list[list[dict]]) -> None:
+        super().__init__([])
+        self._pages = pages
+        self.calls: list[tuple[list[str], int]] = []
+
+    def trades(self, condition_ids: list[str], offset: int = 0) -> list[dict]:
+        """One page per call, in order -- what the poller's walk looks like."""
+        self.calls.append((list(condition_ids), offset))
+        return self._pages[len(self.calls) - 1] if len(self.calls) <= len(self._pages) else []
+
+
+def test_trades() -> None:
+    """The trade tape: parsing, idempotent store, the poller's page walk."""
+    print("\ntrade prints")
+
+    row = TradeRow.of(TRADE)
+    check("row parsed", row is not None and row.side == "BUY" and row.price == 0.69)
+    check("venue timestamp kept as its own clock", row is not None and row.ts == 1788813120)
+    check("outcome index parsed", row is not None and row.outcome_index == 0)
+
+    for broken in (
+        {},
+        {"transactionHash": "", "side": "BUY", "price": 0.5, "size": 1, "timestamp": 1},
+        {**TRADE, "side": "EDGE"},
+        {**TRADE, "size": -5},
+        {**TRADE, "price": "not a number"},
+        {**TRADE, "timestamp": None},
+    ):
+        check(f"malformed row refused: {list(broken)[:1] or 'empty'}", TradeRow.of(broken) is None)  # type: ignore[arg-type]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "t.db") as store:
+            batch = [
+                TradeRow.of({**TRADE, "transactionHash": f"0x{i}"})
+                for i in range(1, 4)
+            ]
+            assert all(row is not None for row in batch)
+            check("first poll inserts", store.record_trades(batch, tick_id=777) == 3)
+            check("re-walking the same pages is idempotent", store.record_trades(batch) == 0)
+            stored = store.conn.execute(
+                "SELECT ts, tick_id, side, price, size FROM trades WHERE transaction_hash = '0x1'"
+            ).fetchone()
+            check("venue ts stored", stored[0] == TRADE["timestamp"])
+            check("first-seen tick recorded", stored[1] == 777)
+            check("row re-seen later keeps its first tick", store.record_trades(
+                batch, tick_id=888
+            ) == 0 and store.conn.execute(
+                "SELECT tick_id FROM trades WHERE transaction_hash='0x1'"
+            ).fetchone()[0] == 777)
+            check("stats counts trades", store.stats()["trades"] == 3)
+
+    # The poller reads one batched request per tick and keeps walking only
+    # while pages come back full of prints it has never seen.
+    from polymarket import poller as poller_mod
+
+    original_page, original_pages = poller_mod.TRADES_PAGE, poller_mod.TRADES_TICK_PAGES
+    poller_mod.TRADES_PAGE = 31  # rewrite the page size so a fixture page counts as full
+    poller_mod.TRADES_TICK_PAGES = 4
+    try:
+        pages = [
+            [{**TRADE, "transactionHash": f"0x{page}-{i}"} for i in range(1, 32)]
+            for page in range(3)
+        ]  # three full pages, then the tape runs out
+        api = FakeTradesAPI(pages)
+        with tempfile.TemporaryDirectory() as tmp:
+            with Store(Path(tmp) / "t.db") as store:
+                kept, _ = discover(FakeAPI([_cincinnati_atp()]), _live_board())
+                market = kept[0]
+                cid = market.condition_id
+                poller = Poller(api, store, scores=FakeFlashscore())
+                poller.refresh()
+                poller._state[cid] = "live"
+
+                written = poller.poll_trades({cid}, tick_id=1000)
+                check("poll walked every page: full of new prints", written == 93)
+                check("walked pages until one came back empty", len(api.calls) == 4)
+                check("one batched request carries the match", api.calls[0][0] == [cid])
+                check("pages are walked by offset", [c[1] for c in api.calls] == [0, 31, 62, 93])
+
+                written = poller.poll_trades({cid}, tick_id=1001)
+                check("a quiet tape writes nothing", written == 0)
+                check("re-walking every page still leaves one print each",
+                      store.conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 93)
+
+                api.calls.clear()
+                poller_mod.TRADES_PAGE = 10**9  # one page now holds the whole tape
+                written = poller.poll_trades({cid}, tick_id=1002)
+                check("a short page stops the walk after page zero", len(api.calls) == 1)
+
+                print("\nbackfill-trades")
+                from polymarket.cli import backfill_trades
+
+                summary = backfill_trades(api, store, [cid])
+                check("backfill adds nothing when the store already has the tape",
+                      summary["inserted"] == 0)
+                check("and does not treat walking as writing", summary["markets"] == 1)
+
+                fresh = FakeTradesAPI([[{**TRADE, "transactionHash": f"0xback{i}"} for i in range(2)]])
+                summary = backfill_trades(fresh, store, [cid])
+                check("a backfill of unseen prints writes them", summary["inserted"] == 2)
+                check("and reports them per market", summary["per_market"] == [(cid, 2)])
+    finally:
+        poller_mod.TRADES_PAGE = original_page
+        poller_mod.TRADES_TICK_PAGES = original_pages
+
+
 if __name__ == "__main__":
     test_book()
     test_filters()
@@ -2290,4 +2415,5 @@ if __name__ == "__main__":
     test_stat_events()
     test_final_stats()
     test_stats_poll()
+    test_trades()
     print(f"\n{PASSED} checks passed\n")

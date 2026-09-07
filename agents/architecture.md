@@ -10,22 +10,21 @@ project is for, conventions, workflows).
 A Python CLI (`src/polymarket/`) polls the Polymarket CLOB for ATP and WTA tennis
 order books every 5 seconds while a match is being played -- every 60 seconds
 before it starts, never once it is over -- and, on the same tick, reads the live
-score and the match statistics from Flashscore. All three land in one SQLite
-file, plus a fourth thing that does not run on the tick at all: a finished
-match's per-set statistics, collected an hour after it ended. A FastAPI dashboard
+score and the match statistics from Flashscore, and the trade tape from
+Polymarket's Data API. All four land in one SQLite file, plus a fifth thing that
+does not run on the tick at all: a finished match's per-set statistics, collected
+an hour after it ended. A FastAPI dashboard
 (`src/polymarket/dashboard/`) serves that file read-only to a React + Lightweight
-Charts front end (`frontend/`, built into the Python package). `docker compose`
-runs the capture and the dashboard as two containers off one image, plus an
-optional Cloudflare tunnel. `flashscore-scraper/` is a **separate, standalone**
+Charts front end (`frontend/`, built into the Python package). `flashscore-scraper/` is a **separate, standalone**
 package — a fuller Flashscore client that is not imported by anything in `src/`.
 
 ## Repository map
 
 ```
 src/polymarket/            the package; `polymarket` console script -> cli.main
-  cli.py                   argparse; subcommands discover/run/dashboard/stats/sql/clean-scores
+  cli.py                   argparse; subcommands discover/run/dashboard/stats/sql/backfill-trades/clean-scores
   config.py                all tunables + the two tournament whitelists + regexes
-  api.py                   Polymarket: Gamma (catalog) and CLOB (books) HTTP client
+  api.py                   Polymarket: Gamma (catalog), CLOB (books) and Data API (trades) HTTP client
   book.py                  Snapshot dataclass; parse_book() normalises a raw book
   discovery.py             TennisMarket; the three gates that pick tour-level singles
   scores.py                Flashscore feeds, pairing, Ratchet/StatRatchet. The subtlest file here.
@@ -43,7 +42,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, MatchStats, TimeSeriesChart,
                            OrderBook, Sparkline, TableView
-tests/test_offline.py      ~455 assertions, no network, plain `python` script
+tests/test_offline.py      ~496 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -67,6 +66,7 @@ Flashscore day card f_2_… ───┘         (3 gates + ScoreBoard.pair)
     CLOB POST /books (batched 50) ──> parse_book ──> Poller._changed ──> books
     Flashscore df_sur_2_<id> (+ dc_2_<id>) ──> Ratchet ──> markets, score_events
     Flashscore df_st_2_<id> ──> parse_stats ──> StatRatchet ──> stat_events
+    Data API GET /trades (due cids, csv) ──> TradeRow ──> trades  (venue ts, not tick ts)
                                                 │
   once, 1h after a match ends:                  │
     Flashscore df_st_2_<id> ──> every period ──> set_stats
@@ -116,22 +116,35 @@ Each iteration, in order:
    otherwise spend most of a tick to learn nothing — and that tick is what the
    books are written on. A match that moved from live to ended in the preceding
    score poll gets one forced statistics read, bypassing the floor, so its final
-   point is not lost when the next tick retires it.
-4. **`collect_final_stats()`** — once a minute (`FINAL_STATS_CHECK`), not once a
+    point is not lost when the next tick retires it.
+4. **`poll_trades(due)`** — one batched `GET {DATA_API}/trades` per tick
+   (all due condition ids comma-separated; taker prints only). Continued page by
+   page only while pages come back full of rows the store has never seen --
+   after a restart or an outage the gap can be thousands of prints deep, and
+   "nothing new on this page" is the stop signal, which needs no memory between
+   ticks or restarts because each print is stored under the venue's own trade
+   identity. `--no-trades` drops the step. The rows are keyed to the **venue's**
+   timestamp, not the tick's: a print happened when Polymarket settled it, and
+   a maker-fill model reads it at that time. This is the deliberate exception to
+   invariant 1, and the reason the tape is polled rather than scraped off the
+   CLOB's `last_trade_price`, which says what the newest trade cost but neither
+   how large it was nor which way it was attacked. Wrapped like every other
+   step; a failed tape poll must not cost a book.
+5. **`collect_final_stats()`** — once a minute (`FINAL_STATS_CHECK`), not once a
    tick. `store.matches_awaiting_set_stats` is the queue: matches that ended
    more than `FINAL_STATS_DELAY`=1h ago, less than `FINAL_STATS_WINDOW`=24h ago,
    with a stored `flashscore_id`, an oriented `flashscore_flip`, and no
    `set_stats` rows yet. `FINAL_STATS_BATCH`=4 at a time. The queue is a query
    over the database rather than a timer in memory, so a restart does not lose
    it and re-running writes one row per period rather than two.
-5. **`_refresh_due()`** — refresh when the interval elapses, **or** when a match
+6. **`_refresh_due()`** — refresh when the interval elapses, **or** when a match
    changed state (rate-limited to `MIN_REFRESH_GAP`=60s, since a refresh pages
    the whole tennis catalog), **or** at `_next_start`, the scheduled start of the
    next upcoming match plus `START_GRACE`.
 
-`tick()`, `poll_scores()`, `poll_stats()` and `collect_final_stats()` are each
-wrapped so no exception can kill the capture; the books matter more than the
-score, and the score more than the statistics.
+`tick()`, `poll_scores()`, `poll_stats()`, `poll_trades()` and
+`collect_final_stats()` are each wrapped so no exception can kill the capture;
+the books matter more than the score, and the score more than the statistics.
 
 `refresh()` reloads the day card, re-runs `discover`, rebuilds `self.tracked`
 (token id -> `Tracked`) and `self.watched` (condition id -> `Watched`, only for
@@ -236,6 +249,7 @@ One SQLite file, WAL, `synchronous=NORMAL`, `isolation_level=None`.
 | `score_events` | one row per *change* of (state, period, score, game, serving) | `PRIMARY KEY (condition_id, ts)`; `tick_id` is NULL for refresh-created rows outside a capture tick |
 | `stat_events` | one row per *change* of the running match statistics | `PRIMARY KEY (condition_id, ts)`; `tick_id` joins the pass to books/scores; the feed's **overall** block only. No heartbeat |
 | `set_stats` | one row per (match, period), written once an hour after the match | `PRIMARY KEY (condition_id, period)`; `INSERT OR REPLACE`, so collecting twice leaves one row. The per-set rows sum to the `Match` row, which is what makes it a check on `stat_events` |
+| `trades` | one row per taker fill | `PRIMARY KEY (transaction_hash, wallet, side, outcome_index)`, `INSERT OR IGNORE` (replaying any page is free); `ts` is the **venue's** settlement time, `tick_id` when we first saw it. Indexed on `(condition_id, ts)` for the time-window join |
 | `quotes` | view | spells out direction: `buy_price = best_ask`, `sell_price = best_bid` |
 
 Column lists are **generated**: `BOOK_COLUMNS` from `BOOK_DEPTH` via
@@ -411,7 +425,12 @@ only activates when the system resolver fails. See `DNS.md`.
    qualification, and it does not weaken this: it drops whole statistics reads,
    so a statistics row is still written on a tick that read that match's book
    and score. Each feed keeps its own `ts`; the integer `tick_id` made once at
-   the start of the pass is the exact join key.
+   the start of the pass is the exact join key. The **trade tape is the one
+   deliberate exception** -- it rides the `due` set for cadence but is stored
+   under the venue's own settlement timestamp, because a print happened when
+   Polymarket settled it and a fill model reads it at that time; `books`,
+   `score_events` and `stat_events` are observations the capture makes, `trades`
+   are facts the venue already dated.
 2. **Score and statistics reads stay on one connection, sequential.** See
    `Flashscore.__init__`; `stat_readings` is a loop for the same reason
    `readings` is.
@@ -421,9 +440,11 @@ only activates when the system resolver fails. See `DNS.md`.
 5. **`market_last_trade` is per match**; orientation is an inference and must
    ship with `last_trade_raw` and a caveat.
 6. **The store's schema only grows**; `_migrate()` must keep opening old files.
-7. **`books` writes are `INSERT OR REPLACE` on (token_id, ts)** — replaying a tick
-   is idempotent.
-8. **The dashboard is read-only** apart from the one startup migration.
+ 7. **`books` writes are `INSERT OR REPLACE` on (token_id, ts)** — replaying a tick
+    is idempotent. **`trades` writes are `INSERT OR IGNORE` on the venue's own
+    trade identity** — replays of a poll or a backfill neither duplicate a print
+    nor overwrite one already stored.
+ 8. **The dashboard is read-only** apart from the one startup migration.
 9. **The committed bundle under `dashboard/static/` must match `frontend/src`** —
    rebuild and commit it, or the served UI silently lags the source.
 10. **Staleness is judged on in-play books only.** Both cadences share one loop,
@@ -449,6 +470,7 @@ only activates when the system resolver fails. See `DNS.md`.
 | Capture a new field per tick | `book.Snapshot` + `parse_book` -> `store.BOOK_COLUMNS` + `insert_snapshots` -> `queries._BOOK_FIELDS` -> `types.ts` |
 | Handle a new Flashscore status | `scores._STATUS` / `_STAGE` |
 | Record a statistic the feed has started carrying | add a `Statistic` to `config.STATISTICS` — `store.STAT_COLUMNS` and both tables follow, and the DB migrates itself; the log line "no column for ..." is what tells you one is missing |
+| Change the trade-tape cadence or page size | `config.TRADES_PAGE` / `TRADES_TICK_PAGES`; `store.record_trades` stays idempotent under any of it |
 | Change when the per-set statistics are collected | `config.FINAL_STATS_DELAY` / `_WINDOW` / `_CHECK` / `_BATCH` |
 | New API endpoint | `dashboard/app.py` + a function in `queries.py` + `types.ts` + `api.ts` |
 | New chart or panel | `frontend/src/components/`, then `npm run build` and commit `static/` |

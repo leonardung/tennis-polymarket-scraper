@@ -19,6 +19,7 @@ from .api import Polymarket
 from .config import (
     BOOK_DEPTH,
     CLOB,
+    DATA_API,
     FINAL_STATS_DELAY,
     FLASHSCORE_HOST,
     GAMMA,
@@ -29,11 +30,12 @@ from .config import (
     STALE_AFTER,
     STATS_INTERVAL,
     TOURS,
+    TRADES_PAGE,
 )
 from .discovery import discover
 from .poller import Poller
 from .scores import Flashscore
-from .store import Store
+from .store import Store, TradeRow
 
 DEFAULT_DB = "data/tennis.db"
 
@@ -119,18 +121,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             live_only=not args.include_upcoming,
             only_changes=not args.every_tick,
             record_stats=not args.no_stats,
+            record_trades=not args.no_trades,
             stats_interval=args.stats_interval,
             heartbeat=args.heartbeat,
             stale_after=args.stale_after,
             tours=_tours(args),
         )
         logging.info(
-            "capturing depth-%d %s books, scores%s into %s: every %.0fs while a match "
+            "capturing depth-%d %s books, scores%s%s into %s: every %.0fs while a match "
             "is in play, every %.0fs before it starts, never once it is over "
             "(%s matches, %s)",
             BOOK_DEPTH,
             "/".join(t.upper() for t in _tours(args)),
             "" if args.no_stats else " and match statistics",
+            "" if args.no_trades else " and trade prints",
             args.db,
             args.interval,
             args.idle_interval,
@@ -198,6 +202,97 @@ def cmd_clean_scores(args: argparse.Namespace) -> int:
     return 0
 
 
+def backfill_trades(
+    api: Polymarket, store: Store, condition_ids: list[str]
+) -> dict[str, object]:
+    """Walk every print of every market given, storing what was not there yet.
+
+    Idempotent by construction -- the store's primary key is the venue's own
+    trade identity -- so it is safe to run again, and its `inserted` count is
+    exactly what was missing rather than what was walked.
+
+    One market is hundreds to a couple thousand prints; a page of 1000 covers
+    most matches in two requests. Pages are walked while the venue keeps
+    answering, which means the tape's depth decides the request count, not a
+    poll-interval bookkeeping.
+    """
+    total = 0
+    per_market: list[tuple[str, int]] = []
+    capped: list[str] = []
+    for condition_id in condition_ids:
+        inserted = 0
+        offset = 0
+        while True:
+            try:
+                payload = api.trades([condition_id], offset=offset)
+            except httpx.HTTPStatusError as exc:
+                # The endpoint refuses offsets past 10,000 on market-scoped
+                # reads rather than clamping them. A match that deep in the
+                # tape is rare; stopping it here names it and keeps the rest
+                # of the walk going instead of losing every market behind it.
+                print(f"  {condition_id}: refused at offset {offset} ({exc.response.status_code})")
+                capped.append(condition_id)
+                break
+            if not payload:
+                break
+            rows = [row for row in (TradeRow.of(item) for item in payload) if row]
+            inserted += store.record_trades(rows)
+            if len(payload) < TRADES_PAGE:
+                break
+            offset += len(payload)
+        per_market.append((condition_id, inserted))
+        total += inserted
+    return {
+        "markets": len(condition_ids),
+        "inserted": total,
+        "per_market": per_market,
+        "capped": capped,
+    }
+
+
+def cmd_backfill_trades(args: argparse.Namespace) -> int:
+    """Fill the trade tape for markets that may predate `run` and the tape.
+
+    The capture polls only matches in play, so every match that ended before
+    trades were recorded has no tape --
+    but the Data API keeps what the venue settled, past ones included, and this
+    walks each stored market's whole history into the same idempotent store.
+    Safe beside a running capture: the writes are INSERT OR IGNORE keyed on the
+    venue's own identity, and each market's pages are committed as they land.
+    Does nothing without `--apply`.
+    """
+    if not args.apply:
+        print(
+            "\nnothing changed -- pass --apply to write the tape\n", file=sys.stderr
+        )
+        return 0
+
+    tour = None if args.tour == "both" else args.tour
+    with Polymarket() as api, Store(args.db) as store:
+        condition_ids = store.markets_for_trade_backfill(tour=tour, limit=args.limit)
+        if not condition_ids:
+            print("\nno markets recorded yet -- has `run` been started?\n")
+            return 0
+        print(f"backfilling trade prints for {len(condition_ids)} market(s)...")
+        summary = backfill_trades(api, store, condition_ids)
+
+    inserted = int(summary["inserted"])
+    by_market = list(summary["per_market"])  # (condition_id, inserted)
+    loud = [(cid, n) for cid, n in by_market if n]
+    print(f"\n{summary['markets']} market(s), {inserted} print(s) new")
+    for cid, n in loud[:10]:
+        print(f"  {cid}: {n}")
+    if len(loud) > 10:
+        print(f"  ... and {len(loud) - 10} more with prints")
+    print(f"markets with nothing to add: {len(by_market) - len(loud)}")
+    capped = list(summary.get("capped", []))
+    if capped:
+        print(f"\nmarkets the endpoint refused to page deeper on ({len(capped)}):")
+        for cid in capped[:10]:
+            print(f"  {cid}")
+    return 0
+
+
 def _capture_is_idle(db: str) -> bool:
     """True if nothing has written to the database in the last minute.
 
@@ -226,6 +321,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"markets   {stats['markets']}")
     print(f"snapshots {stats['snapshots']}")
     print(f"stats     {stats['stat_events']} change(s), {stats['set_stats']} match(es) with final per-set")
+    print(f"trades    {stats['trades']}")
     print(f"window    {fmt(stats['first_ts'])} -> {fmt(stats['last_ts'])}\n")
     rows = stats["by_tournament"]
     if isinstance(rows, list) and rows:
@@ -388,6 +484,12 @@ def main(argv: list[str] | None = None) -> int:
         f"per-set reading {FINAL_STATS_DELAY / 3600:.0f}h after each match ends",
     )
     p_run.add_argument(
+        "--no-trades",
+        action="store_true",
+        help="do not record trade prints -- per-trade price, size and taker direction "
+        "off the Data API. They cost one extra batched read per tick",
+    )
+    p_run.add_argument(
         "--stats-interval",
         type=float,
         default=STATS_INTERVAL,
@@ -445,6 +547,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fill.set_defaults(func=cmd_backfill_book_ts, needs_network=False)
 
+    p_trades = sub.add_parser(
+        "backfill-trades",
+        parents=[common],
+        help="fill the trade tape of finished matches that were captured before it",
+    )
+    p_trades.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write them; without this it prints nothing at all",
+    )
+    p_trades.add_argument(
+        "--limit",
+        type=int,
+        help="at most this many markets, oldest first, for a rate-limited run",
+    )
+    p_trades.set_defaults(func=cmd_backfill_trades, needs_network=True)
+
     p_sql = sub.add_parser(
         "sql", parents=[common], help="query the database (read-only, safe while recording)"
     )
@@ -470,6 +589,7 @@ def main(argv: list[str] | None = None) -> int:
             [
                 urlparse(GAMMA).hostname or "",
                 urlparse(CLOB).hostname or "",
+                urlparse(DATA_API).hostname or "",
                 urlparse(FLASHSCORE_HOST).hostname or "",
             ],
             args.dns,
