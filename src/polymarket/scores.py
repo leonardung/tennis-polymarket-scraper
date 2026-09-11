@@ -57,6 +57,8 @@ from typing import Iterable, Sequence
 
 import httpx
 
+from .telemetry import measured_request
+
 from .config import (
     FLASHSCORE_DAYS,
     FLASHSCORE_HOST,
@@ -772,12 +774,29 @@ class Flashscore:
         self.close()
 
     def _get(self, feed: str, timeout: float | None = None) -> str:
-        response = self._client.get(
+        return self._text(self._send(feed, timeout))
+
+    def _send(self, feed: str, timeout: float | None = None):
+        return self._client.get(
             f"{FLASHSCORE_HOST}/{SPORT}/x/feed/{feed}",
             **({"timeout": timeout} if timeout is not None else {}),
         )
+
+    @staticmethod
+    def _text(response) -> str:
         response.raise_for_status()
         return response.text
+
+    def _reading_request(self, feed, match_id, path, timeout, parser, present):
+        # Payload-only overrides still work, but cannot establish an HTTP
+        # boundary. Native requests timestamp the return before status/text
+        # decoding, including when that decoding later fails.
+        if getattr(self._get, "__func__", None) is not Flashscore._get:
+            return parser(self._get(path, timeout=timeout))
+        return measured_request(
+            self, feed, [match_id], lambda: self._send(path, timeout),
+            lambda response: parser(self._text(response)), present,
+        )
 
     def board(self) -> ScoreBoard:
         """The tour-level singles card, both tours, across the configured days.
@@ -813,13 +832,19 @@ class Flashscore:
         without its points is still a score, so a failure there is not allowed
         to lose the reading.
         """
-        base = parse_reading(self._get(f"df_sur_{SPORT}_{match_id}", timeout=SCORE_TIMEOUT))
+        base = self._reading_request(
+            "score_base", match_id, f"df_sur_{SPORT}_{match_id}", SCORE_TIMEOUT,
+            parse_reading, lambda value, _: value is not None,
+        )
         # Nobody is serving between sets, before the start or during a rain
         # delay, so there is nothing to ask the second feed for.
         if base is None or not in_a_game(base.period):
             return base
         try:
-            blocks = parse_blocks(self._get(f"dc_{SPORT}_{match_id}", timeout=SCORE_TIMEOUT))
+            blocks = self._reading_request(
+                "score_points", match_id, f"dc_{SPORT}_{match_id}", SCORE_TIMEOUT,
+                parse_blocks, lambda value, _: bool(value),
+            )
         except (httpx.HTTPError, ValueError) as exc:
             log.debug("score feed: no points for %s (%s)", match_id, exc)
             return base
@@ -858,7 +883,10 @@ class Flashscore:
         caller keeps is its own decision -- the capture writes the overall
         block on the tick and the sets once, an hour after the match.
         """
-        return parse_stats(self._get(f"df_st_{SPORT}_{match_id}", timeout=STATS_TIMEOUT))
+        return self._reading_request(
+            "statistics", match_id, f"df_st_{SPORT}_{match_id}", STATS_TIMEOUT,
+            parse_stats, lambda value, _: value is not None and value.overall is not None,
+        )
 
     def stat_readings(self, match_ids: Sequence[str]) -> dict[str, StatReading]:
         """Read several matches' statistics, one after another.

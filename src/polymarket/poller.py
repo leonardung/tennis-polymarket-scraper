@@ -4,13 +4,13 @@ Each match is read at its own cadence -- every tick while it is being played,
 every `idle_interval` before it starts, not at all once it is over. The grid
 itself never changes; `_due_matches` decides who is on it. Books, score and
 match statistics for one match are read in the same pass, so they share a
-timestamp.
+tick_id. Their measured response clocks remain separate.
 
 One thing runs on the grid but not on its clock: the trade tape. Each tick
 also asks the Data API for every print the matches on it produced, and stores
 those under the venue's own timestamps -- a print is when the venue settled it,
-not when we noticed. That is the only stream with more than one timestamp and
-no `ts` of ours, and it is why the tape is polled rather than parsed off the
+not when we noticed. Its `received_ts` records when we noticed, while `ts`
+retains the venue meaning. That is why the tape is polled rather than parsed off the
 book: the CLOB's `last_trade_price` says what the most recent print *cost* but
 neither how large it was nor which way it was attacked.
 
@@ -25,7 +25,8 @@ from __future__ import annotations
 import logging
 import signal
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import wraps
 from typing import Sequence
 
 import httpx
@@ -33,6 +34,7 @@ import httpx
 from .api import Polymarket
 from .book import Snapshot, parse_book
 from .config import (
+    BOOK_DEPTH,
     FINAL_STATS_BATCH,
     FINAL_STATS_CHECK,
     FINAL_STATS_DELAY,
@@ -55,7 +57,8 @@ from .config import (
 )
 from .discovery import discover, seconds_from_now
 from .scores import Flashscore, Paired, Ratchet, ScoreBoard, StatRatchet
-from .store import ScoreRow, StatRow, Store, TradeRow
+from .store import DEPTH_COLUMNS, STAT_COLUMNS, ScoreRow, StatRow, Store, TradeRow
+from .telemetry import drain, observations, received_at
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +97,134 @@ def _fingerprint(snap: Snapshot) -> tuple:
         tuple(snap.asks),
         snap.market_last_trade,
     )
+
+
+class _PollEvidence:
+    """Link a successful response only after its exact value was accepted.
+
+    The request owners know HTTP boundaries, while the poller knows ratchets
+    and market orientation. Keeping the join here preserves both meanings.
+    """
+
+    def __init__(self, poller, kind, due):
+        self.store = poller.store
+        self.kind = kind
+        self.client = poller.scores if kind in ("score", "statistics") else poller.api
+        self.mapping = {}
+        if kind == "trades":
+            self.mapping = {cid: [cid] for cid in due or ()}
+        self.before = {}
+        self.accepted = {}
+        self.rejected = set()
+        self.trade_outcomes = {}
+        self.trade_counts = {}
+        self.trade_errors = {}
+        self.pending_rows = None
+        self.pending_requests = set()
+
+    def target_matches(self, targets):
+        # A shared source ID does not imply that every derivative is due.
+        # Persist only the market projections actually requested by this poll.
+        self.mapping = {}
+        for watched in targets:
+            self.mapping.setdefault(watched.pairing.id, []).append(watched.condition_id)
+        self.snapshot_before()
+
+    def target_books(self, targets):
+        self.mapping = {token: [meta.condition_id] for token, meta in targets.items()}
+        self.snapshot_before()
+
+    def snapshot_before(self):
+        self.before = {
+            (target, cid): self.latest(target, cid)
+            for target, cids in self.mapping.items() for cid in cids
+        }
+
+    def latest(self, target, cid):
+        if self.kind == "score":
+            table, key, value = "score_events", "condition_id", cid
+            columns = "state, period, score, game, serving"
+        elif self.kind == "statistics":
+            table, key, value = "stat_events", "condition_id", cid
+            columns = ", ".join(STAT_COLUMNS)
+        else:
+            table, key, value = "books", "token_id", target
+            columns = ", ".join(["best_bid", "best_ask", *DEPTH_COLUMNS, "market_last_trade"])
+        return self.store.conn.execute(
+            f"SELECT ts, {columns} FROM {table} WHERE {key} = ? ORDER BY ts DESC LIMIT 1",
+            (value,),
+        ).fetchone()
+
+    def confirm(self, target, cid, observed):
+        current = self.latest(target, cid)
+        previous = self.before.get((target, cid))
+        if current is not None and current[1:] == observed:
+            outcome = "unchanged" if previous is not None and previous[1:] == current[1:] else "changed"
+            self.accepted[(target, cid)] = (outcome, current[0])
+
+    def persist(self):
+        if self.pending_rows is None:
+            self.pending_rows = self.mapped_rows()
+        if self.pending_rows:
+            self.store.record_feed_polls(self.pending_rows)
+        # Keep both mapped linkage and raw requests until SQL succeeds. A
+        # partial executemany is retried under the same idempotent request IDs.
+        self.client._request_observations = [
+            item for item in observations(self.client)
+            if item.request_id not in self.pending_requests
+        ]
+
+    def mapped_rows(self):
+        rows = []
+        for observation in observations(self.client):
+            self.pending_requests.add(observation.request_id)
+            for cid in self.mapping.get(observation.target_id, ()):
+                outcome, value_ts, error = observation.outcome, None, observation.error
+                error = error or self.trade_errors.get((observation.request_id, cid))
+                if outcome == "changed":
+                    if (observation.target_id, cid) in self.rejected:
+                        outcome = "rewind"
+                    elif self.kind == "trades":
+                        outcome = self.trade_outcomes.get((observation.request_id, cid), "error")
+                    else:
+                        outcome, value_ts = self.accepted.get((observation.target_id, cid), ("error", None))
+                    if outcome == "error" and error is None:
+                        error = "response was not accepted into the value store"
+                rows.append((
+                    observation.request_id, observation.feed, observation.target_id,
+                    cid, observation.request_ts, observation.received_ts,
+                    outcome, value_ts, error, observation.duration_seconds,
+                    *self.trade_counts.get((observation.request_id, cid), (None, None)),
+                ))
+        return rows
+
+
+def _capture_poll(kind):
+    """Flush even when the existing capture path raises or returns no values."""
+    def decorate(method):
+        @wraps(method)
+        def wrapped(self, *args, **kwargs):
+            pending = getattr(self, "_pending_evidence", [])
+            self._pending_evidence = pending
+            while pending:
+                pending[0].persist()
+                pending.pop(0)
+            evidence = _PollEvidence(self, kind, kwargs.get("due", args[0] if args else None))
+            # Other callers (for example final set statistics) may have used
+            # the same client. Their observations cannot confirm this poll.
+            drain(evidence.client)
+            self._evidence = evidence
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                pending.append(evidence)
+                try:
+                    evidence.persist()
+                    pending.remove(evidence)
+                finally:
+                    self._evidence = None
+        return wrapped
+    return decorate
 
 
 class Poller:
@@ -389,6 +520,7 @@ class Poller:
                 targets.append(watched)
         return targets
 
+    @_capture_poll("score")
     def poll_scores(
         self, due: set[str] | None = None, tick_id: int | None = None
     ) -> int:
@@ -399,6 +531,7 @@ class Poller:
         targets = self._score_targets(due)
         if not targets:
             return 0
+        self._evidence.target_matches(targets)
 
         # With --all-markets a match's derivatives share its Flashscore id, so
         # the feed is read once and applied to each market that wants it.
@@ -415,6 +548,7 @@ class Poller:
             # A read that has gone backwards is a stale copy of the feed, not
             # news; writing it turns one game into three score changes.
             if not self.ratchet.accept(watched.condition_id, reading):
+                self._evidence.rejected.add((watched.pairing.id, watched.condition_id))
                 continue
             rows.append(
                 ScoreRow(
@@ -424,6 +558,7 @@ class Poller:
                     score=watched.pairing.render(reading),
                     game=watched.pairing.render_game(reading),
                     serving=watched.pairing.render_server(reading),
+                    received_ts=received_at(self.scores, watched.pairing.id, ("score_base", "score_points")),
                 )
             )
         if not rows:
@@ -431,6 +566,9 @@ class Poller:
 
         self.store.update_scores(rows)
         written = self.store.record_score_events(rows, tick_id=tick_id)
+        for row in rows:
+            self._evidence.confirm(self.watched[row.condition_id].pairing.id, row.condition_id,
+                                   (row.state, row.period, row.score, row.game, row.serving))
 
         moved = []
         for row in rows:
@@ -515,6 +653,7 @@ class Poller:
             targets.append(watched)
         return targets
 
+    @_capture_poll("statistics")
     def poll_stats(
         self,
         due: set[str] | None = None,
@@ -534,6 +673,7 @@ class Poller:
         targets = self._stat_targets(due, finishing)
         if not targets:
             return 0
+        self._evidence.target_matches(targets)
 
         readings = self.scores.stat_readings(sorted({w.pairing.id for w in targets}))
 
@@ -545,22 +685,25 @@ class Poller:
             # A read whose match totals cover fewer points than one already
             # taken is a stale copy of the feed, not a correction.
             if not self.stat_ratchet.accept(watched.condition_id, reading):
+                self._evidence.rejected.add((watched.pairing.id, watched.condition_id))
                 continue
             overall = reading.overall
             if overall is None:
                 continue
             rows.append(
-                StatRow.of(
+                replace(StatRow.of(
                     watched.condition_id,
                     overall,
                     flip=watched.pairing.flip,
                     digest=reading.digest,
-                )
+                ), received_ts=received_at(self.scores, watched.pairing.id, ("statistics",)))
             )
         if not rows:
             return 0
 
         written = self.store.record_stat_events(rows, tick_id=tick_id)
+        for row in rows:
+            self._evidence.confirm(self.watched[row.condition_id].pairing.id, row.condition_id, row.row())
         log.log(
             logging.INFO if written else logging.DEBUG,
             "stats: %d match(es) read, %d change(s)",
@@ -571,6 +714,7 @@ class Poller:
 
     # ---------------- trade prints ----------------
 
+    @_capture_poll("trades")
     def poll_trades(self, due: set[str] | None = None, tick_id: int | None = None) -> int:
         """Read the trade tape of the matches this tick is reading. Returns new rows.
 
@@ -594,15 +738,40 @@ class Poller:
         condition_ids = sorted(due)
         inserted = 0
         for page in range(TRADES_TICK_PAGES):
+            observation_start = len(observations(self.api))
             payload = self.api.trades(condition_ids, offset=page * TRADES_PAGE)
+            page_observations = observations(self.api)[observation_start:]
             if not payload:
+                for observation in page_observations:
+                    self._evidence.trade_counts[(observation.request_id, observation.target_id)] = (0, 0)
                 break
             rows = [TradeRow.of(item) for item in payload]
-            fresh = [row for row in rows if row is not None]
+            fresh = [replace(row, received_ts=received_at(self.api, row.condition_id, ("trades",)))
+                     for row in rows if row is not None]
             malformed = len(rows) - len(fresh)
             if malformed:
                 log.warning("trades: %d malformed row(s) refused", malformed)
-            inserted += self.store.record_trades(fresh, tick_id=tick_id)
+            bad_targets = [str(item.get("conditionId") or "") if isinstance(item, dict) else ""
+                           for item, row in zip(payload, rows) if row is None]
+            for cid in sorted(set(condition_ids) | {row.condition_id for row in fresh}):
+                selected = [row for row in fresh if row.condition_id == cid]
+                for observation in page_observations:
+                    if observation.target_id == cid:
+                        key = (observation.request_id, cid)
+                        self._evidence.trade_counts[key] = (len(selected), bad_targets.count(cid))
+                        if malformed:
+                            self._evidence.trade_errors[key] = (
+                                f"malformed page rows: {malformed}; target rows: {bad_targets.count(cid)}; "
+                                f"rows without target identity: {bad_targets.count('')}"
+                            )
+                count = self.store.record_trades(selected, tick_id=tick_id)
+                inserted += count
+                for observation in page_observations:
+                    if observation.feed == "trades" and observation.target_id == cid:
+                        self._evidence.trade_outcomes.setdefault(
+                            (observation.request_id, cid),
+                            "changed" if count else "unchanged" if selected else "error",
+                        )
             if len(payload) < TRADES_PAGE:
                 break  # the tape is caught up to the venue's newest print
         log.log(
@@ -678,6 +847,7 @@ class Poller:
 
     # ---------------- one snapshot ----------------
 
+    @_capture_poll("books")
     def tick(self, due: set[str] | None = None, tick_id: int | None = None) -> int:
         """Snapshot every book due this tick. Returns rows written.
 
@@ -692,17 +862,21 @@ class Poller:
         tokens = [token for token, meta in self.tracked.items() if meta.condition_id in due]
         if not tokens:
             return 0
+        self._evidence.target_books({token: self.tracked[token] for token in tokens})
         ts = time.time()
         started = time.monotonic()
         books = self.api.books(tokens)
 
         rows = []
         ages = []
+        snapshots = {}
         for token, book in books.items():
             meta = self.tracked.get(token)
             if meta is None:
                 continue
             snap = parse_book(token, book)
+            snap.received_ts = received_at(self.api, token, ("books",))
+            snapshots[token] = snap
             # Books of matches in play only, and every one read rather than only
             # the ones written -- a frozen feed writes nothing, so the skipped
             # books are the evidence. Restricted to live matches because the
@@ -717,6 +891,15 @@ class Poller:
         self._check_stale(ts, ages)
 
         written = self.store.insert_snapshots(ts, rows, tick_id=tick_id) if rows else 0
+        for snap, _, _, _ in rows:
+            self._last_fingerprint[snap.token_id] = _fingerprint(snap)
+            self._last_write[snap.token_id] = ts
+        for token, snap in snapshots.items():
+            levels = tuple(value for side in (snap.bids, snap.asks)
+                           for level in (side + [(None, None)] * BOOK_DEPTH)[:BOOK_DEPTH]
+                           for value in level)
+            self._evidence.confirm(token, self.tracked[token].condition_id,
+                                   (snap.best_bid, snap.best_ask, *levels, snap.market_last_trade))
         missing = len(tokens) - len(books)
         unchanged = len(books) - written
         waiting = len(self.tracked) - len(tokens)
@@ -780,8 +963,6 @@ class Poller:
         due = ts - self._last_write.get(token, 0.0) >= self.heartbeat
         if not due and self._last_fingerprint.get(token) == fingerprint:
             return False
-        self._last_fingerprint[token] = fingerprint
-        self._last_write[token] = ts
         return True
 
     # ---------------- loop ----------------

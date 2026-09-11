@@ -2409,6 +2409,455 @@ def test_trades() -> None:
         poller_mod.TRADES_TICK_PAGES = original_pages
 
 
+def _predecessor_store():
+    """Execute the exact, hash-pinned pre-availability writer, without network."""
+    import hashlib
+    import subprocess
+    import types
+
+    revision = "f258925fdc8cd8c75324aeeaa959d2cc98df5095"
+    source = subprocess.check_output(
+        ["git", "show", f"{revision}:src/polymarket/store.py"],
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert hashlib.sha256(source).hexdigest() == "8560fcf51c630c9e2e40dcc39fa604fe91bf5f970bd0353d0d7b190556b8577c"
+    module = types.ModuleType("polymarket._predecessor_store")
+    module.__package__ = "polymarket"
+    sys.modules[module.__name__] = module
+    exec(compile(source, f"{revision}:src/polymarket/store.py", "exec"), module.__dict__)
+    return module
+
+
+def test_availability_migration() -> None:
+    """Expand a real legacy shape, then run old explicit-column writers again."""
+    predecessor = _predecessor_store()
+
+    print("\navailability migration and rollback")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "legacy.db"
+        legacy = sqlite3.connect(path)
+        legacy.executescript(predecessor.SCHEMA)
+        inserts = {
+            "books": "INSERT INTO books (ts, token_id, condition_id) VALUES (?, 'token', 'm')",
+            "score_events": "INSERT INTO score_events (ts, condition_id, state) VALUES (?, 'm', 'live')",
+            "stat_events": "INSERT INTO stat_events (ts, condition_id, digest) VALUES (?, 'm', 'old')",
+            "trades": "INSERT INTO trades (ts, transaction_hash, wallet, side, outcome_index, condition_id) "
+                      "VALUES (?, ?, 'wallet', 'BUY', 0, 'm')",
+        }
+        columns = {}
+        before = {}
+        for table, sql in inserts.items():
+            legacy.execute(sql, (10, "old") if table == "trades" else (10,))
+            columns[table] = [r[1] for r in legacy.execute(f"PRAGMA table_info({table})")]
+            before[table] = legacy.execute(f"SELECT * FROM {table}").fetchall()
+        legacy.commit()
+        legacy.close()
+        for reopen in range(2):
+            with Store(path) as store:
+                for table in inserts:
+                    original = store.conn.execute(
+                        f"SELECT {', '.join(columns[table])} FROM {table} WHERE ts = 10"
+                    ).fetchall()
+                    check(f"{table}: legacy values survive open {reopen}", original == before[table])
+                    check(f"{table}: legacy receipt remains unknown {reopen}",
+                          store.conn.execute(f"SELECT received_ts FROM {table} WHERE ts = 10").fetchone() == (None,))
+                check("migration never invents historical polls", store.conn.execute("SELECT COUNT(*) FROM feed_polls").fetchone() == (0,))
+        legacy = sqlite3.connect(path)
+        for table, sql in inserts.items():
+            legacy.execute(sql, (20, "rollback") if table == "trades" else (20,))
+        legacy.commit()
+        legacy.close()
+        with Store(path) as store:
+            for table in inserts:
+                check(f"{table}: rollback writer remains readable on re-upgrade",
+                      store.conn.execute(f"SELECT ts, received_ts FROM {table} ORDER BY ts").fetchall() == [(10, None), (20, None)])
+            poll = ("request", "statistics", "fs", "m", 25, 27, "unchanged", 10, None)
+            store.record_feed_polls([poll, poll])
+            check("request retries persist one observation", store.conn.execute("SELECT COUNT(*) FROM feed_polls").fetchone() == (1,))
+
+
+def test_predecessor_writer_rollback() -> None:
+    from dataclasses import replace
+    from unittest.mock import patch
+    from polymarket.store import ScoreRow, StatRow
+
+    print("\nactual predecessor writer rollback")
+    predecessor = _predecessor_store()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "rollback.db"
+        with predecessor.Store(path) as old, patch("time.time", lambda: 10):
+            old.record_score_events([predecessor.ScoreRow("m", "live", "S1", "1-0")])
+            old.record_stat_events([predecessor.StatRow("m", "Match", {"aces_0": 1})])
+            old.insert_snapshots(10, [(parse_book("one", BOOK), "m", 0, "one")])
+            old.record_trades([predecessor.TradeRow.of({**TRADE, "timestamp": 10})])
+        tables = ("books", "score_events", "stat_events", "trades", "feed_polls")
+        with Store(path) as store, patch("time.time", lambda: 20):
+            store.record_score_events([ScoreRow("m", "live", "S1", "2-0", received_ts=19)])
+            store.record_stat_events([StatRow("m", "Match", {"aces_0": 2}, received_ts=19)])
+            store.insert_snapshots(20, [(replace(parse_book("one", BOOK), received_ts=21), "m", 0, "one")])
+            store.record_trades([replace(TradeRow.of({**TRADE, "timestamp": 20, "transactionHash": "measured"}), received_ts=21)])
+            store.record_feed_polls([("pinned", "statistics", "fs", "m", 18, 19, "changed", 20, None, 1, None, None)])
+            before = {table: store.conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+        with predecessor.Store(path) as old, patch("time.time", lambda: 30):
+            check("predecessor readers accept measured expanded rows", old.stats()["snapshots"] == 2 and old.stats()["trades"] == 2)
+            old.record_score_events([predecessor.ScoreRow("m", "live", "S1", "3-0")])
+            old.record_stat_events([predecessor.StatRow("m", "Match", {"aces_0": 3})])
+            old.insert_snapshots(30, [(parse_book("one", BOOK), "m", 0, "one")])
+            old.record_trades([predecessor.TradeRow.of({**TRADE, "timestamp": 30, "transactionHash": "rollback"})])
+        with Store(path) as store:
+            for table in tables:
+                existing = store.conn.execute(f"SELECT * FROM {table}" + (" WHERE ts <= 20" if table != "feed_polls" else "")).fetchall()
+                check(f"actual predecessor preserves measured {table}", existing == before[table])
+                if table != "feed_polls":
+                    check(f"actual predecessor writes nullable receipt in {table}", store.conn.execute(
+                        f"SELECT received_ts FROM {table} WHERE ts=30"
+                    ).fetchone() == (None,))
+
+
+def test_measured_requests_and_polls() -> None:
+    """Clock advances inside mock HTTP, proving each chunk/page/reading separately."""
+    import httpx
+    from unittest.mock import patch
+    from polymarket.api import Polymarket
+    from polymarket.poller import Tracked, Watched
+    from polymarket.scores import Flashscore, Paired, Reading
+
+    print("\nmeasured live request availability")
+    clock = [100.0]
+    mode = {"book": "ok", "score": "ok", "points": "ok", "stats": "ok", "trades": "ok"}
+    calls = []
+
+    def handler(request):
+        clock[0] += 2
+        path = request.url.path
+        calls.append((path, clock[0]))
+        if path.endswith("/books"):
+            token = json.loads(request.content)[0]["token_id"]
+            if mode["book"] == "error" and token == "two":
+                return httpx.Response(503)
+            return httpx.Response(200, json=[] if mode["book"] == "empty" else [{**BOOK, "asset_id": token}])
+        if path.endswith("/trades"):
+            if mode["trades"] == "error":
+                raise httpx.ReadTimeout("tape timeout", request=request)
+            offset = int(request.url.params["offset"])
+            return httpx.Response(200, json=[{**TRADE, "conditionId": "m", "transactionHash": f"tx{offset}"}]
+                                  if offset < 2 else [])
+        if "df_sur_" in path:
+            if mode["score"] == "error":
+                return httpx.Response(503)
+            raw = "AC÷17¬BA÷4¬BB÷3¬~" if mode["score"] == "ok" else "AC÷17¬BA÷1¬BB÷0¬~"
+            return httpx.Response(200, text=raw)
+        if "/dc_" in path:
+            return httpx.Response(503) if mode["points"] == "error" else httpx.Response(200, text=LIVE_FEED)
+        if "df_st_" in path:
+            if mode["stats"] == "error":
+                return httpx.Response(503)
+            if mode["stats"] == "empty":
+                return httpx.Response(200, text="")
+            points = 80 if mode["stats"] == "rewind" else 100
+            aces = "2" if mode["stats"] == "changed" else "1"
+            return httpx.Response(200, text=_stats_feed(("Match", [
+                ("Aces", aces, "2"), ("Total Points Won", f"50% (40/{points})", f"50% (40/{points})")
+            ])))
+        raise AssertionError(path)
+
+    api = Polymarket.__new__(Polymarket)
+    scores = Flashscore.__new__(Flashscore)
+    api._client = httpx.Client(transport=httpx.MockTransport(handler))
+    scores._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with tempfile.TemporaryDirectory() as tmp, patch("polymarket.telemetry.time.time", lambda: clock[0]), \
+            patch("polymarket.api.BOOKS_CHUNK", 1), patch("polymarket.api.TRADES_PAGE", 1), \
+            patch("polymarket.poller.TRADES_PAGE", 1):
+        path = Path(tmp) / "capture.db"
+        with Store(path) as store:
+            poller = Poller(api, store, scores=scores, stats_interval=0, heartbeat=10000)
+            poller.tracked = {token: Tracked("m", i, token, "match") for i, token in enumerate(("one", "two"))}
+            poller._state = {"m": "live", "derivative": "live", "n": "live"}
+            for cid, fid in (("m", "fs1"), ("derivative", "fs1"), ("n", "fs2")):
+                poller.watched[cid] = Watched(cid, Paired(fid, False, Reading("live", "S1"), "match"), None, "match")
+
+            check("both measured book chunks stored", poller.tick({"m"}) == 2)
+            check("book capture clock retained while receipts differ by chunk",
+                  store.conn.execute("SELECT ts, received_ts FROM books ORDER BY token_id").fetchall() == [(100, 102), (100, 104)])
+            check("book chunks have distinct request identities", store.conn.execute("SELECT COUNT(DISTINCT request_id) FROM feed_polls").fetchone() == (2,))
+            check("unchanged book creates no value row", poller.tick({"m"}) == 0)
+            check("unchanged book heartbeat links exact existing quote", store.conn.execute(
+                "SELECT outcome, value_ts FROM feed_polls WHERE feed='books' ORDER BY received_ts DESC LIMIT 2"
+            ).fetchall() == [("unchanged", 100), ("unchanged", 100)])
+            mode["book"] = "empty"
+            poller.tick({"m"})
+            check("missing book targets get empty outcomes", store.conn.execute(
+                "SELECT outcome, value_ts FROM feed_polls WHERE feed='books' ORDER BY received_ts DESC LIMIT 2"
+            ).fetchall() == [("empty", None), ("empty", None)])
+            mode["book"] = "error"
+            try:
+                poller.tick({"m"})
+                check("HTTP error must propagate", False)
+            except httpx.HTTPStatusError:
+                pass
+            check("book error persisted despite raised path", store.conn.execute(
+                "SELECT outcome, value_ts, error FROM feed_polls WHERE target_id='two' ORDER BY received_ts DESC LIMIT 1"
+            ).fetchone()[0:2] == ("error", None))
+
+            start = clock[0]
+            check("score writes each market including derivative", poller.poll_scores() == 3)
+            check("score availability measured per reading, not batch write", store.conn.execute(
+                "SELECT condition_id, ts, received_ts FROM score_events ORDER BY condition_id"
+            ).fetchall() == [("derivative", start + 8, start + 4), ("m", start + 8, start + 4), ("n", start + 8, start + 8)])
+            check("score requests stay sequential", [p.rsplit('/', 1)[-1] for p, _ in calls[-4:]] ==
+                  ["df_sur_2_fs1", "dc_2_fs1", "df_sur_2_fs2", "dc_2_fs2"])
+            check("one base request maps to both market identities", store.conn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT request_id) FROM feed_polls WHERE feed='score_base' AND target_id='fs1'"
+            ).fetchone() == (2, 1))
+            check("unchanged score does not duplicate", poller.poll_scores() == 0)
+            mode["score"] = "rewind"
+            check("score rewind does not write", poller.poll_scores() == 0)
+            check("score rewind cannot refresh either constituent", store.conn.execute(
+                "SELECT DISTINCT outcome, value_ts FROM feed_polls WHERE feed LIKE 'score_%' AND received_ts > ?", (clock[0] - 8,)
+            ).fetchall() == [("rewind", None)])
+            mode["score"], mode["points"] = "ok", "error"
+            poller.poll_scores()
+            check("optional points failures are durable", store.conn.execute(
+                "SELECT COUNT(*) FROM feed_polls WHERE feed='score_points' AND outcome='error'"
+            ).fetchone() == (3,))
+            check("partial score waits for optional failure completion", store.conn.execute(
+                "SELECT received_ts FROM score_events WHERE condition_id='n' ORDER BY ts DESC LIMIT 1"
+            ).fetchone() == (clock[0],))
+            mode["score"] = "error"
+            start = clock[0]
+            check("failed score base produces no value", poller.poll_scores() == 0)
+            check("failed base neither requests points nor links a value", store.conn.execute(
+                "SELECT DISTINCT feed, outcome, value_ts FROM feed_polls WHERE feed LIKE 'score_%' AND received_ts > ?", (start,)
+            ).fetchall() == [("score_base", "error", None)])
+            mode["score"], mode["points"] = "ok", "ok"
+            start = clock[0]
+            poller.poll_scores({"m"})
+            check("shared source does not invent an observation for a derivative not due", store.conn.execute(
+                "SELECT DISTINCT condition_id FROM feed_polls WHERE feed LIKE 'score_%' AND received_ts > ?", (start,)
+            ).fetchall() == [("m",)])
+
+            start = clock[0]
+            check("statistics first reading stored", poller.poll_stats() == 3)
+            check("statistics preserve per-request availability", store.conn.execute(
+                "SELECT condition_id, ts, received_ts FROM stat_events ORDER BY condition_id"
+            ).fetchall() == [("derivative", start + 4, start + 2), ("m", start + 4, start + 2), ("n", start + 4, start + 4)])
+            first_stat_ts = clock[0]
+            check("statistics unchanged creates heartbeat only", poller.poll_stats() == 0)
+            for outcome in ("rewind", "empty", "error"):
+                mode["stats"] = outcome
+                check(f"statistics {outcome} writes no value", poller.poll_stats() == 0)
+                check(f"statistics {outcome} has no freshness linkage", store.conn.execute(
+                    "SELECT DISTINCT outcome, value_ts FROM feed_polls WHERE feed='statistics' AND received_ts > ?", (clock[0] - 4,)
+                ).fetchall() == [(outcome, None)])
+            mode["stats"] = "changed"
+            check("new statistic creates new value", poller.poll_stats() == 3)
+            second_stat_ts = clock[0]
+            poller.poll_stats()
+            check("new unchanged response confirms only new value", store.conn.execute(
+                "SELECT DISTINCT value_ts FROM feed_polls WHERE feed='statistics' AND received_ts > ?", (clock[0] - 4,)
+            ).fetchall() == [(second_stat_ts,)] and second_stat_ts > first_stat_ts)
+            start = clock[0]
+            poller.poll_stats({"m"})
+            check("statistics maps only due derivative projections", store.conn.execute(
+                "SELECT DISTINCT condition_id FROM feed_polls WHERE feed='statistics' AND received_ts > ?", (start,)
+            ).fetchall() == [("m",)])
+
+            start = clock[0]
+            check("trade pages write each venue print", poller.poll_trades({"m"}) == 2)
+            trade_rows = store.conn.execute("SELECT ts, received_ts FROM trades ORDER BY transaction_hash").fetchall()
+            check("trade venue clock retained with individual page receipts", trade_rows ==
+                  [(TRADE["timestamp"], start + 2), (TRADE["timestamp"], start + 4)])
+            check("duplicate pages add no trades", poller.poll_trades({"m"}) == 0)
+            check("duplicate pages retain first receipt", store.conn.execute(
+                "SELECT ts, received_ts FROM trades ORDER BY transaction_hash"
+            ).fetchall() == trade_rows)
+            check("duplicate pages measured unchanged and last page empty", store.conn.execute(
+                "SELECT outcome FROM feed_polls WHERE feed='trades' ORDER BY received_ts DESC LIMIT 3"
+            ).fetchall() == [("empty",), ("unchanged",), ("unchanged",)])
+            mode["trades"] = "error"
+            try:
+                poller.poll_trades({"m"})
+                check("trade error must propagate", False)
+            except httpx.ReadTimeout:
+                pass
+            check("trade transport failure persisted in finally", store.conn.execute(
+                "SELECT outcome, value_ts FROM feed_polls WHERE feed='trades' ORDER BY received_ts DESC LIMIT 1"
+            ).fetchone() == ("error", None))
+            total = store.conn.execute("SELECT COUNT(*) FROM feed_polls").fetchone()
+        with Store(path) as reopened:
+            check("observations survive restart", reopened.conn.execute("SELECT COUNT(*) FROM feed_polls").fetchone() == total)
+            fake = FakeFlashscore(readings={"legacy": Reading("live", "S1")})
+            poller = Poller(FakeAPI([]), reopened, scores=fake)
+            poller.watched = {"legacy": Watched("legacy", Paired("legacy", False, Reading("live", "S1"), "match"), None, "match")}
+            poller.poll_scores()
+            check("legacy payload-only fake keeps receipt unknown", reopened.conn.execute(
+                "SELECT received_ts FROM score_events WHERE condition_id='legacy'"
+            ).fetchone() == (None,))
+            check("legacy fake never manufactures measured polls", reopened.conn.execute("SELECT COUNT(*) FROM feed_polls").fetchone() == total)
+    api.close()
+    scores.close()
+
+
+def test_capture_review_regressions() -> None:
+    from unittest.mock import patch
+    from polymarket.poller import Tracked, Watched
+    from polymarket.scores import Paired, Reading
+    from polymarket.telemetry import measured_request, observations
+
+    print("\ncapture failure recovery and exact confirmation")
+    clock = [100.0]
+    price = [0.4]
+    api = FakeAPI([])
+
+    def books(tokens):
+        def send():
+            clock[0] += 2
+            return {token: {"bids": [{"price": price[0], "size": 1}], "asks": []} for token in tokens}
+        return measured_request(api, "books", tokens, send, lambda value: value, lambda value, target: target in value)
+
+    api.books = books
+    with tempfile.TemporaryDirectory() as tmp, patch("time.time", lambda: clock[0]):
+        with Store(Path(tmp) / "failures.db") as store:
+            poller = Poller(api, store, scores=FakeFlashscore(), heartbeat=10000)
+            poller.tracked = {token: Tracked("m", i, token, "match") for i, token in enumerate(("one", "two"))}
+            poller.tick({"m"})
+            price[0] = 0.6
+            original_write = store.insert_snapshots
+            def fail_write(*args, **kwargs):
+                raise sqlite3.OperationalError("injected book write failure")
+            store.insert_snapshots = fail_write
+            try:
+                poller.tick({"m"})
+                check("injected write failure propagates", False)
+            except sqlite3.OperationalError:
+                pass
+            check("failed book batch leaves dedup fingerprint at stored quote", poller._last_fingerprint["one"][0] == 0.4)
+            store.insert_snapshots = original_write
+            check("identical retry of failed 0.6 response writes both quotes", poller.tick({"m"}) == 2)
+            check("failed response never refreshes stored 0.4", store.conn.execute(
+                "SELECT COUNT(*) FROM feed_polls WHERE received_ts > 102 AND value_ts=100"
+            ).fetchone() == (0,))
+            check("retry links 0.6, not old 0.4", store.conn.execute(
+                "SELECT DISTINCT b.best_bid FROM feed_polls p JOIN books b "
+                "ON b.token_id=p.target_id AND b.ts=p.value_ts WHERE p.received_ts=?", (clock[0],)
+            ).fetchall() == [(0.6,)])
+            # Even a stale external dedup cache cannot make a different value
+            # fresh: confirmation compares the response's exact stored fields.
+            price[0] = 0.8
+            with patch.object(poller, "_changed", return_value=False):
+                poller.tick({"m"})
+            check("mismatching response cannot confirm latest stored quote", store.conn.execute(
+                "SELECT DISTINCT outcome, value_ts FROM feed_polls WHERE received_ts=?", (clock[0],)
+            ).fetchall() == [("error", None)])
+
+            original_persist = store.record_feed_polls
+            def partial_persist(rows):
+                original_persist(rows[:1])
+                raise sqlite3.OperationalError("injected partial telemetry persistence")
+            store.record_feed_polls = partial_persist
+            try:
+                poller.tick({"m"})
+                check("injected telemetry error propagates", False)
+            except sqlite3.OperationalError:
+                pass
+            pending = poller._pending_evidence[0]
+            expected_rows = list(pending.pending_rows)
+            check("failed persistence retains raw requests and mapped linkage", len(observations(api)) == 2 and len(expected_rows) == 2)
+            store.record_feed_polls = original_persist
+            poller.tick(set())
+            persisted = store.conn.execute("SELECT * FROM feed_polls WHERE request_id=? ORDER BY target_id", (expected_rows[0][0],)).fetchall()
+            check("partial persistence retries idempotently with exact original linkage", persisted == sorted(expected_rows, key=lambda row: row[2]))
+            check("successful retry clears pending evidence", not poller._pending_evidence and not observations(api))
+
+            # Large discovery sets do not imply SQL work when nothing is due.
+            poller.watched = {str(i): Watched(str(i), Paired(str(i), False, Reading("live", "S1"), "match"), None, "match") for i in range(100)}
+            statements = []
+            store.conn.set_trace_callback(statements.append)
+            poller.tick(set())
+            poller.poll_scores(set())
+            poller.poll_stats(set())
+            poller.poll_trades(set())
+            store.conn.set_trace_callback(None)
+            check("no-op polls perform no SQLite statements", statements == [])
+
+            malformed = [{**TRADE, "conditionId": "m"}, {"conditionId": "m"}, {}, "garbage"]
+            def trades(cids, offset=0):
+                return measured_request(api, "trades", cids, lambda: malformed, lambda value: value,
+                                        lambda value, target: any(isinstance(item, dict) and item.get("conditionId") == target for item in value))
+            api.trades = trades
+            check("mixed malformed tape page still stores valid print", poller.poll_trades({"m"}) == 1)
+            diagnostic = store.conn.execute("SELECT accepted_count, rejected_count, error FROM feed_polls WHERE feed='trades'").fetchone()
+            check("trade telemetry counts valid and attributable malformed rows", diagnostic[:2] == (1, 1))
+            check("trade telemetry preserves unattributed malformed page count", "rows without target identity: 2" in diagnostic[2])
+
+
+def test_request_completion_clocks() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from polymarket.scores import Flashscore
+    from polymarket.telemetry import measured_request, observations, drain, received_at
+
+    print("\nHTTP completion, decode delays and clock adjustments")
+    wall, monotonic = [100.0], [10.0]
+    decode_error = [False]
+
+    class SlowResponse:
+        def raise_for_status(self):
+            wall[0] += 20
+            monotonic[0] += 20
+        @property
+        def text(self):
+            wall[0] += 30
+            monotonic[0] += 30
+            if decode_error[0]:
+                raise ValueError("injected response text decoding failure")
+            return MATCH_FEED
+
+    def send(*args, **kwargs):
+        wall[0] += 2
+        monotonic[0] += 2
+        return SlowResponse()
+
+    scores = Flashscore.__new__(Flashscore)
+    scores._client = SimpleNamespace(get=send)
+    with patch("time.time", lambda: wall[0]), patch("time.monotonic", lambda: monotonic[0]):
+        scores.reading("fs")
+        poll = drain(scores)[0]
+        check("Flashscore receipt precedes delayed status/text decoding", poll.received_ts == 102 and wall[0] == 152)
+        check("Flashscore duration excludes status/text decoding", poll.duration_seconds == 2)
+        decode_error[0] = True
+        start = wall[0]
+        try:
+            scores.reading("fs")
+            check("decode failure propagates", False)
+        except ValueError:
+            pass
+        poll = drain(scores)[0]
+        check("decode failure retains HTTP receipt and request duration", poll.outcome == "error" and poll.received_ts == start + 2 and poll.duration_seconds == 2)
+
+        owner = SimpleNamespace()
+        def decode(value):
+            wall[0] += 50
+            monotonic[0] += 50
+            raise ValueError("shared decoder failed")
+        start = wall[0]
+        try:
+            measured_request(owner, "books", ["x"], send, decode, lambda *_: True)
+        except ValueError:
+            pass
+        poll = drain(owner)[0]
+        check("shared decoder failure cannot move receipt to parse completion", poll.received_ts == start + 2 and poll.duration_seconds == 2)
+
+        def backwards_send():
+            wall[0] -= 40
+            monotonic[0] += 3
+            return "accepted"
+        measured_request(owner, "score_base", ["fs"], backwards_send, lambda value: value, lambda *_: True)
+        measured_request(owner, "score_points", ["fs"], backwards_send, lambda value: value, lambda *_: True)
+        check("wall-clock reversal keeps positive monotonic duration", [o.duration_seconds for o in observations(owner)] == [3, 3])
+        check("combined availability follows final request occurrence, not greatest clock", received_at(owner, "fs", ("score_base", "score_points")) == wall[0])
+
+
 if __name__ == "__main__":
     test_book()
     test_filters()
@@ -2443,4 +2892,9 @@ if __name__ == "__main__":
     test_final_stats()
     test_stats_poll()
     test_trades()
+    test_availability_migration()
+    test_measured_requests_and_polls()
+    test_predecessor_writer_rollback()
+    test_capture_review_regressions()
+    test_request_completion_clocks()
     print(f"\n{PASSED} checks passed\n")

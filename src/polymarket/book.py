@@ -20,6 +20,7 @@ class Snapshot:
     market_last_trade: float | None  # per-market, identical on both tokens
     book_hash: str | None
     api_timestamp: str | None
+    received_ts: float | None = None
 
     @property
     def book_ts(self) -> float | None:

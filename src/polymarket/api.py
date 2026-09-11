@@ -9,6 +9,7 @@ from typing import Any, Iterator
 import httpx
 
 from .config import BOOKS_CHUNK, CLOB, DATA_API, GAMMA, TRADES_PAGE
+from .telemetry import measured_request
 
 log = logging.getLogger(__name__)
 
@@ -97,11 +98,19 @@ class Polymarket:
         for start in range(0, len(token_ids), BOOKS_CHUNK):
             chunk = token_ids[start : start + BOOKS_CHUNK]
             body = [{"token_id": tid} for tid in chunk]
-            resp = self._client.post(f"{CLOB}/books", json=body)
-            resp.raise_for_status()
-            payload = resp.json()
-            if isinstance(payload, dict):
-                payload = payload.get("data") or []
+            def decode(resp):
+                resp.raise_for_status()
+                payload = resp.json()
+                return payload.get("data") or [] if isinstance(payload, dict) else payload
+
+            payload = measured_request(
+                self, "books", chunk,
+                lambda: self._client.post(f"{CLOB}/books", json=body), decode,
+                lambda values, target: any(
+                    str(b.get("asset_id") or b.get("assetId") or "") == target
+                    for b in values
+                ),
+            )
             for book in payload:
                 asset = str(book.get("asset_id") or book.get("assetId") or "")
                 if asset:
@@ -124,15 +133,20 @@ class Polymarket:
         resting price). `market` accepts a comma-separated list of condition ids,
         which is what keeps a tick's whole trade poll to one request.
         """
-        resp = self._client.get(
-            f"{DATA_API}/trades",
-            params={
+        def send():
+            return self._client.get(f"{DATA_API}/trades", params={
                 "market": ",".join(condition_ids),
                 "takerOnly": "true",
                 "limit": TRADES_PAGE,
                 "offset": offset,
-            },
+            })
+
+        def decode(resp):
+            resp.raise_for_status()
+            payload = resp.json()
+            return payload if isinstance(payload, list) else []
+
+        return measured_request(
+            self, "trades", condition_ids, send, decode,
+            lambda values, target: any(isinstance(v, dict) and str(v.get("conditionId")) == target for v in values),
         )
-        resp.raise_for_status()
-        payload = resp.json()
-        return payload if isinstance(payload, list) else []

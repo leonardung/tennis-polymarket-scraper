@@ -742,6 +742,70 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
 uv run python tests/test_offline.py   # ~496 checks, no network needed
 ```
 
+## Measured response availability and poll health
+
+New live captures append nullable `received_ts` to `books`, `score_events`,
+`stat_events` and `trades`. This is the measured response completion, in epoch
+seconds. A combined score becomes available after its last constituent request
+completes. The original `ts` columns keep their existing meanings: a book's
+pre-request capture clock, score/statistic write clocks, and the trade venue's
+clock. `book_ts` remains the venue's book clock; `book_ts_derived` still identifies
+reconstructed clocks. Flashscore provides no source event timestamp.
+
+`feed_polls` records every live HTTP request and target, including unchanged
+responses, missing targets, failures and ratchet rejections. Its columns are
+`request_id`, `feed`, `target_id`, `condition_id`, `request_ts`, `received_ts`,
+`outcome`, nullable `value_ts`, nullable `error`, nullable `duration_seconds`,
+and nullable `accepted_count` / `rejected_count`. The primary key is
+`(request_id, feed, target_id, condition_id)`. Feeds are `books`, `score_base`,
+`score_points`, `statistics` and `trades`. Book targets are token IDs, score and
+statistic targets are Flashscore IDs, and trade targets are condition IDs.
+Derivative markets share a request ID but retain separate condition IDs.
+
+Each actual book chunk and trade page has its own clocks. Flashscore base,
+points and statistics requests stay sequential and have separate clocks.
+Response clocks are taken at HTTP return, before status checks and text or
+payload decoding. `duration_seconds` measures HTTP elapsed time with a monotonic
+clock and excludes decoding; subtracting wall clocks is not a substitute when
+the system clock changes. A combined score uses its final actual request's
+receipt, even if that clock is numerically earlier than the preceding receipt.
+Outcomes are `changed`, `unchanged`, `empty`, `error` or `rewind`. Accepted score,
+statistic and book observations link `value_ts` to the stored row's original
+`ts`; only that value can be refreshed by an unchanged observation. Failed,
+empty and rejected responses never refresh it. Trade polls have no single
+value to link, so their `value_ts` stays NULL. Duplicate trades retain their
+original venue timestamp, identity and first measured receipt.
+
+Trade counts record valid parsed rows for each target (including duplicates)
+and malformed rows attributable to that target. Diagnostics in `error` also
+state the page's total malformed rows and rows without a target identity, so
+valid prints survive a partially malformed page. Those page-wide diagnostics
+are repeated per request target and must not be summed across targets. Counts
+stay NULL for other feeds and failed requests whose payload was unavailable.
+
+Confirmation compares the response with the exact stored values. Book dedup
+state advances only after a successful value write. If telemetry persistence
+fails, the poller retains the mapped evidence in memory and retries it under
+the same request IDs before the next poll; a partially written batch therefore
+adds no duplicate observations.
+
+Value age and observation age answer different questions. A quiet value may
+remain fresh through accepted heartbeats, while a failed poll confirms nothing.
+Legacy rows have NULL receipts and no invented heartbeats; historical change
+gaps cannot prove missed capture. Public trade receipt is evidence of observing
+the tape, never an acknowledgment of an own order.
+
+Opening an older database adds these columns and the poll table idempotently,
+without rewriting existing rows or keys. Rollback needs only the previous
+collector code or gitlink: retain the expanded database, whose nullable columns
+allow the old explicit-column inserts and readers to keep working. Never drop
+columns or backfill guessed receipts. Re-upgrading resumes the same additive
+migration. Deploying this collector to a remote capture host is a separate step.
+The offline rollback test executes the hash-pinned predecessor Store from Git
+commit `f258925fdc8cd8c75324aeeaa959d2cc98df5095` against expanded, populated
+tables, verifies its old readers and writers, and reopens them with current code.
+That local Git object is required to run this test; it needs no network.
+
 ## Working on the dashboard front end
 
 The dashboard is React + TypeScript, built with Vite, in `frontend/`. The build

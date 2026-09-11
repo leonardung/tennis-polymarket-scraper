@@ -30,6 +30,7 @@ class ScoreRow:
     score: str | None
     game: str | None = None  # points in the game being played, "30-40"
     serving: int | None = None  # which outcome is serving, by index
+    received_ts: float | None = None
 
     @classmethod
     def of(cls, market: TennisMarket) -> "ScoreRow":
@@ -58,6 +59,7 @@ class StatRow:
     period: str  # "Match", "Set 1", ...
     values: dict[str, float | None]
     digest: str | None = None
+    received_ts: float | None = None
 
     @classmethod
     def of(
@@ -123,6 +125,7 @@ BOOK_COLUMNS = [
     # blind to changes that happened while nothing was being recorded. NULL for
     # rows written before this column existed and never backfilled.
     "book_ts_derived",
+    "received_ts",
 ]
 
 
@@ -190,6 +193,7 @@ SCORE_EVENT_COLUMNS = [
     ("score", "TEXT"),
     ("game", "TEXT"),
     ("serving", "INTEGER"),
+    ("received_ts", "REAL"),
 ]
 
 
@@ -218,6 +222,7 @@ class TradeRow:
     outcome_index: int | None
     outcome: str | None
     ts: float
+    received_ts: float | None = None
 
     @classmethod
     def of(cls, payload: dict[str, Any]) -> "TradeRow | None":
@@ -268,6 +273,7 @@ TRADE_COLUMNS = [
     ("size", "REAL"),
     ("outcome_index", "INTEGER"),
     ("outcome", "TEXT"),
+    ("received_ts", "REAL"),
 ]
 
 _TEXT_COLUMNS = {"condition_id", "token_id", "outcome", "book_hash"}
@@ -310,10 +316,7 @@ CREATE TABLE IF NOT EXISTS score_events (
 -- feed's "Match" block only -- the totals as they stood at `ts` -- because
 -- that is the block that moves while the match is on.
 --
--- There is no heartbeat. A book that stops moving is ambiguous (a calm market
--- and a dead collector look alike), which is why one gets written anyway; a
--- statistic that stops moving is not, because `books` and `score_events` are
--- already recording on the same tick and say whether anything was running.
+-- Request heartbeats live in feed_polls. These rows still contain changes only.
 CREATE TABLE IF NOT EXISTS stat_events (
     ts             REAL,
     tick_id        INTEGER,
@@ -322,6 +325,7 @@ CREATE TABLE IF NOT EXISTS stat_events (
     -- write -- that is the stored values -- but it ties a row to one read.
     digest         TEXT,
 {",".join(chr(10) + f"    {col:<22} REAL" for col in STAT_COLUMNS)},
+    received_ts    REAL,
     PRIMARY KEY (condition_id, ts)
 ) WITHOUT ROWID;
 
@@ -417,6 +421,18 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS feed_polls (
+                request_id TEXT NOT NULL, feed TEXT NOT NULL,
+                target_id TEXT NOT NULL, condition_id TEXT NOT NULL,
+                request_ts REAL NOT NULL, received_ts REAL NOT NULL,
+                outcome TEXT NOT NULL, value_ts REAL, error TEXT,
+                duration_seconds REAL, accepted_count INTEGER, rejected_count INTEGER,
+                PRIMARY KEY (request_id, feed, target_id, condition_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS feed_polls_by_value
+            ON feed_polls(condition_id, feed, value_ts, received_ts);
+        """)
         self._migrate()
         self.conn.executescript(VIEWS)
 
@@ -441,7 +457,7 @@ class Store:
                 ("condition_id", "TEXT"),
                 ("digest", "TEXT"),
             ]
-            + [(col, "REAL") for col in STAT_COLUMNS],
+            + [(col, "REAL") for col in STAT_COLUMNS] + [("received_ts", "REAL")],
             "set_stats": [
                 ("condition_id", "TEXT"),
                 ("period", "TEXT"),
@@ -450,6 +466,8 @@ class Store:
             ]
             + [(col, "REAL") for col in STAT_COLUMNS],
             "trades": TRADE_COLUMNS,
+            "feed_polls": [("duration_seconds", "REAL"), ("accepted_count", "INTEGER"),
+                           ("rejected_count", "INTEGER")],
         }
         for table, columns in expected.items():
             present = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -459,6 +477,16 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    def record_feed_polls(self, rows: Iterable[tuple]) -> None:
+        """Persist observations idempotently without changing captured values."""
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO feed_polls "
+            "(request_id, feed, target_id, condition_id, request_ts, received_ts, "
+            "outcome, value_ts, error, duration_seconds, accepted_count, rejected_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [tuple(row) + (None,) * (12 - len(row)) for row in rows],
+        )
 
     def __enter__(self) -> "Store":
         return self
@@ -566,13 +594,13 @@ class Store:
             ).fetchone()
             if previous is not None and tuple(previous) == current:
                 continue
-            rows.append((now, tick_id, entry.condition_id, *current))
+            rows.append((now, tick_id, entry.condition_id, *current, entry.received_ts))
 
         if rows:
             self.conn.executemany(
                 "INSERT OR REPLACE INTO score_events "
-                "(ts, tick_id, condition_id, state, period, score, game, serving) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(ts, tick_id, condition_id, state, period, score, game, serving, received_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
         return len(rows)
@@ -604,10 +632,10 @@ class Store:
             ).fetchone()
             if previous is not None and tuple(previous) == current:
                 continue
-            payload.append((now, tick_id, entry.condition_id, entry.digest, *current))
+            payload.append((now, tick_id, entry.condition_id, entry.digest, *current, entry.received_ts))
 
         if payload:
-            columns = ["ts", "tick_id", "condition_id", "digest", *STAT_COLUMNS]
+            columns = ["ts", "tick_id", "condition_id", "digest", *STAT_COLUMNS, "received_ts"]
             self.conn.executemany(
                 f"INSERT OR REPLACE INTO stat_events ({', '.join(columns)}) "
                 f"VALUES ({', '.join('?' * len(columns))})",
@@ -726,7 +754,7 @@ class Store:
                 for i in range(BOOK_DEPTH):
                     price, size = side[i] if i < len(side) else (None, None)
                     values += [price, size]
-            values += [snap.market_last_trade, snap.book_hash, snap.book_ts, 0]
+            values += [snap.market_last_trade, snap.book_hash, snap.book_ts, 0, snap.received_ts]
             payload.append(tuple(values))
 
         placeholders = ",".join("?" * len(BOOK_COLUMNS))
@@ -768,6 +796,7 @@ class Store:
                 row.size,
                 row.outcome_index,
                 row.outcome,
+                row.received_ts,
             ) for row in rows],
         )
         return cursor.rowcount if cursor.rowcount > 0 else 0
