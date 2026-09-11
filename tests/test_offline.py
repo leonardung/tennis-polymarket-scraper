@@ -1623,6 +1623,32 @@ def test_dashboard_state() -> None:
     check("unknown state, no start time, stale", classify(None, None, stale, now) == "past")
 
 
+def test_dashboard_legacy_book_without_tick_id() -> None:
+    print("\nlegacy dashboard book")
+    import sqlite3
+    from polymarket.dashboard import queries
+
+    kept, _ = discover(FakeAPI([_cincinnati_atp()]), _live_board())
+    market = kept[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "legacy.db"
+        with Store(path) as store:
+            store.upsert_markets(kept)
+            store.insert_snapshots(1_800_000_000.0, [
+                (parse_book(market.tokens[0], BOOK), market.condition_id, 0, market.outcomes[0]),
+            ])
+        with sqlite3.connect(path) as conn:
+            conn.execute("DROP VIEW IF EXISTS quotes")
+            conn.execute("ALTER TABLE books DROP COLUMN tick_id")
+        conn = queries.connect(path)
+        try:
+            detail = queries.match_detail(conn, market.condition_id)
+            check("legacy book remains readable", detail["books"][0] is not None)
+            check("absent tick stays unknown", detail["books"][0]["tick_id"] is None)
+        finally:
+            conn.close()
+
+
 def test_last_trade_orientation() -> None:
     print("\nlast-trade orientation")
     from polymarket.dashboard.queries import _orient
@@ -2404,6 +2430,7 @@ if __name__ == "__main__":
     test_update_scores()
     test_prune_score_events()
     test_dashboard_state()
+    test_dashboard_legacy_book_without_tick_id()
     test_last_trade_orientation()
     test_dashboard_series()
     test_decimation()

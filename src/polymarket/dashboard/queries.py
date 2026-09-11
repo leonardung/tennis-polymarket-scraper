@@ -441,7 +441,7 @@ def _ladder(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
     return {
         "ts": row["ts"],
-        "tick_id": row["tick_id"],
+        "tick_id": row["tick_id"] if "tick_id" in row.keys() else None,
         "outcome": row["outcome"],
         "bid": row["best_bid"],
         "ask": row["best_ask"],
