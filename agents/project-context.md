@@ -98,6 +98,8 @@ uv run polymarket sql "SELECT ..."      # any query, read-only
 uv run polymarket clean-scores          # repair pre-ratchet score history
 uv run polymarket backfill-book-ts      # reconstruct book_ts for older rows
 uv run polymarket backfill-trades --apply  # walk the trade tape for stored markets
+uv run polymarket backfill-odds --apply    # closing odds for matches first seen in play
+uv run polymarket backfill-odds --all --apply  # pair the whole database first, from past daily lists
 ```
 
 `dashboard`, `stats` and `sql` open the file read-only and are safe to run beside
@@ -108,7 +110,7 @@ discover`.
 ## How to verify a change
 
 ```bash
-uv run python tests/test_offline.py     # 640 checks, no network
+uv run python tests/test_offline.py     # 655 checks, no network
 ```
 
 `tests/test_offline.py` is a **plain script, not pytest** — a flat list of
@@ -218,7 +220,10 @@ Other conventions:
   goes live (the `starting` set), which is its closing line. Do not read the
   absence of `odds` rows for a live match as a failure, and do not read a flat
   `odds` series as a market with no opinion. Because it is a pre-match product it
-  needs `--include-upcoming`; a live-only run records no odds and warns once.
+  needs `--include-upcoming`; a live-only run records no odds and warns once. A
+  match already in play when the capture started is paired (`tennisexplorer_id`
+  is set) but has no odds until `backfill-odds --apply` reads its page once for
+  the closing line.
 - **The odds page is scraped HTML, ~330 KB, and `parse_odds` is a regex.** A site
   redesign breaks it silently; the tell is `parse_odds` returning `None` (markup
   moved) rather than `[]` (tab present, nothing quoted). The page is broken into

@@ -8,7 +8,7 @@ import logging
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -32,7 +32,7 @@ from .config import (
     TOURS,
     TRADES_PAGE,
 )
-from .discovery import discover
+from .discovery import discover, parse_iso
 from .evidence import (
     DEFAULT_INTERVAL as EVIDENCE_INTERVAL,
     DEFAULT_MAX_REQUESTS,
@@ -46,8 +46,8 @@ from .evidence import (
 from .evidence_chain import RPC_URL
 from .poller import Poller
 from .scores import Flashscore
-from .store import Store, TradeRow
-from .tennisexplorer import TennisExplorer
+from .store import OddsRow, Store, TradeRow
+from .tennisexplorer import TeBoard, TennisExplorer
 
 DEFAULT_DB = "data/tennis.db"
 DEFAULT_EVIDENCE_DB = "data/exploratory-evidence.db"
@@ -339,6 +339,190 @@ def cmd_backfill_trades(args: argparse.Namespace) -> int:
     return 0
 
 
+def backfill_odds(
+    explorer: TennisExplorer,
+    store: Store,
+    markets: list[tuple[str, str, int, str]],
+    pause: float = 0.0,
+) -> dict[str, object]:
+    """Read one closing line per match from its already-known odds page.
+
+    The odds capture only reads a match while it is upcoming, so a match that
+    was already in play when the capture started has no rows -- but TennisExplorer
+    still serves the last pre-match line, which is the closing one. This reads
+    each of those pages once and stores that line.
+
+    Idempotent: `record_odds` writes only what differs from the stored line, so
+    running it again leaves one row per bookmaker. `markets` is
+    ``(condition_id, tennisexplorer_id, flip, question)``; `flip` is applied
+    here so the stored pair is in the market's own outcome order, exactly as the
+    live poll does.
+    """
+    total = 0
+    per_market: list[tuple[str, int]] = []
+    missing: list[str] = []
+    for condition_id, te_id, flip, question in markets:
+        quotes = explorer.odds(te_id)
+        if quotes is None:
+            missing.append(question)
+            per_market.append((condition_id, 0))
+            continue
+        rows = [
+            OddsRow(
+                condition_id=condition_id,
+                bookmaker=quote.bookmaker,
+                price_0=quote.away if flip else quote.home,
+                price_1=quote.home if flip else quote.away,
+                tennisexplorer_id=te_id,
+            )
+            for quote in quotes
+        ]
+        inserted = store.record_odds(rows)
+        total += inserted
+        per_market.append((condition_id, inserted))
+        if pause:
+            time.sleep(pause)
+    return {
+        "markets": len(markets),
+        "inserted": total,
+        "per_market": per_market,
+        "missing": missing,
+    }
+
+
+def pair_odds_backfill(
+    explorer: TennisExplorer,
+    store: Store,
+    markets: list[tuple[str, str, str, str | None, str | None, str, str]],
+    pause: float = 0.0,
+) -> dict[str, object]:
+    """Pair stored markets to TennisExplorer ids from their own day's list.
+
+    A market's page is not linked from anything Polymarket stores, so the id has
+    to be found the same way the live capture finds it -- by both players' names
+    on the day the match was played. The daily-list URL takes a date, so a past
+    day is read exactly like today's; the three days around the market's start
+    are cached and shared across markets on the same date, which is what keeps
+    the request count near one per tournament-day rather than per match.
+
+    Only an oriented pairing is stored. An ambiguous one is left NULL so a later
+    run may resolve it rather than writing a guess.
+
+    `markets` is ``(condition_id, question, tour, start_time, match_date,
+    outcome_0, outcome_1)`` as ``store.markets_missing_tennisexplorer`` returns
+    them. Returns counts plus the questions that would not pair.
+    """
+    loaded: dict[tuple[str, str], list] = {}
+    boards: dict[tuple[str, str], TeBoard] = {}
+
+    def day_matches(tour: str, when: datetime) -> list:
+        key = (tour, when.strftime("%Y-%m-%d"))
+        if key not in loaded:
+            try:
+                loaded[key] = explorer.daily(tour, when)
+            except (httpx.HTTPError, ValueError) as exc:
+                print(f"  {tour} {key[1]}: day list unavailable ({exc})")
+                loaded[key] = []
+            if pause:
+                time.sleep(pause)
+        return loaded[key]
+
+    def board_for(tour: str, when: datetime) -> TeBoard:
+        key = (tour, when.strftime("%Y-%m-%d"))
+        if key not in boards:
+            found: list = []
+            # +/-1 because the day list is bucketed by the site's own timezone.
+            for offset in (-1, 0, 1):
+                found += day_matches(tour, when + timedelta(days=offset))
+            boards[key] = TeBoard(found)
+        return boards[key]
+
+    updates: list[tuple[str, int, str]] = []
+    unpaired: list[str] = []
+    for condition_id, question, tour, start_time, match_date, first, second in markets:
+        when = parse_iso(start_time)
+        if when is None and match_date:
+            when = parse_iso(f"{match_date}T12:00:00Z")
+        if when is None:
+            unpaired.append(question)
+            continue
+        day = datetime.fromtimestamp(when, timezone.utc)
+        paired = board_for(tour, day).pair(tour, [first, second], when)
+        if paired is None or not paired.oriented:
+            unpaired.append(question)
+            continue
+        updates.append((paired.id, int(paired.flip), condition_id))
+
+    store.set_tennisexplorer(updates)
+    return {
+        "considered": len(markets),
+        "paired": len(updates),
+        "unpaired": unpaired,
+        "lists": len(loaded),
+    }
+
+
+def cmd_backfill_odds(args: argparse.Namespace) -> int:
+    """Fill the pre-match odds of matches that were already under way.
+
+    The live capture reads a match's odds page only before it starts, so matches
+    first seen in play have none. Their pages still hold the closing line, and
+    this walks them once. Safe beside a running capture: the writes are ordinary
+    `odds` writes and only what differs is inserted. Does nothing without
+    `--apply`.
+    """
+    if not args.apply:
+        print(
+            "\nnothing changed -- pass --apply to write the closing odds\n", file=sys.stderr
+        )
+        return 0
+
+    tour = None if args.tour == "both" else args.tour
+    with TennisExplorer() as explorer, Store(args.db) as store:
+        if args.all:
+            # First give every unpaired market a page, reading each day's list
+            # once. This is what makes a backfill of the whole database possible:
+            # odds pages are reached by id, and only the live capture ever
+            # learned those, for matches it saw before the start.
+            unpaired = store.markets_missing_tennisexplorer(tour=tour, limit=args.limit)
+            if unpaired:
+                print(f"pairing {len(unpaired)} match(es) from their day's lists...")
+                paired = pair_odds_backfill(
+                    explorer, store, unpaired, pause=args.pause
+                )
+                print(
+                    f"  paired {paired['paired']} of {paired['considered']} "
+                    f"from {paired['lists']} day list(s)"
+                )
+                skipped = list(paired["unpaired"])
+                if skipped:
+                    print(f"  {len(skipped)} would not pair (ambiguous or not listed)")
+        markets = store.markets_for_odds_backfill(tour=tour, limit=args.limit)
+        if not markets:
+            print("\nno match is waiting on odds -- every paired one has them\n")
+            return 0
+        print(f"reading the odds page for {len(markets)} match(es)...")
+        summary = backfill_odds(explorer, store, markets, pause=args.pause)
+
+    inserted = int(summary["inserted"])
+    by_market = list(summary["per_market"])
+    loud = [(cid, n) for cid, n in by_market if n]
+    print(f"\n{summary['markets']} match(es), {inserted} bookmaker line(s) recorded")
+    for cid, n in loud[:10]:
+        print(f"  {cid}: {n}")
+    if len(loud) > 10:
+        print(f"  ... and {len(loud) - 10} more")
+    quiet = len(by_market) - len(loud)
+    if quiet:
+        print(f"matches with nothing to add: {quiet}")
+    missing = list(summary.get("missing", []))
+    if missing:
+        print(f"\npages with no Home/Away odds ({len(missing)}):")
+        for question in missing[:10]:
+            print(f"  {question}")
+    return 0
+
+
 def _capture_is_idle(db: str) -> bool:
     """True if nothing has written to the database in the last minute.
 
@@ -627,6 +811,36 @@ def main(argv: list[str] | None = None) -> int:
         help="at most this many markets, oldest first, for a rate-limited run",
     )
     p_trades.set_defaults(func=cmd_backfill_trades, needs_network=True)
+
+    p_odds = sub.add_parser(
+        "backfill-odds",
+        parents=[common],
+        help="store the closing odds of matches first seen after their start",
+    )
+    p_odds.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write them; without this it prints nothing at all",
+    )
+    p_odds.add_argument(
+        "--all",
+        action="store_true",
+        help="also pair matches the capture never saw before the start, reading "
+        "each past day's fixture list to find their page",
+    )
+    p_odds.add_argument(
+        "--limit",
+        type=int,
+        help="at most this many matches, earliest start first",
+    )
+    p_odds.add_argument(
+        "--pause",
+        type=float,
+        default=0.0,
+        help="seconds to wait between page reads, to be gentle on the site "
+        "(default 0; ~0.3 is a few hundred matches in a few minutes)",
+    )
+    p_odds.set_defaults(func=cmd_backfill_odds, needs_network=True)
 
     p_sql = sub.add_parser(
         "sql", parents=[common], help="query the database (read-only, safe while recording)"

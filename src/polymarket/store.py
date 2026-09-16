@@ -940,6 +940,79 @@ class Store:
             params += (limit,)
         return [str(row[0]) for row in self.conn.execute(query, params)]
 
+    def markets_for_odds_backfill(
+        self, tour: str | None = None, limit: int | None = None
+    ) -> list[tuple[str, str, int, str]]:
+        """Markets with a TennisExplorer page and no odds rows yet.
+
+        Returns ``(condition_id, tennisexplorer_id, flip, question)``, oldest
+        start first. Only markets that were paired while the capture was running
+        have an id at all, so this is not a whole-season walk: it is exactly the
+        matches that were already under way when the odds capture started, whose
+        page still serves the last pre-match line.
+
+        A market whose pairing could not be oriented has a NULL flip and is left
+        out -- the two prices could not be told apart, and a mirrored closing
+        line is worse than none.
+        """
+        query = (
+            "SELECT m.condition_id, m.tennisexplorer_id, m.tennisexplorer_flip, m.question "
+            "FROM markets m "
+            "WHERE m.tennisexplorer_id IS NOT NULL AND m.tennisexplorer_flip IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM odds o WHERE o.condition_id = m.condition_id)"
+        )
+        params: tuple = ()
+        if tour:
+            query += " AND m.tour = ?"
+            params += (tour,)
+        query += " ORDER BY m.start_time"
+        if limit is not None:
+            query += " LIMIT ?"
+            params += (limit,)
+        return [
+            (str(cid), str(te), int(flip), str(question or cid))
+            for cid, te, flip, question in self.conn.execute(query, params)
+        ]
+
+    def markets_missing_tennisexplorer(
+        self, tour: str | None = None, limit: int | None = None
+    ) -> list[tuple[str, str, str, str | None, str | None, str, str]]:
+        """Markets never paired to a TennisExplorer page.
+
+        Returns ``(condition_id, question, tour, start_time, match_date,
+        outcome_0, outcome_1)``, earliest start first. A live-only capture never
+        pairs an upcoming match, so every market recorded before the odds
+        capture was deployed is here -- which is exactly what a full backfill
+        has to pair.
+        """
+        query = (
+            "SELECT condition_id, question, tour, start_time, match_date, "
+            "outcome_0, outcome_1 "
+            "FROM markets WHERE tennisexplorer_id IS NULL"
+        )
+        params: tuple = ()
+        if tour:
+            query += " AND tour = ?"
+            params += (tour,)
+        query += " ORDER BY start_time"
+        if limit is not None:
+            query += " LIMIT ?"
+            params += (limit,)
+        return [
+            (str(cid), str(q or cid), str(t or ""), st, md, str(o0 or ""), str(o1 or ""))
+            for cid, q, t, st, md, o0, o1 in self.conn.execute(query, params)
+        ]
+
+    def set_tennisexplorer(self, rows: Iterable[tuple[str, int, str]]) -> int:
+        """Store the TennisExplorer id and flip a backfill paired for a market."""
+        rows = list(rows)
+        self.conn.executemany(
+            "UPDATE markets SET tennisexplorer_id = ?, tennisexplorer_flip = ? "
+            "WHERE condition_id = ?",
+            rows,
+        )
+        return len(rows)
+
     def stats(self) -> dict[str, object]:
         cur = self.conn.cursor()
         markets = cur.execute("SELECT COUNT(*) FROM markets").fetchone()[0]

@@ -24,6 +24,7 @@ uv run polymarket sql "SELECT ..."   # any query
 uv run polymarket clean-scores # repair a score history recorded before the ratchet
 uv run polymarket backfill-book-ts   # reconstruct book_ts for older rows
 uv run polymarket backfill-trades --apply  # fill the trade tape of finished matches
+uv run polymarket backfill-odds --apply    # closing odds for matches first seen after their start
 ```
 
 Or run the capture and the dashboard as two containers — see [Docker](#docker).
@@ -507,9 +508,32 @@ between reads costs rows only when a bookmaker moves.
 Because this is a pre-match product, it needs the match to be tracked before it
 starts — that is `--include-upcoming`, which the Docker capture already passes. A
 live-only `polymarket run` tracks no upcoming match, so it records no odds; it
-says so once at startup. The source is a scraped page rather than a feed, so it
-is the largest response the capture makes and is polled last, after the books,
-the score and the tape. `--no-odds` turns it off entirely.
+says so once at startup. A match that was already in play when the capture
+started has none either, but its page still serves the last line, and
+`backfill-odds` walks those matches once and stores it:
+
+```bash
+uv run polymarket backfill-odds --apply            # already-paired matches with no odds
+uv run polymarket backfill-odds --all --apply      # first pair the whole database
+uv run polymarket backfill-odds --all --apply --pause 0.3   # gentler, and easier to stop
+```
+
+`--all` is the one to reach for after upgrading an existing database: a market's
+TennisExplorer page is reached by id, and only the live capture ever learned
+those, for matches it saw before the start. It reads each past day's fixture list
+to find the id — the daily-list URL takes a date, so a past day is fetched exactly
+like today's, and the three days around each match are cached and shared, so the
+cost is roughly one list per tournament-day plus one page per match. It is
+resumable: pairing is written as it goes, and re-running skips what is paired.
+
+A match is left unpaired, deliberately, when Polymarket's two names match no
+TennisExplorer fixture from those days. That happens when the market named a
+projected or changed matchup — TennisExplorer will have the winner against a
+different opponent — and attaching that page's odds would be worse than none.
+
+The source is a scraped page rather than a feed, so it is the largest response
+the capture makes and is polled last, after the books, the score and the tape.
+`--no-odds` turns it off entirely.
 
 Matches are paired to a TennisExplorer page by both players' names against the
 site's daily lists, the same way scores are paired to Flashscore; the id and its
@@ -832,7 +856,7 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 640 checks, no network needed
+uv run python tests/test_offline.py   # 655 checks, no network needed
 ```
 
 ## Measured response availability and poll health

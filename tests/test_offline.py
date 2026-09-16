@@ -226,10 +226,18 @@ class FakeTennisExplorer:
         self.quotes = quotes or {}
         self.board_calls: list[tuple] = []
         self.odds_calls: list[str] = []
+        # Historical daily lists, keyed (tour, "YYYY-MM-DD"), for the backfill.
+        self.daily_matches: dict[tuple[str, str], list] = {}
+        self.daily_calls: list[tuple[str, str]] = []
 
     def board(self, tours, today=None):
         self.board_calls.append(tuple(tours))
         return self._board
+
+    def daily(self, tour, date):
+        key = (tour, date.date().isoformat())
+        self.daily_calls.append(key)
+        return self.daily_matches.get(key, [])
 
     def odds(self, match_id):
         self.odds_calls.append(match_id)
@@ -2655,6 +2663,8 @@ def test_tennisexplorer() -> None:
     print("\ntennisexplorer odds")
     from datetime import datetime, timezone
 
+    from polymarket.scores import name_tokens
+
     day = parse_day(DAY_HTML, "atp", datetime(2026, 9, 16), tz=1)
     check("daily list finds both rows", len(day) == 2)
     check("scheduled row paired", day[0].id == "111")
@@ -2690,6 +2700,17 @@ def test_tennisexplorer() -> None:
     twin_pair = twin.pair("atp", ["A. Lee", "B. Lee"])
     check("identical names keep the id without orientation",
           twin_pair is not None and twin_pair.oriented is False)
+
+    # A two-letter surname ("Wu", "Ce") is dropped by _distinctive as if it were
+    # an initial; the loose fallback still pairs when both players agree.
+    short = TeBoard([TeMatch(
+        id="666", tour="atp", home="Wu Y.", away="Walton A.",
+        home_tokens=name_tokens("Wu Y."), away_tokens=name_tokens("Walton A."),
+        starts_at=None,
+    )])
+    short_pair = short.pair("atp", ["Yibing Wu", "Adam Walton"])
+    check("a two-letter surname still pairs on both names agreeing",
+          short_pair is not None and short_pair.id == "666" and short_pair.flip is False)
 
     quotes = parse_odds(ODDS_HTML)
     check("odds tab parsed", quotes is not None and len(quotes) == 2)
@@ -2824,6 +2845,84 @@ def test_tennisexplorer() -> None:
                   store.conn.execute(
                       "SELECT tennisexplorer_flip FROM markets WHERE condition_id = ?", (cid,)
                   ).fetchone()[0] == 1)
+
+    # backfill-odds: a match first seen in play gets its closing line from the
+    # page it already points at, flipped into the market's own order.
+    from polymarket.cli import backfill_odds
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "b.db"
+        with Store(path) as store:
+            store.conn.execute(
+                "INSERT INTO markets (condition_id, question, tour, start_time, "
+                "tennisexplorer_id, tennisexplorer_flip) VALUES (?,?,?,?,?,?)",
+                ("0x9", "A vs B", "atp", "2026-09-16T21:00:00Z", "777", 1),
+            )
+            store.conn.execute(
+                "INSERT INTO markets (condition_id, question, tennisexplorer_id, "
+                "tennisexplorer_flip) VALUES (?,?,?,?)",
+                ("0x8", "never paired", None, None),
+            )
+            pending = store.markets_for_odds_backfill()
+            check("only paired matches without odds are queued",
+                  [p[0] for p in pending] == ["0x9"])
+            explorer = FakeTennisExplorer(quotes={"777": [OddsQuote("10Bet", 6.50, 1.10)]})
+            summary = backfill_odds(explorer, store, pending)
+            check("the closing line is written", summary["inserted"] == 1)
+            row = store.conn.execute(
+                "SELECT bookmaker, price_0, price_1 FROM odds WHERE condition_id = '0x9'"
+            ).fetchone()
+            check("and flipped into the market's order", row == ("10Bet", 1.10, 6.50))
+            check("re-running the backfill finds nothing left to do",
+                  store.markets_for_odds_backfill() == [])
+
+    # --all: a market the capture never paired is found from the fixture list
+    # of the day it was played, then the id and flip are stored for its page.
+    from polymarket.cli import pair_odds_backfill
+    from polymarket.scores import name_tokens
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "pair.db"
+        with Store(path) as store:
+            store.conn.execute(
+                "INSERT INTO markets (condition_id, question, tour, start_time, "
+                "match_date, outcome_0, outcome_1) VALUES (?,?,?,?,?,?,?)",
+                (
+                    "0xa",
+                    "Cincinnati Open: Botic van de Zandschulp vs Tallon Griekspoor",
+                    "atp",
+                    "2026-08-18T16:55:00Z",
+                    "2026-08-18",
+                    "Botic van de Zandschulp",
+                    "Tallon Griekspoor",
+                ),
+            )
+            markets = store.markets_missing_tennisexplorer()
+            check("unpaired markets are queued", [m[0] for m in markets] == ["0xa"])
+
+            explorer = FakeTennisExplorer()
+            explorer.daily_matches[("atp", "2026-08-18")] = [
+                TeMatch(
+                    id="555",
+                    tour="atp",
+                    home="Van de Zandschulp B.",
+                    away="Griekspoor T.",
+                    home_tokens=name_tokens("Van de Zandschulp B."),
+                    away_tokens=name_tokens("Griekspoor T."),
+                    starts_at=None,
+                )
+            ]
+            summary = pair_odds_backfill(explorer, store, markets)
+            check("a historical match is paired from its day list",
+                  summary["paired"] == 1)
+            row = store.conn.execute(
+                "SELECT tennisexplorer_id, tennisexplorer_flip FROM markets "
+                "WHERE condition_id = '0xa'"
+            ).fetchone()
+            check("and the id and orientation are stored", row == ("555", 0))
+            check("pairing clears the queue", store.markets_missing_tennisexplorer() == [])
+            check("only the three-day window is fetched once",
+                  len(explorer.daily_calls) == 3)
 
 
 def _predecessor_store():

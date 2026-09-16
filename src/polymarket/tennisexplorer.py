@@ -260,7 +260,17 @@ class TeBoard:
                     home, away = away, home
                 agree = _distinctive(first & home), _distinctive(second & away)
                 if not agree[0] or not agree[1]:
-                    continue
+                    # A two-letter surname -- Wu, Li, Ce, Te -- is genuinely
+                    # distinctive of a player, but `_distinctive` drops it as if
+                    # it were an initial, so a name like "Yibing Wu" leaves
+                    # nothing to match. Fall back to the full token sets, still
+                    # requiring *both* players to agree, which is what keeps it
+                    # off a single shared surname. A loose match scores lower
+                    # than a distinctive one, so it can never win over one.
+                    loose = (first & home, second & away)
+                    if not loose[0] or not loose[1]:
+                        continue
+                    agree = loose
                 apart = (
                     abs(candidate.starts_at - start_time)
                     if start_time is not None and candidate.starts_at is not None
@@ -321,6 +331,30 @@ class TennisExplorer:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+    def daily(self, tour: str, date: datetime) -> list[TeMatch]:
+        """One specific day's list for one tour, however old.
+
+        The daily-list URL is a calendar date, so the same request that serves
+        today's card serves an arbitrary past one -- which is what makes a
+        historical pairing possible. Raises on a transport failure rather than
+        returning empty, so a caller backfilling many days can tell a day with
+        no matches from a day that could not be read.
+        """
+        kind = _TOUR_TYPES.get(tour)
+        if kind is None:
+            return []
+        response = self._client.get(
+            f"{TENNISEXPLORER_HOST}/matches/",
+            params={
+                "type": kind,
+                "year": f"{date.year:04d}",
+                "month": f"{date.month:02d}",
+                "day": f"{date.day:02d}",
+            },
+        )
+        response.raise_for_status()
+        return parse_day(response.text, tour, date, self.tz)
 
     def board(self, tours: Sequence[str], today: datetime | None = None) -> TeBoard:
         """The daily lists for `tours` across the configured days.

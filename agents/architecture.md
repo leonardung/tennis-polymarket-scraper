@@ -23,7 +23,7 @@ package — a fuller Flashscore client that is not imported by anything in `src/
 
 ```
 src/polymarket/            the package; `polymarket` console script -> cli.main
-  cli.py                   argparse; subcommands discover/run/dashboard/stats/sql/backfill-trades/clean-scores
+  cli.py                   argparse; subcommands discover/run/dashboard/stats/sql/backfill-trades/backfill-odds/backfill-book-ts/clean-scores
   config.py                all tunables + the two tournament whitelists + regexes
   api.py                   Polymarket: Gamma (catalog), CLOB (books) and Data API (trades) HTTP client
   book.py                  Snapshot dataclass; parse_book() normalises a raw book
@@ -44,7 +44,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, MatchStats, MatchOdds,
                            TimeSeriesChart, OrderBook, Sparkline, TableView
-tests/test_offline.py      640 assertions, no network, plain `python` script
+tests/test_offline.py      655 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -499,6 +499,7 @@ only activates when the system resolver fails. See `DNS.md`.
 | Handle a new Flashscore status | `scores._STATUS` / `_STAGE` |
 | Record a statistic the feed has started carrying | add a `Statistic` to `config.STATISTICS` — `store.STAT_COLUMNS` and both tables follow, and the DB migrates itself; the log line "no column for ..." is what tells you one is missing |
 | Change the trade-tape cadence or page size | `config.TRADES_PAGE` / `TRADES_TICK_PAGES`; `store.record_trades` stays idempotent under any of it |
+| Fill the odds of matches first seen already in play | `polymarket backfill-odds --apply`; the queue is `store.markets_for_odds_backfill` (paired, oriented, no `odds` rows). `--all` first pairs the whole database from historical daily lists via `cli.pair_odds_backfill` / `store.markets_missing_tennisexplorer` |
 | Change how the odds are paired or scraped | `tennisexplorer.TeBoard.pair` / `TennisExplorer.odds`; the page's markup is regex-parsed, so `parse_odds` is what a redesign breaks |
 | Turn the odds capture off | `--no-odds`, or `Poller(record_odds=False)` |
 | Change when the per-set statistics are collected | `config.FINAL_STATS_DELAY` / `_WINDOW` / `_CHECK` / `_BATCH` |
