@@ -7,7 +7,10 @@ same tick, so a price, the point it moved on, and the aces count behind it all
 share a `tick_id` while retaining their individual read timestamps. The trade
 tape is recorded on the same tick cadence but under the venue's own timestamps:
 every taker fill, with its price, size and direction, so a resting order's fill
-model can be replayed against what actually crossed the book.
+model can be replayed against what actually crossed the book. The bookmakers'
+pre-match odds are captured before each match too — up to its start, and once
+more on the tick it goes live for the closing line — so Polymarket's own drift
+can be read against the bookmakers' closing consensus.
 
 ## Commands
 
@@ -56,6 +59,7 @@ triggers an early refresh.
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--no-stats` | off | don't record match statistics (see [Match statistics](#match-statistics)) |
 | `--no-trades` | off | don't record trade prints (see [The trade tape](#the-trade-tape)) |
+| `--no-odds` | off | don't record bookmaker odds; they are pre-match only and need `--include-upcoming` to be captured (see [Bookmaker odds](#bookmaker-odds)) |
 | `--stats-interval N` | `5` | floor between statistics reads of one match, on top of `--interval` |
 | `--heartbeat N` | `300` | write an unchanged book at least this often |
 | `--stale-after N` | `120` | warn when every in-play book is this far behind its own upstream timestamp |
@@ -92,6 +96,13 @@ which turn over several times a game. Opening a match gives its full history:
   settled per-set reading has been collected, `Final` and one tab per set appear
   beside it. The two are kept apart on purpose — where they disagree, `Final` is
   right, and that disagreement is what the per-set table exists to show.
+- **Bookmaker odds** — the Home/Away line from every bookmaker TennisExplorer
+  tracked, as a decimal odd and its implied probability, with the best price on
+  each side marked. A consensus row averages those probabilities, normalizes away
+  the bookmakers' margin, and shows the signed difference from Polymarket's mid.
+  Pre-match only — the last line is the closing one — and the panel is absent for
+  a match the capture never saw before it started. See
+  [Bookmaker odds](#bookmaker-odds).
 - **Order book** — the live 10-level ladder for both players.
 - **Table view** — the same numbers as text, for reading exact values.
 
@@ -476,9 +487,45 @@ in markets that were recorded before prints were. It is idempotent and safe to
 run beside a live capture. Prints are stored under the venue's own timestamps —
 see [What gets stored](#what-gets-stored).
 
+## Bookmaker odds
+
+The capture reads the **bookmaker odds** for each match from
+[TennisExplorer](https://www.tennisexplorer.com) and records every bookmaker's
+Home/Away line into the `odds` table. The point is a second opinion on the same
+match: the bookmakers' pre-match consensus sitting beside Polymarket's own price,
+so a move in one can be read against the other.
+
+**Before the match only.** A bookmaker closes its pre-match market at the first
+ball and TennisExplorer carries no in-play odds, so a read during play would only
+find the frozen line — at ~330 KB a page. The capture therefore reads the odds
+while a match is still **upcoming**, on the same slow cadence the score keeps for
+a match that hasn't started, and takes one forced read on the tick the score poll
+sees it go live. That last read is the **closing line**; after it the page is
+abandoned for the rest of the match. Only changes are stored, so the interval
+between reads costs rows only when a bookmaker moves.
+
+Because this is a pre-match product, it needs the match to be tracked before it
+starts — that is `--include-upcoming`, which the Docker capture already passes. A
+live-only `polymarket run` tracks no upcoming match, so it records no odds; it
+says so once at startup. The source is a scraped page rather than a feed, so it
+is the largest response the capture makes and is polled last, after the books,
+the score and the tape. `--no-odds` turns it off entirely.
+
+Matches are paired to a TennisExplorer page by both players' names against the
+site's daily lists, the same way scores are paired to Flashscore; the id and its
+orientation are stored on the `markets` row. A pairing that cannot be oriented is
+recorded but not read, because a mirrored line is worse than none. The odds show
+up on the match page of the dashboard as a per-bookmaker table with the
+margin-free consensus beside Polymarket's mid.
+
+```bash
+uv run polymarket run --include-upcoming   # odds are captured pre-match
+uv run polymarket run --no-odds            # skip them
+```
+
 ## What gets stored
 
-Six tables and a view, in one SQLite file.
+Seven tables and a view, in one SQLite file.
 
 **`markets`** — one row per match:
 
@@ -499,6 +546,11 @@ match ends, by which time the market has usually been resolved and dropped from
 the API — there is nothing left to pair against, only what was written down. A
 NULL `flashscore_flip` means the two names fitted each other's side equally well,
 so nothing that reads home from away may be attributed to a player at all.
+
+`tennisexplorer_id` + `tennisexplorer_flip` are the same pair for the odds page:
+which TennisExplorer match the bookmaker lines come from, and whether that page
+lists this market's second outcome as its home player. A NULL flip again means
+the pairing was not oriented, so the two prices cannot be told apart.
 
 **`books`** — one row per player per tick:
 
@@ -676,6 +728,40 @@ SELECT datetime(t.ts,'unixepoch') AS t, t.side, t.size, t.price,
 FROM trades t WHERE t.condition_id = '0x...' ORDER BY t.ts DESC LIMIT 20;
 ```
 
+**`odds`** — the bookmakers' Home/Away pre-match lines, one row per bookmaker
+per move:
+
+| Column | Meaning |
+|---|---|
+| `ts` | when the capture read it — these are observations, at the tick's resolution |
+| `tick_id` | the capture pass the read belonged to, shared with that tick's book and score |
+| `condition_id` | which market |
+| `bookmaker` | the book's name, as the page labels it |
+| `price_0`, `price_1` | its two prices, in the market's own outcome order |
+| `tennisexplorer_id` | the page the line came from, so a row is traceable after the pairing is gone |
+| `received_ts` | when the page response was received |
+
+Changes only, like `stat_events`, and **pre-match only**: the newest row per
+bookmaker is its closing line, and there are no rows for a match that was first
+seen live. The two sides are one row because they are one line on the page; it is
+rewritten when either side moves, so a stored pair always stood together at `ts`.
+Unlike `trades`, `ts` here **is** the capture's clock: the page carries a
+timestamp per move, but in the nested history table the current-value scrape does
+not read.
+
+```sql
+-- the latest line from each bookmaker, with Polymarket's mid at the same moment
+SELECT o.bookmaker, o.price_0, o.price_1,
+       (SELECT b.mid FROM books b
+        WHERE b.condition_id = o.condition_id AND b.outcome_index = 0
+          AND b.ts <= o.ts ORDER BY b.ts DESC LIMIT 1) AS poly_mid
+FROM odds o
+WHERE o.condition_id = '0x...'
+  AND o.ts = (SELECT MAX(x.ts) FROM odds x
+              WHERE x.condition_id = o.condition_id AND x.bookmaker = o.bookmaker)
+ORDER BY o.bookmaker;
+```
+
 **`quotes`** — a view that spells out the direction, since bid/ask is easy to
 invert:
 
@@ -734,12 +820,19 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
   turns them off, and `backfill-trades --apply` fills any gap afterwards — the
   Data API keeps the history, so a print missed while the capture was down is
   recoverable, unlike a book.
+- Bookmaker odds are the cheapest table by row count — fifteen bookmakers per
+  match, and only when a line moves — but the most expensive thing on the wire:
+  the TennisExplorer page is ~330 KB per match, read sequentially, on each
+  upcoming-match poll (the `--idle-interval` cadence, 60 s by default) plus one
+  closing read at the start. Only pre-match matches are read, so an in-play
+  capture pays nothing for them. `--no-odds` turns them off. `feed_polls` does
+  not cover this source: it is a scraped page rather than a measured value feed.
 - Safe to stop and restart: it reopens the same database and carries on, and
   re-running a tick never duplicates rows.
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # ~496 checks, no network needed
+uv run python tests/test_offline.py   # 640 checks, no network needed
 ```
 
 ## Measured response availability and poll health

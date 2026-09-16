@@ -119,6 +119,7 @@ export interface MatchDetail {
   last_trade: LastTrade | null;
   score_events: ScoreEvent[];
   stats: MatchStats;
+  odds: MatchOdds;
 }
 
 /** One statistic, both players. Mirrors queries._stat_period. */
@@ -134,6 +135,21 @@ export interface StatEntry {
    * is deliberately neither stored nor sent.
    */
   values: [[number | null, number | null], [number | null, number | null]];
+}
+
+/** One bookmaker's Home/Away decimal odds, in `players` order. */
+export interface OddsQuote {
+  bookmaker: string;
+  price_0: number;
+  price_1: number;
+}
+
+/** The pre-match bookmaker lines for one match. Mirrors queries.match_odds. */
+export interface MatchOdds {
+  /** When the newest of these lines was read, or null if there are none. */
+  ts: number | null;
+  tennisexplorer_id: string | null;
+  bookmakers: OddsQuote[];
 }
 
 export interface MatchStats {

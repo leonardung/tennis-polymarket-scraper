@@ -10,10 +10,11 @@ project is for, conventions, workflows).
 A Python CLI (`src/polymarket/`) polls the Polymarket CLOB for ATP and WTA tennis
 order books every 5 seconds while a match is being played -- every 60 seconds
 before it starts, never once it is over -- and, on the same tick, reads the live
-score and the match statistics from Flashscore, and the trade tape from
-Polymarket's Data API. All four land in one SQLite file, plus a fifth thing that
-does not run on the tick at all: a finished match's per-set statistics, collected
-an hour after it ended. A FastAPI dashboard
+score and the match statistics from Flashscore, the trade tape from Polymarket's
+Data API, and the bookmakers' pre-match odds from TennisExplorer. All five land
+in one SQLite file, plus a sixth thing that does not run on the tick at all: a
+finished match's per-set statistics, collected an hour after it ended. A FastAPI
+dashboard
 (`src/polymarket/dashboard/`) serves that file read-only to a React + Lightweight
 Charts front end (`frontend/`, built into the Python package). `flashscore-scraper/` is a **separate, standalone**
 package — a fuller Flashscore client that is not imported by anything in `src/`.
@@ -28,7 +29,8 @@ src/polymarket/            the package; `polymarket` console script -> cli.main
   book.py                  Snapshot dataclass; parse_book() normalises a raw book
   discovery.py             TennisMarket; the three gates that pick tour-level singles
   scores.py                Flashscore feeds, pairing, Ratchet/StatRatchet. The subtlest file here.
-  poller.py                Poller: the capture loop (tick, score poll, stats poll, refresh)
+  tennisexplorer.py        the bookmaker-odds page scraper and its own pairing board
+  poller.py                Poller: the capture loop (tick, score poll, stats poll, odds poll, refresh)
   store.py                 Store: SQLite schema, migration, writes, prune_score_events
   resolver.py              DNS-over-HTTPS shim for ISPs that NXDOMAIN polymarket.com
   dashboard/
@@ -40,9 +42,9 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/hooks.ts             useDataVersion (pulse poll), useAsync, useRoute, useTicker
   src/api.ts, types.ts     fetch wrappers; TS mirrors of queries.py payloads
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
-  src/components/          Chrome, MatchCard, MatchDetail, MatchStats, TimeSeriesChart,
-                           OrderBook, Sparkline, TableView
-tests/test_offline.py      ~496 assertions, no network, plain `python` script
+  src/components/          Chrome, MatchCard, MatchDetail, MatchStats, MatchOdds,
+                           TimeSeriesChart, OrderBook, Sparkline, TableView
+tests/test_offline.py      640 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -67,6 +69,7 @@ Flashscore day card f_2_… ───┘         (3 gates + ScoreBoard.pair)
     Flashscore df_sur_2_<id> (+ dc_2_<id>) ──> Ratchet ──> markets, score_events
     Flashscore df_st_2_<id> ──> parse_stats ──> StatRatchet ──> stat_events
     Data API GET /trades (due cids, csv) ──> TradeRow ──> trades  (venue ts, not tick ts)
+    TennisExplorer match-detail/?id=<te> ──> parse_odds ──> odds  (changes only)
                                                 │
   once, 1h after a match ends:                  │
     Flashscore df_st_2_<id> ──> every period ──> set_stats
@@ -128,27 +131,45 @@ Each iteration, in order:
    a maker-fill model reads it at that time. This is the deliberate exception to
    invariant 1, and the reason the tape is polled rather than scraped off the
    CLOB's `last_trade_price`, which says what the newest trade cost but neither
-   how large it was nor which way it was attacked. Wrapped like every other
-   step; a failed tape poll must not cost a book.
-5. **`collect_final_stats()`** — once a minute (`FINAL_STATS_CHECK`), not once a
+    how large it was nor which way it was attacked. Wrapped like every other
+    step; a failed tape poll must not cost a book.
+5. **`poll_odds(due, starting)`** — one `match-detail/?id=<te>` page per paired
+   match, read sequentially on `TennisExplorer`'s single connection, in the same
+   pass as the book and score and stamped with the same `tick_id`. **Pre-match
+   only:** `_odds_targets` returns matches whose state is `upcoming`, plus the
+   `starting` set -- matches the score poll just saw move upcoming -> live, which
+   get one forced read for the closing line. An in-play match is never read again,
+   because its line is frozen and the page is ~330 KB. Changes only, exactly as
+   `stat_events`. `--no-odds` drops the step. This is a scraped page rather than a
+   value feed, so it is deliberately **not** in `feed_polls` (see telemetry).
+   Polled last: unlike the other feeds it only matters before the match, and it is
+   the largest response on the tick. Requires `--include-upcoming` to see anything,
+   since a live-only capture never holds a match before it starts; the poller warns
+   once if odds are on and upcoming matches are not tracked.
+6. **`collect_final_stats()`** — once a minute (`FINAL_STATS_CHECK`), not once a
    tick. `store.matches_awaiting_set_stats` is the queue: matches that ended
    more than `FINAL_STATS_DELAY`=1h ago, less than `FINAL_STATS_WINDOW`=24h ago,
    with a stored `flashscore_id`, an oriented `flashscore_flip`, and no
    `set_stats` rows yet. `FINAL_STATS_BATCH`=4 at a time. The queue is a query
    over the database rather than a timer in memory, so a restart does not lose
    it and re-running writes one row per period rather than two.
-6. **`_refresh_due()`** — refresh when the interval elapses, **or** when a match
+7. **`_refresh_due()`** — refresh when the interval elapses, **or** when a match
    changed state (rate-limited to `MIN_REFRESH_GAP`=60s, since a refresh pages
    the whole tennis catalog), **or** at `_next_start`, the scheduled start of the
    next upcoming match plus `START_GRACE`.
 
-`tick()`, `poll_scores()`, `poll_stats()`, `poll_trades()` and
+`tick()`, `poll_scores()`, `poll_stats()`, `poll_trades()`, `poll_odds()` and
 `collect_final_stats()` are each wrapped so no exception can kill the capture;
-the books matter more than the score, and the score more than the statistics.
+the books matter more than the score, the score more than the statistics, and
+the statistics more than the odds.
 
 `refresh()` reloads the day card, re-runs `discover`, rebuilds `self.tracked`
-(token id -> `Tracked`) and `self.watched` (condition id -> `Watched`, only for
-matches Flashscore could pair). It then passes the day card's reading through the
+(token id -> `Tracked`), `self.watched` (condition id -> `Watched`, only for
+matches Flashscore could pair) and `self.odds_watched` (condition id ->
+`OddsWatched`, only for matches TennisExplorer could pair and orient). The
+TennisExplorer daily lists are read here too, on the refresh cadence rather than
+the tick, and set `tennisexplorer_id` / `tennisexplorer_flip` on each market. It
+then passes the day card's reading through the
 ratchet too — the card is minutes old, so where it is behind, the already-known
 score wins rather than the refresh rewinding it every 5 minutes.
 
@@ -250,6 +271,7 @@ One SQLite file, WAL, `synchronous=NORMAL`, `isolation_level=None`.
 | `stat_events` | one row per *change* of the running match statistics | `PRIMARY KEY (condition_id, ts)`; `tick_id` joins the pass to books/scores; the feed's **overall** block only. No heartbeat |
 | `set_stats` | one row per (match, period), written once an hour after the match | `PRIMARY KEY (condition_id, period)`; `INSERT OR REPLACE`, so collecting twice leaves one row. The per-set rows sum to the `Match` row, which is what makes it a check on `stat_events` |
 | `trades` | one row per taker fill | `PRIMARY KEY (transaction_hash, wallet, side, outcome_index)`, `INSERT OR IGNORE` (replaying any page is free); `ts` is the **venue's** settlement time, `tick_id` when we first saw it. Indexed on `(condition_id, ts)` for the time-window join |
+| `odds` | one row per bookmaker per *change* of its Home/Away line | `PRIMARY KEY (condition_id, bookmaker, ts)`, `INSERT OR REPLACE`; `price_0`/`price_1` are the pair in the market's outcome order, so a stored pair always stood together. Both `ts` and `tick_id` are the capture's -- these are observations. Not in `feed_polls` |
 | `quotes` | view | spells out direction: `buy_price = best_ask`, `sell_price = best_bid` |
 
 Column lists are **generated**: `BOOK_COLUMNS` from `BOOK_DEPTH` via
@@ -314,7 +336,7 @@ deletions strand, then brings `markets` back in step. Reachable as
 |---|---|
 | `GET /api/overview` | every match with latest prices, sparkline, coverage, tab classification |
 | `GET /api/pulse` | `{last_ts, rows}` — the cheap poll target |
-| `GET /api/match/{cid}` | metadata, both ladders, oriented last trade, full `score_events`, and `stats` (`match_stats`: the latest `stat_events` row plus every `set_stats` period, kept apart rather than merged) |
+| `GET /api/match/{cid}` | metadata, both ladders, oriented last trade, full `score_events`, `stats` (`match_stats`: the latest `stat_events` row plus every `set_stats` period, kept apart rather than merged), and `odds` (`match_odds`: the newest Home/Away line per bookmaker, or an empty shape) |
 | `GET /api/match/{cid}/series?points=&since=` | both players on one shared forward-filled grid |
 
 `serve()` calls `_ensure_schema()` first, which opens the DB **writable once** to
@@ -376,6 +398,12 @@ Docker image has no Node in it.
 - **`theme.ts`** owns light/dark. CSS custom properties are the single source of
   truth; canvas cannot read them, so `readPalette()` pulls the `CHART_TOKENS` out
   of computed style after a frame and the charts are restyled from that.
+- **`MatchOdds`** is plain DOM, no chart: one row per bookmaker with its decimal
+  odd and implied probability, the best price per side marked, and a consensus row
+  that averages the implied probabilities, normalizes the margin away and shows
+  the signed difference from Polymarket's mid. It renders nothing when `odds` is
+  empty, so a match the capture only ever saw live has no odds panel rather than
+  an empty one. It is pre-match data and the UI says so.
 - **`MatchStats`** is plain DOM, no chart: one row per statistic, the two
   players either side of a two-segment bar. The bar's split is computed on the
   *rate* where the feed reports one — 49 of 67 first serves against 46 of 54 is
@@ -418,10 +446,10 @@ only activates when the system resolver fails. See `DNS.md`.
 
 ## Invariants a change must not break
 
-1. **A tick's price, score and statistics share a `tick_id`.** A match's book,
-   score and statistics are read in the same pass, off one `due` set. There is no
-   separate score interval (there was; it was removed) -- what varies is which
-   matches a tick reads, not which feed. `STATS_INTERVAL` is the one
+1. **A tick's price, score, statistics and odds share a `tick_id`.** A match's
+   book, score and statistics are read in the same pass, off one `due` set. There
+   is no separate score interval (there was; it was removed) -- what varies is
+   which matches a tick reads, not which feed. `STATS_INTERVAL` is the one
    qualification, and it does not weaken this: it drops whole statistics reads,
    so a statistics row is still written on a tick that read that match's book
    and score. Each feed keeps its own `ts`; the integer `tick_id` made once at
@@ -429,8 +457,8 @@ only activates when the system resolver fails. See `DNS.md`.
    deliberate exception** -- it rides the `due` set for cadence but is stored
    under the venue's own settlement timestamp, because a print happened when
    Polymarket settled it and a fill model reads it at that time; `books`,
-   `score_events` and `stat_events` are observations the capture makes, `trades`
-   are facts the venue already dated.
+   `score_events`, `stat_events` and `odds` are observations the capture makes,
+   `trades` are facts the venue already dated.
 2. **Score and statistics reads stay on one connection, sequential.** See
    `Flashscore.__init__`; `stat_readings` is a loop for the same reason
    `readings` is.
@@ -471,6 +499,8 @@ only activates when the system resolver fails. See `DNS.md`.
 | Handle a new Flashscore status | `scores._STATUS` / `_STAGE` |
 | Record a statistic the feed has started carrying | add a `Statistic` to `config.STATISTICS` — `store.STAT_COLUMNS` and both tables follow, and the DB migrates itself; the log line "no column for ..." is what tells you one is missing |
 | Change the trade-tape cadence or page size | `config.TRADES_PAGE` / `TRADES_TICK_PAGES`; `store.record_trades` stays idempotent under any of it |
+| Change how the odds are paired or scraped | `tennisexplorer.TeBoard.pair` / `TennisExplorer.odds`; the page's markup is regex-parsed, so `parse_odds` is what a redesign breaks |
+| Turn the odds capture off | `--no-odds`, or `Poller(record_odds=False)` |
 | Change when the per-set statistics are collected | `config.FINAL_STATS_DELAY` / `_WINDOW` / `_CHECK` / `_BATCH` |
 | New API endpoint | `dashboard/app.py` + a function in `queries.py` + `types.ts` + `api.ts` |
 | New chart or panel | `frontend/src/components/`, then `npm run build` and commit `static/` |

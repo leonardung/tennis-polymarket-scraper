@@ -14,7 +14,9 @@ timestamps say when each sequential read happened; their shared `tick_id` is
 the exact join key. The trade tape is recorded on the same tick cadence but
 under the venue's own timestamps — every taker fill with price, size and
 direction, so a resting order's fill model can be replayed against what
-actually crossed the book. A match that has not started yet is read once a
+actually crossed the book. The bookmakers' pre-match odds are scraped from
+TennisExplorer on the same tick, so Polymarket's own drift can be read against
+the bookmaker consensus. A match that has not started yet is read once a
 minute instead, and one that has finished is not read again. A read-only web
 dashboard browses what has been recorded.
 
@@ -76,6 +78,14 @@ a three-set match against the tens of thousands its books produce, at 75
 columns each -- most of them NULL at a tournament without ball tracking. Six
 live matches take the tick from ~0.05 s to ~0.35 s; the budget is five seconds.
 
+The odds are the opposite trade-off: the cheapest table by row count -- fifteen
+bookmakers per match, and only when a line moves -- and the most expensive thing
+on the wire, ~330 KB per match read sequentially off one connection. That read
+happens on the upcoming cadence (`--idle-interval`, 60 s) plus once at the start,
+never during play, so the cost is bounded by how many matches are waiting rather
+than by how many are on court. It is still the largest response the capture makes,
+which is why `--no-odds` exists and the poll runs last.
+
 ## How to run it
 
 ```bash
@@ -98,7 +108,7 @@ discover`.
 ## How to verify a change
 
 ```bash
-uv run python tests/test_offline.py     # ~496 checks, no network
+uv run python tests/test_offline.py     # 640 checks, no network
 ```
 
 `tests/test_offline.py` is a **plain script, not pytest** — a flat list of
@@ -199,6 +209,25 @@ Other conventions:
 - **`trades.ts` is the venue's clock, never the capture's.** A print happened
   when Polymarket settled it; `tick_id` is when we noticed. Reading price
   against prints joins on the venue clock by time window, not on `tick_id`.
+- **The TennisExplorer odds are pre-match only, and the capture now treats them
+  that way.** Measured, not assumed: across a sample of finished matches the
+  newest odds-history timestamp was always at or before the start, and a live
+  match's odds block was byte-identical across repeated reads. Bookmakers close at
+  the first ball and the site has no in-play feed. `_odds_targets` therefore reads
+  only matches whose state is `upcoming`, plus one forced read on the tick a match
+  goes live (the `starting` set), which is its closing line. Do not read the
+  absence of `odds` rows for a live match as a failure, and do not read a flat
+  `odds` series as a market with no opinion. Because it is a pre-match product it
+  needs `--include-upcoming`; a live-only run records no odds and warns once.
+- **The odds page is scraped HTML, ~330 KB, and `parse_odds` is a regex.** A site
+  redesign breaks it silently; the tell is `parse_odds` returning `None` (markup
+  moved) rather than `[]` (tab present, nothing quoted). The page is broken into
+  tabs and the Home/Away one is the only tab read; the per-move timestamps live in
+  the nested history tables the current-value scrape does not read, so `odds.ts`
+  is the capture's clock, not the site's.
+- **The odds source is not in `feed_polls`.** It is a page read, not a measured
+  value feed, and `TennisExplorer` deliberately does not use `measured_request`.
+  Do not expect an availability row for it.
 - **NULL means "no quote"**, which is real information about a decided market.
   Never fill it with a number at any layer.
 - **The Flashscore feed is undocumented.** `FLASHSCORE_SIGN` (`x-fsign`) is a

@@ -90,6 +90,12 @@ class TennisMarket:
     # score poll go straight to the right feed, and read what comes back in the
     # order this market lists its players, without pairing the board again.
     pairing: Paired | None = None
+    # Which TennisExplorer match's odds page this market reads, and whether that
+    # page lists the market's second outcome as its home player. Filled in by the
+    # poller's refresh beside the Flashscore pairing: the odds are a third
+    # source, and nothing in the Polymarket payload names either.
+    tennisexplorer_id: str | None = None
+    tennisexplorer_flip: int | None = None
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
     @property

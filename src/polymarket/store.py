@@ -181,6 +181,13 @@ MARKET_COLUMNS = [
     # nothing that reads home from away may be attributed to a player at all.
     ("flashscore_id", "TEXT"),
     ("flashscore_flip", "INTEGER"),
+    # Which TennisExplorer match's odds page this market's bookmakers are read
+    # from, and whether that page lists the market's second outcome as its home
+    # player. Kept for the same reason as the Flashscore pair: a restart pairs
+    # again, but the odds already stored need to be attributable to a match
+    # whose id this site may have retired by the time anyone reads them back.
+    ("tennisexplorer_id", "TEXT"),
+    ("tennisexplorer_flip", "INTEGER"),
     ("raw", "TEXT"),
 ]
 
@@ -276,6 +283,40 @@ TRADE_COLUMNS = [
     ("received_ts", "REAL"),
 ]
 
+
+@dataclass(frozen=True)
+class OddsRow:
+    """One bookmaker's Home/Away price, in the market's own outcome order.
+
+    A bookmaker's two prices are one row, not two, because they are one market
+    and one line of the page. The two sides move independently, but a row is
+    written only when either of them has moved, so the pair as stored is always
+    a pairing that actually stood together at `ts`.
+
+    ``price_0`` is the price on the market's first outcome. The page lists its
+    own home player first, so ``TePaired.render`` swaps them where the pairing
+    was flipped -- nothing here has to know.
+    """
+
+    condition_id: str
+    bookmaker: str
+    price_0: float
+    price_1: float
+    tennisexplorer_id: str | None = None
+    received_ts: float | None = None
+
+
+ODDS_COLUMNS = [
+    ("ts", "REAL"),
+    ("tick_id", "INTEGER"),
+    ("condition_id", "TEXT"),
+    ("bookmaker", "TEXT"),
+    ("price_0", "REAL"),
+    ("price_1", "REAL"),
+    ("tennisexplorer_id", "TEXT"),
+    ("received_ts", "REAL"),
+]
+
 _TEXT_COLUMNS = {"condition_id", "token_id", "outcome", "book_hash"}
 _INT_COLUMNS = {"tick_id", "outcome_index", "book_ts_derived"}
 
@@ -366,6 +407,25 @@ CREATE TABLE IF NOT EXISTS set_stats (
 CREATE TABLE IF NOT EXISTS trades (
 {", ".join(f"    {name:<18} {kind}" for name, kind in TRADE_COLUMNS)},
     PRIMARY KEY (transaction_hash, wallet, side, outcome_index)
+) WITHOUT ROWID;
+
+-- The bookmakers' pre-match odds, scraped from TennisExplorer on the tick.
+-- Same grain and the same reasoning as stat_events: the page is re-read every
+-- tick and carries the same prices until the match starts, so only a change is
+-- written down and the table stays a list of moments rather than of reads.
+--
+-- The two sides are one row because they are one market on one line of the
+-- page; the row is written when either side moves, so the pair always stood
+-- together at `ts`. Unlike trades, `ts` is the capture's clock, not the
+-- source's: the page does carry a timestamp per move, but in the nested
+-- history table the current-value scrape does not read. These are observations
+-- we made, at the resolution of the tick.
+--
+-- `tennisexplorer_id` rides the row so a price can still be traced to its match
+-- after the pairing that produced it is gone.
+CREATE TABLE IF NOT EXISTS odds (
+{", ".join(f"    {name:<18} {kind}" for name, kind in ODDS_COLUMNS)},
+    PRIMARY KEY (condition_id, bookmaker, ts)
 ) WITHOUT ROWID;
 
 """
@@ -466,6 +526,7 @@ class Store:
             ]
             + [(col, "REAL") for col in STAT_COLUMNS],
             "trades": TRADE_COLUMNS,
+            "odds": ODDS_COLUMNS,
             "feed_polls": [("duration_seconds", "REAL"), ("accepted_count", "INTEGER"),
                            ("rejected_count", "INTEGER")],
         }
@@ -525,6 +586,10 @@ class Store:
                 # read home-from-away may be attributed to a player then, and a
                 # 0 would say "the two are already the right way round".
                 (int(m.pairing.flip) if m.pairing.oriented else None) if m.pairing else None,
+                m.tennisexplorer_id,
+                # None, not 0, when the pairing could not be oriented: a mirrored
+                # odds pair is worse than no odds pair.
+                m.tennisexplorer_flip,
                 json.dumps(m.raw, default=str),
             )
             for m in markets
@@ -548,6 +613,13 @@ class Store:
                 -- deferred statistics collection is going to need.
                 flashscore_id=COALESCE(excluded.flashscore_id, markets.flashscore_id),
                 flashscore_flip=COALESCE(excluded.flashscore_flip, markets.flashscore_flip),
+                -- Coalesced for the same reason: a refresh where the odds board
+                -- was unavailable pairs nothing and must not erase the id the
+                -- already-recorded prices point back at.
+                tennisexplorer_id=COALESCE(
+                    excluded.tennisexplorer_id, markets.tennisexplorer_id),
+                tennisexplorer_flip=COALESCE(
+                    excluded.tennisexplorer_flip, markets.tennisexplorer_flip),
                 raw=excluded.raw
             """,
             rows,
@@ -801,6 +873,54 @@ class Store:
         )
         return cursor.rowcount if cursor.rowcount > 0 else 0
 
+    def record_odds(self, rows: Iterable[OddsRow], tick_id: int | None = None) -> int:
+        """Record bookmaker odds, one row per bookmaker that has moved.
+
+        Changes only, for the same reason the score and statistics tables store
+        changes only: the page is re-read every tick and hands back the same
+        pre-match prices until the match starts, so writing each read unchanged
+        would bury the moves under thousands of copies of the last one.
+
+        The comparison is per bookmaker over both sides at once: a row is this
+        bookmaker's line, and it is rewritten when either side of it moves. That
+        keeps a stored pair a price that actually stood together, rather than
+        two sides spliced from different moments.
+        """
+        now = time.time()
+        payload = []
+        for entry in rows:
+            previous = self.conn.execute(
+                "SELECT price_0, price_1 FROM odds "
+                "WHERE condition_id = ? AND bookmaker = ? ORDER BY ts DESC LIMIT 1",
+                (entry.condition_id, entry.bookmaker),
+            ).fetchone()
+            if previous is not None and (
+                previous[0],
+                previous[1],
+            ) == (entry.price_0, entry.price_1):
+                continue
+            payload.append(
+                (
+                    now,
+                    tick_id,
+                    entry.condition_id,
+                    entry.bookmaker,
+                    entry.price_0,
+                    entry.price_1,
+                    entry.tennisexplorer_id,
+                    entry.received_ts,
+                )
+            )
+
+        if payload:
+            names = [name for name, _ in ODDS_COLUMNS]
+            self.conn.executemany(
+                f"INSERT OR REPLACE INTO odds ({', '.join(names)}) "
+                f"VALUES ({', '.join('?' * len(names))})",
+                payload,
+            )
+        return len(payload)
+
     def markets_for_trade_backfill(
         self, tour: str | None = None, limit: int | None = None
     ) -> list[str]:
@@ -837,6 +957,7 @@ class Store:
         ).fetchall()
         stat_rows = cur.execute("SELECT COUNT(*) FROM stat_events").fetchone()[0]
         trade_rows = cur.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        odds_rows = cur.execute("SELECT COUNT(*) FROM odds").fetchone()[0]
         # By match rather than by row: the interesting number is how many
         # finished matches have their settled per-set breakdown, not how many
         # periods that came to.
@@ -851,6 +972,7 @@ class Store:
             "last_ts": last,
             "stat_events": stat_rows,
             "trades": trade_rows,
+            "odds": odds_rows,
             "set_stats": final,
             "by_tournament": by_tournament,
         }

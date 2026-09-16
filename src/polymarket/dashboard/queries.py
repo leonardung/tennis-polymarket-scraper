@@ -346,6 +346,7 @@ def match_detail(conn: sqlite3.Connection, condition_id: str) -> dict[str, Any] 
         "last_trade": _oriented_last_trade(books),
         "score_events": score_events(conn, condition_id),
         "stats": match_stats(conn, condition_id),
+        "odds": match_odds(conn, condition_id),
     }
 
 
@@ -426,6 +427,53 @@ def match_stats(conn: sqlite3.Connection, condition_id: str) -> dict[str, Any]:
         "live": _stat_period(latest, columns) if latest is not None else [],
         "final_ts": final_ts,
         "sets": sets,
+    }
+
+
+def match_odds(conn: sqlite3.Connection, condition_id: str) -> dict[str, Any]:
+    """The latest Home/Away line each bookmaker has on this match.
+
+    One row per bookmaker, the newest `odds` row for that bookmaker, in the
+    market's own outcome order -- the capture already flipped anything the page
+    listed the other way round. These are pre-match observations only: the last
+    one before the match starts is its closing line, and nothing is recorded in
+    play. The vig is left in the stored prices; normalizing it is a reader's
+    decision, made in the UI, not here.
+    """
+    empty: dict[str, Any] = {"ts": None, "tennisexplorer_id": None, "bookmakers": []}
+    if not _has_table(conn, "odds"):
+        return empty
+    rows = [
+        {
+            "bookmaker": r["bookmaker"],
+            "price_0": r["price_0"],
+            "price_1": r["price_1"],
+            "ts": r["ts"],
+            "tennisexplorer_id": r["tennisexplorer_id"],
+        }
+        for r in conn.execute(
+            """
+            SELECT o.bookmaker, o.price_0, o.price_1, o.ts, o.tennisexplorer_id
+            FROM odds o
+            WHERE o.condition_id = ?
+              AND o.ts = (
+                  SELECT MAX(x.ts) FROM odds x
+                  WHERE x.condition_id = o.condition_id AND x.bookmaker = o.bookmaker
+              )
+            ORDER BY o.bookmaker
+            """,
+            (condition_id,),
+        )
+    ]
+    if not rows:
+        return empty
+    return {
+        "ts": max(row["ts"] for row in rows),
+        "tennisexplorer_id": rows[0]["tennisexplorer_id"],
+        "bookmakers": [
+            {"bookmaker": r["bookmaker"], "price_0": r["price_0"], "price_1": r["price_1"]}
+            for r in rows
+        ],
     }
 
 

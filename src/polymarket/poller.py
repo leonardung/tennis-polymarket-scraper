@@ -55,10 +55,19 @@ from .config import (
     TRADES_PAGE,
     TRADES_TICK_PAGES,
 )
-from .discovery import discover, seconds_from_now
+from .discovery import discover, parse_iso, seconds_from_now
 from .scores import Flashscore, Paired, Ratchet, ScoreBoard, StatRatchet
-from .store import DEPTH_COLUMNS, STAT_COLUMNS, ScoreRow, StatRow, Store, TradeRow
+from .store import (
+    DEPTH_COLUMNS,
+    STAT_COLUMNS,
+    OddsRow,
+    ScoreRow,
+    StatRow,
+    Store,
+    TradeRow,
+)
 from .telemetry import drain, observations, received_at
+from .tennisexplorer import TeBoard, TePaired, TennisExplorer
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +88,14 @@ class Watched:
     pairing: Paired
     start_time: str | None
     question: str
+
+
+@dataclass(frozen=True)
+class OddsWatched:
+    """A match whose bookmaker odds can be re-read from TennisExplorer."""
+
+    condition_id: str
+    pairing: TePaired
 
 
 # How many times a finished match is asked for statistics that never come.
@@ -241,15 +258,22 @@ class Poller:
         only_changes: bool = True,
         record_stats: bool = True,
         record_trades: bool = True,
+        record_odds: bool = True,
         stats_interval: float = STATS_INTERVAL,
         heartbeat: float = HEARTBEAT,
         stale_after: float = STALE_AFTER,
         scores: Flashscore | None = None,
+        odds: TennisExplorer | None = None,
         tours: Sequence[str] = TOURS,
     ) -> None:
         self.api = api
         self.store = store
         self.scores = scores if scores is not None else Flashscore()
+        # TennisExplorer is a third source beside Flashscore and Polymarket. It
+        # only ever supplies the bookmakers' pre-match odds; the daily lists are
+        # read on the refresh, the odds pages on the tick.
+        self.odds = odds if odds is not None else TennisExplorer()
+        self.odds_board = TeBoard()
         self.board = ScoreBoard()
         # Every score, from the day card or from a per-match read, goes through
         # here before it is written, so a stale copy cannot rewind one already
@@ -268,11 +292,13 @@ class Poller:
         self.only_changes = only_changes
         self.record_stats = record_stats
         self.record_trades = record_trades
+        self.record_odds = record_odds
         self.stats_interval = stats_interval
         self.heartbeat = heartbeat
         self.stale_after = stale_after
         self.tracked: dict[str, Tracked] = {}
         self.watched: dict[str, Watched] = {}  # by condition_id
+        self.odds_watched: dict[str, OddsWatched] = {}  # by condition_id
         self._state: dict[str, str] = {}  # last seen live/upcoming/ended
         self._last_fingerprint: dict[str, tuple] = {}
         self._last_write: dict[str, float] = {}
@@ -290,6 +316,16 @@ class Poller:
         self._final_tries: dict[str, int] = {}
         self._state_changed = False
         self._stop = False
+
+        if self.record_odds and self.live_only:
+            # Odds are a pre-match product, and a live-only capture never holds
+            # a match before it starts -- so it would pair nothing and record
+            # nothing. Say so once rather than leave a silently empty table.
+            log.warning(
+                "odds: --no-odds is not set but --include-upcoming is off, so no "
+                "match is tracked before it starts and no bookmaker odds will be "
+                "captured; pass --include-upcoming to record them"
+            )
 
     # ---------------- lifecycle ----------------
 
@@ -351,6 +387,41 @@ class Poller:
             for market in kept
             if market.pairing
         }
+
+        # A third board, for the odds pages. It is read here rather than on the
+        # tick because the daily lists are what turn a market into a
+        # TennisExplorer id, and it is a handful of large page reads -- not
+        # something to repeat every five seconds. A load that fails keeps the
+        # previous board: the ids it holds still point at the right pages, and
+        # the pairing they produced is already stored on each market's row.
+        if self.record_odds:
+            try:
+                self.odds_board = self.odds.board(self.tours)
+            except (httpx.HTTPError, ValueError) as exc:
+                log.warning(
+                    "tennisexplorer board unavailable (%s), reusing the previous one",
+                    exc,
+                )
+
+        # Rebuilt wholesale, so a match that has been dropped stops being
+        # polled. A pairing that could not be oriented is recorded as an id with
+        # a NULL flip -- the prices are known but which side is which is not,
+        # and a mirrored pair is worse than none -- so it is not polled either.
+        self.odds_watched = {}
+        for market in kept:
+            paired = self.odds_board.pair(
+                market.tour, market.outcomes, parse_iso(market.start_time)
+            )
+            if paired is None:
+                continue
+            market.tennisexplorer_id = paired.id
+            market.tennisexplorer_flip = int(paired.flip) if paired.oriented else None
+            if paired.oriented:
+                self.odds_watched[market.condition_id] = OddsWatched(
+                    condition_id=market.condition_id,
+                    pairing=paired,
+                )
+
         for condition_id in set(self._last_poll) - self._followed():
             self._last_poll.pop(condition_id, None)
             self._last_stat_poll.pop(condition_id, None)
@@ -726,6 +797,89 @@ class Poller:
         )
         return written
 
+    # ---------------- bookmaker odds ----------------
+
+    def _odds_targets(
+        self,
+        due: set[str] | None = None,
+        starting: set[str] | None = None,
+    ) -> list[OddsWatched]:
+        """Which matches' odds pages this tick should read.
+
+        **Before the match only.** The bookmakers' markets close at the first
+        ball and the page then serves the same frozen line, so reading it while
+        a match is in play records nothing new and costs a ~330 KB page. The
+        odds are read on every tick a match is *upcoming* -- which, with
+        `--include-upcoming`, is the idle cadence right up to the start -- and
+        once more on the tick the score poll sees it go live, so the closing
+        line is captured rather than whatever the last idle poll happened to
+        see. After that it is never read again.
+
+        A match the refresh could not pair to a page, and a match that was
+        already live when it was first tracked, are not read at all. `starting`
+        is the set the score poll just saw move from upcoming to live.
+        """
+        if not self.record_odds:
+            return []
+        starting = starting or set()
+        targets = []
+        for condition_id, watched in self.odds_watched.items():
+            if due is not None and condition_id not in due:
+                continue
+            state = self._state.get(condition_id, "upcoming")
+            if state == "ended":
+                continue
+            if state == "live" and condition_id not in starting:
+                continue
+            targets.append(watched)
+        return targets
+
+    def poll_odds(
+        self,
+        due: set[str] | None = None,
+        tick_id: int | None = None,
+        starting: set[str] | None = None,
+    ) -> int:
+        """Read the bookmakers' odds for the matches this tick is reading.
+
+        One page read per match, sequential on one connection, in the same pass
+        as that match's book and score. Only matches not yet in play are read:
+        the line is pre-match only and freezes at the first ball, and the one
+        read forced on the tick a match goes live is what makes the last stored
+        price the closing one. What lands in `odds` is the moves that were seen
+        and the tick they were seen on, the same changes-only rule the score
+        and statistics tables follow.
+        """
+        targets = self._odds_targets(due, starting)
+        if not targets:
+            return 0
+        rows = []
+        for watched in targets:
+            quotes = self.odds.odds(watched.pairing.id)
+            if quotes is None:
+                continue
+            received = time.time()
+            for quote in quotes:
+                first, second = watched.pairing.render(quote)
+                rows.append(
+                    OddsRow(
+                        condition_id=watched.condition_id,
+                        bookmaker=quote.bookmaker,
+                        price_0=first,
+                        price_1=second,
+                        tennisexplorer_id=watched.pairing.id,
+                        received_ts=received,
+                    )
+                )
+        written = self.store.record_odds(rows, tick_id=tick_id)
+        log.log(
+            logging.INFO if written else logging.DEBUG,
+            "odds: %d match(es) read, %d change(s)",
+            len(targets),
+            written,
+        )
+        return written
+
     # ---------------- trade prints ----------------
 
     @_capture_poll("trades")
@@ -1016,6 +1170,14 @@ class Poller:
                 for condition_id in due
                 if self._state.get(condition_id) == "live"
             }
+            # Odds are read before a match, so the opposite transition matters:
+            # the tick a match leaves "upcoming" is the last one to catch the
+            # closing line, and the score poll below is what moves it.
+            upcoming_before_score = {
+                condition_id
+                for condition_id in due
+                if self._state.get(condition_id) == "upcoming"
+            }
             try:
                 self.tick(due, tick_id=tick_id)
             except httpx.HTTPError as exc:
@@ -1057,6 +1219,24 @@ class Poller:
                 log.warning("trades poll failed (%s), continuing", exc)
             except Exception:  # noqa: BLE001 - the books matter more than the tape
                 log.exception("unexpected error in trades poll, continuing")
+
+            # The bookmakers' pre-match odds, on the same `due` set. A match
+            # that was upcoming before the score poll and is live after it just
+            # started, and gets one forced read for the closing line before the
+            # page is abandoned for the rest of the match.
+            starting = {
+                condition_id
+                for condition_id in upcoming_before_score
+                if self._state.get(condition_id) == "live"
+            }
+            # The least valuable thing read on a tick and the largest response,
+            # so it is polled last, after the book, the score and the tape.
+            try:
+                self.poll_odds(due, tick_id=tick_id, starting=starting)
+            except httpx.HTTPError as exc:
+                log.warning("odds poll failed (%s), continuing", exc)
+            except Exception:  # noqa: BLE001 - the books matter more than the odds
+                log.exception("unexpected error in odds poll, continuing")
 
             if self._final_stats_due():
                 try:

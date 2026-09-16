@@ -47,6 +47,7 @@ from .evidence_chain import RPC_URL
 from .poller import Poller
 from .scores import Flashscore
 from .store import Store, TradeRow
+from .tennisexplorer import TennisExplorer
 
 DEFAULT_DB = "data/tennis.db"
 DEFAULT_EVIDENCE_DB = "data/exploratory-evidence.db"
@@ -120,11 +121,17 @@ def _as_dict(market: object) -> dict[str, object]:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    with Polymarket() as api, Flashscore() as scores, Store(args.db) as store:
+    with (
+        Polymarket() as api,
+        Flashscore() as scores,
+        TennisExplorer() as odds,
+        Store(args.db) as store,
+    ):
         poller = Poller(
             api,
             store,
             scores=scores,
+            odds=odds,
             interval=args.interval,
             idle_interval=args.idle_interval,
             refresh_interval=args.refresh,
@@ -134,19 +141,21 @@ def cmd_run(args: argparse.Namespace) -> int:
             only_changes=not args.every_tick,
             record_stats=not args.no_stats,
             record_trades=not args.no_trades,
+            record_odds=not args.no_odds,
             stats_interval=args.stats_interval,
             heartbeat=args.heartbeat,
             stale_after=args.stale_after,
             tours=_tours(args),
         )
         logging.info(
-            "capturing depth-%d %s books, scores%s%s into %s: every %.0fs while a match "
+            "capturing depth-%d %s books, scores%s%s%s into %s: every %.0fs while a match "
             "is in play, every %.0fs before it starts, never once it is over "
             "(%s matches, %s)",
             BOOK_DEPTH,
             "/".join(t.upper() for t in _tours(args)),
             "" if args.no_stats else " and match statistics",
             "" if args.no_trades else " and trade prints",
+            "" if args.no_odds else " and TennisExplorer odds",
             args.db,
             args.interval,
             args.idle_interval,
@@ -359,6 +368,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"snapshots {stats['snapshots']}")
     print(f"stats     {stats['stat_events']} change(s), {stats['set_stats']} match(es) with final per-set")
     print(f"trades    {stats['trades']}")
+    print(f"odds      {stats['odds']} change(s) from TennisExplorer")
     print(f"window    {fmt(stats['first_ts'])} -> {fmt(stats['last_ts'])}\n")
     rows = stats["by_tournament"]
     if isinstance(rows, list) and rows:
@@ -525,6 +535,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="do not record trade prints -- per-trade price, size and taker direction "
         "off the Data API. They cost one extra batched read per tick",
+    )
+    p_run.add_argument(
+        "--no-odds",
+        action="store_true",
+        help="do not record bookmaker odds off TennisExplorer. They are pre-match only "
+        "and freeze at the first ball, and the page is ~330KB per match per tick",
     )
     p_run.add_argument(
         "--stats-interval",

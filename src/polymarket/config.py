@@ -69,6 +69,18 @@ FLASHSCORE_SIGN = "SW9D1eZo"  # static signature the site sends on every feed re
 FLASHSCORE_TZ = 1  # only shifts where the day boundary falls; times are always UTC
 FLASHSCORE_DAYS = (-1, 0, 1)  # day cards to read, relative to today
 
+# Bookmaker odds come from TennisExplorer, which publishes a match's whole
+# pre-match odds history on its detail page. It is a scrape of server-rendered
+# HTML rather than a feed, and the page is ~330 KB -- the fixture list, both
+# players' profiles, the head-to-head and four odds tabs, of which only the
+# Home/Away tab is kept. The odds freeze at the first ball (they are pre-match
+# only), so the per-tick poll records the same values until a match starts;
+# that is deliberate, and `tennisexplorer.py` says why.
+TENNISEXPLORER_HOST = "https://www.tennisexplorer.com"
+TENNISEXPLORER_TIMEOUT = 20.0
+TENNISEXPLORER_TZ = 1  # the site's default clock; only dates wall-clock times
+TENNISEXPLORER_DAYS = (-1, 0, 1)  # daily lists to pair against, relative to today
+
 
 # Match statistics come off a third Flashscore feed, `df_st_2_<id>`, and are read
 # on the tick with the book and the score. One read carries every period at once

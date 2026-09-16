@@ -18,7 +18,14 @@ from polymarket.book import parse_book  # noqa: E402
 from polymarket.config import BOOK_DEPTH, MATCH_SLUG, match_tournament  # noqa: E402
 from polymarket.discovery import discover  # noqa: E402
 from polymarket.poller import Poller  # noqa: E402
-from polymarket.store import Store, TradeRow  # noqa: E402
+from polymarket.store import OddsRow, Store, TradeRow  # noqa: E402
+from polymarket.tennisexplorer import (  # noqa: E402
+    OddsQuote,
+    TeBoard,
+    TeMatch,
+    parse_day,
+    parse_odds,
+)
 
 PASSED = 0
 
@@ -209,6 +216,53 @@ class FakeFlashscore:
         wanted = list(match_ids)
         self.stat_calls.append(wanted)
         return {i: self.stats_by_id[i] for i in wanted if i in self.stats_by_id}
+
+
+class FakeTennisExplorer:
+    """Stands in for the odds site: a board to pair against, pages to read."""
+
+    def __init__(self, board: TeBoard | None = None, quotes: dict | None = None) -> None:
+        self._board = board if board is not None else TeBoard()
+        self.quotes = quotes or {}
+        self.board_calls: list[tuple] = []
+        self.odds_calls: list[str] = []
+
+    def board(self, tours, today=None):
+        self.board_calls.append(tuple(tours))
+        return self._board
+
+    def odds(self, match_id):
+        self.odds_calls.append(match_id)
+        return self.quotes.get(match_id)
+
+
+# The poller builds a real TennisExplorer when it is not handed one, and its
+# refresh reads the daily lists. No check may reach that site, so an empty fake
+# stands in for the whole run; the checks that exercise odds pass their own
+# instance explicitly.
+import polymarket.poller as _poller_module  # noqa: E402
+
+_poller_module.TennisExplorer = FakeTennisExplorer  # type: ignore[assignment]
+
+
+def _te_board(*matches: tuple, tour: str = "atp") -> TeBoard:
+    """Build a TeBoard the way parse_day would, from (home, away) name pairs."""
+    from polymarket.scores import name_tokens
+
+    built = []
+    for index, (home, away) in enumerate(matches):
+        built.append(
+            TeMatch(
+                id=f"te{index}",
+                tour=tour,
+                home=home,
+                away=away,
+                home_tokens=name_tokens(home),
+                away_tokens=name_tokens(away),
+                starts_at=None,
+            )
+        )
+    return TeBoard(built)
 
 
 def _board(*matches: tuple, tour: str = "atp", received_ts: float | None = None) -> object:
@@ -2548,6 +2602,230 @@ def test_trades() -> None:
         poller_mod.TRADES_TICK_PAGES = original_pages
 
 
+DAY_HTML = """<table class="result"><tbody>
+<tr id="s10" class="one fRow bott" onmouseover="md_over(this);">
+  <td class="first time" rowspan="2">17:00</td>
+  <td class="t-name"><a href="/player/zandsch/">Van de Zandschulp B.</a></td>
+  <td class="result">&nbsp;</td>
+  <td class="score">&nbsp;</td>
+  <td class="coursew" rowspan="2">2.10</td>
+  <td class="course" rowspan="2">1.70</td>
+  <td rowspan="2"><a href="/match-detail/?id=111" title="Click for match detail">info</a></td>
+</tr>
+<tr id="s10b" class="one" onmouseover="md_over(this);">
+  <td class="t-name"><a href="/player/grieks/">Griekspoor T.</a></td>
+  <td class="result">&nbsp;</td>
+</tr>
+<tr id="r11" class="two bott" onmouseover="md_over(this);">
+  <td class="first time" rowspan="2">10:05</td>
+  <td class="t-name"><a href="/player/sobolieva/">Sobolieva A.</a> (6)</td>
+  <td class="result">2</td>
+  <td class="score">7</td>
+  <td class="coursew" rowspan="2">1.56</td>
+  <td class="course" rowspan="2">2.36</td>
+  <td rowspan="2"><a href="/match-detail/?id=222" title="Click for match detail">info</a></td>
+</tr>
+<tr id="r11b" class="two" onmouseover="md_over(this);">
+  <td class="t-name"><a href="/player/zoldakova/">Zoldakova D.</a></td>
+  <td class="result">0</td>
+</tr>
+</tbody></table>
+"""
+
+# A Home/Away tab (the only one read), a second tab to bound it, and three
+# bookmakers of which the last quotes only one side.
+ODDS_HTML = """<div id="oddsMenu-1-data"><table class="result " cellspacing="0"><tbody>
+<tr class="head"><td class="tl"> </td><td class="k1">Home</td><td class="k2">Away</td></tr>
+<tr class="one"><td class="first tl"><a href="x" class="icons"><span class="i eLink">&nbsp;</span><span class="t">10Bet</span></a></td>
+  <td class="k1"><div class="odds-in odown">1.10<div class="odds-change-div"><table><tr><td>15.09. 16:15</td><td class="bold">1.10</td></tr></table></div></div></td>
+  <td class="k2"><div class="odds-in oup">6.50<div class="odds-change-div"><table><tr><td>15.09. 13:03</td><td class="bold">6.50</td></tr></table></div></div></td></tr>
+<tr class="two"><td class="first tl"><a href="y" class="icons"><span class="t">1xBet</span></a></td>
+  <td class="k1"><div class="odds-in odown">1.12<div class="odds-change-div"><table></table></div></div></td>
+  <td class="k2 best-betrate"><div class="odds-in oup">7.20<div class="odds-change-div"><table></table></div></div></td></tr>
+<tr class="one"><td class="first tl"><a href="z" class="icons"><span class="t">Half</span></a></td>
+  <td class="k1"><div class="odds-in odown">2.00<div class="odds-change-div"><table></table></div></div></td>
+  <td class="k2">&nbsp;</td></tr>
+</tbody></table></div>
+<div id="oddsMenu-2-data"><table class="result"><tbody><tr class="one"><td>Over</td></tr></tbody></table></div>
+"""
+
+
+def test_tennisexplorer() -> None:
+    """The odds source: daily-list pairing, the odds tab, the store, the poll."""
+    print("\ntennisexplorer odds")
+    from datetime import datetime, timezone
+
+    day = parse_day(DAY_HTML, "atp", datetime(2026, 9, 16), tz=1)
+    check("daily list finds both rows", len(day) == 2)
+    check("scheduled row paired", day[0].id == "111")
+    check("home player read", day[0].home == "Van de Zandschulp B.")
+    check("away player read from the second row", day[0].away == "Griekspoor T.")
+    check("result row also read", day[1].id == "222")
+    # 17:00 on the list's own day, in the site's GMT+1.
+    expected = datetime(2026, 9, 16, 17, 0, tzinfo=timezone.utc).timestamp() - 3600
+    check("start dated from the list's day", day[0].starts_at == expected)
+
+    board = TeBoard(day)
+    paired = board.pair("atp", ["Botic van de Zandschulp", "Tallon Griekspoor"])
+    check("market paired to the page", paired is not None and paired.id == "111")
+    check("sides the same way round", paired is not None and paired.flip is False)
+    reverse = board.pair("atp", ["Tallon Griekspoor", "Botic van de Zandschulp"])
+    check("reversed market is flipped, not rejected",
+          reverse is not None and reverse.flip is True)
+
+    # The same two players appearing twice on the board is refused, not guessed.
+    ambiguous = TeBoard(day + [TeMatch(
+        id="333", tour="atp", home="Van de Zandschulp B.", away="Griekspoor T.",
+        home_tokens=day[0].home_tokens, away_tokens=day[0].away_tokens, starts_at=None,
+    )])
+    check("a second candidate refuses the pairing",
+          ambiguous.pair("atp", ["Botic van de Zandschulp", "Tallon Griekspoor"]) is None)
+
+    # Two identical surnames fit each other's side equally well: the match is
+    # known but which way round it goes is not.
+    twin = TeBoard([TeMatch(
+        id="444", tour="atp", home="Lee A.", away="Lee B.",
+        home_tokens=frozenset({"lee"}), away_tokens=frozenset({"lee"}), starts_at=None,
+    )])
+    twin_pair = twin.pair("atp", ["A. Lee", "B. Lee"])
+    check("identical names keep the id without orientation",
+          twin_pair is not None and twin_pair.oriented is False)
+
+    quotes = parse_odds(ODDS_HTML)
+    check("odds tab parsed", quotes is not None and len(quotes) == 2)
+    check("bookmaker named", quotes is not None and quotes[0].bookmaker == "10Bet")
+    check("current prices read past the nested history table",
+          quotes is not None and (quotes[0].home, quotes[0].away) == (1.10, 6.50))
+    check("a best-rate marker does not hide the price",
+          quotes is not None and quotes[1].away == 7.20)
+    check("a one-sided bookmaker is dropped", quotes is not None and len(quotes) == 2)
+    check("no Home/Away tab is None, not empty", parse_odds("<div id='x'></div>") is None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "t.db") as store:
+            row = OddsRow(
+                condition_id="0x1", bookmaker="10Bet", price_0=1.10, price_1=6.50,
+                tennisexplorer_id="111",
+            )
+            check("first read inserts", store.record_odds([row], tick_id=9) == 1)
+            check("re-reading the same prices writes nothing",
+                  store.record_odds([row], tick_id=10) == 0)
+            moved = OddsRow(
+                condition_id="0x1", bookmaker="10Bet", price_0=1.08, price_1=6.75,
+                tennisexplorer_id="111",
+            )
+            check("either side moving rewrites the pair",
+                  store.record_odds([moved], tick_id=11) == 1)
+            stored = store.conn.execute(
+                "SELECT tick_id, price_0, price_1, tennisexplorer_id FROM odds "
+                "ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+            check("change stamped with its tick", stored[0] == 11)
+            check("the pair stored together",
+                  (stored[1], stored[2]) == (1.08, 6.75))
+            check("the page id rides the row", stored[3] == "111")
+            check("stats counts odds changes", store.stats()["odds"] == 2)
+
+    # The dashboard payload: the newest line per bookmaker, and an empty shape
+    # (not None) for a match with none -- the same contract the UI relies on.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "d.db"
+        with Store(path) as store:
+            store.conn.execute(
+                "INSERT INTO markets (condition_id, question, outcome_0, outcome_1) "
+                "VALUES (?, ?, ?, ?)",
+                ("0x1", "A vs B", "A", "B"),
+            )
+            store.record_odds(
+                [OddsRow("0x1", "10Bet", 1.10, 6.50, "111"),
+                 OddsRow("0x1", "Pinnacle", 1.12, 7.08, "111")],
+                tick_id=1,
+            )
+            time.sleep(0.01)
+            store.record_odds([OddsRow("0x1", "10Bet", 1.08, 6.75, "111")], tick_id=2)
+        from polymarket.dashboard import queries
+
+        conn = queries.connect(path)
+        payload = queries.match_odds(conn, "0x1")
+        check("dashboard odds: one row per bookmaker", len(payload["bookmakers"]) == 2)
+        check(
+            "dashboard odds: the newest line per bookmaker",
+            payload["bookmakers"][0]
+            == {"bookmaker": "10Bet", "price_0": 1.08, "price_1": 6.75},
+        )
+        check(
+            "dashboard odds: a match with none is an empty shape",
+            queries.match_odds(conn, "0xmissing")
+            == {"ts": None, "tennisexplorer_id": None, "bookmakers": []},
+        )
+
+    # On the tick, in the poller: pair on the refresh, read the page on the
+    # tick, and write only what moved.
+    api = FakeAPI([_cincinnati_atp()])
+    explorer = FakeTennisExplorer(
+        _te_board(("Van de Zandschulp B.", "Griekspoor T.")),
+        {"te0": [OddsQuote("10Bet", 1.10, 6.50), OddsQuote("1xBet", 1.12, 7.20)]},
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "t.db") as store:
+            poller = Poller(
+                api, store, scores=FakeFlashscore(board=_live_board()), odds=explorer
+            )
+            poller.refresh()
+            check("refresh paired the market to a page", len(poller.odds_watched) == 1)
+            cid = next(iter(poller.odds_watched))
+            check("the page id is stored on the market",
+                  store.conn.execute(
+                      "SELECT tennisexplorer_id FROM markets WHERE condition_id = ?", (cid,)
+                  ).fetchone()[0] == "te0")
+
+            # Before the start the page is read; the board says "live", so the
+            # state is set to what the tick before the start would have seen.
+            poller._state[cid] = "upcoming"
+            written = poller.poll_odds({cid}, tick_id=100)
+            check("both bookmakers written on the first read", written == 2)
+            check("one page read for the match", explorer.odds_calls == ["te0"])
+            check("a second tick finds nothing moved",
+                  poller.poll_odds({cid}, tick_id=101) == 0)
+            check("odds are only read for due matches",
+                  poller.poll_odds(set(), tick_id=102) == 0)
+
+            # Once in play the page freezes, so it is not read again...
+            poller._state[cid] = "live"
+            explorer.odds_calls.clear()
+            check("in-play odds are not read",
+                  poller.poll_odds({cid}, tick_id=103) == 0 and explorer.odds_calls == [])
+            # ...except once on the tick it goes live, for the closing line.
+            check("the starting tick forces one closing read",
+                  poller.poll_odds({cid}, tick_id=104, starting={cid}) == 0
+                  and explorer.odds_calls == ["te0"])
+
+    # Orientation: the page's home is the market's second outcome, so the two
+    # prices arrive swapped in the market's order.
+    flipped = FakeTennisExplorer(
+        _te_board(("Griekspoor T.", "Van de Zandschulp B.")),
+        {"te0": [OddsQuote("10Bet", 6.50, 1.10)]},
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "t.db") as store:
+            poller = Poller(
+                api, store, scores=FakeFlashscore(board=_live_board()), odds=flipped
+            )
+            poller.refresh()
+            cid = next(iter(poller.odds_watched))
+            poller._state[cid] = "upcoming"
+            poller.poll_odds({cid}, tick_id=1)
+            stored = store.conn.execute(
+                "SELECT price_0, price_1 FROM odds WHERE condition_id = ?", (cid,)
+            ).fetchone()
+            check("a flipped page stores in the market's order",
+                  stored == (1.10, 6.50))
+            check("and records the flip on the market",
+                  store.conn.execute(
+                      "SELECT tennisexplorer_flip FROM markets WHERE condition_id = ?", (cid,)
+                  ).fetchone()[0] == 1)
+
+
 def _predecessor_store():
     """Execute the exact, hash-pinned pre-availability writer, without network."""
     import hashlib
@@ -3032,6 +3310,7 @@ if __name__ == "__main__":
     test_final_stats()
     test_stats_poll()
     test_trades()
+    test_tennisexplorer()
     test_availability_migration()
     test_measured_requests_and_polls()
     test_predecessor_writer_rollback()

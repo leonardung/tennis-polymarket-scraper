@@ -14,6 +14,7 @@ import { useAsync } from "../hooks";
 import type { ChartPalette } from "../theme";
 import type { MatchDetail as Detail, ScoreEvent } from "../types";
 import { Legend, Panel, Segmented, StatTile } from "./Chrome";
+import { MatchOdds } from "./MatchOdds";
 import { MatchStats } from "./MatchStats";
 import { OrderBook } from "./OrderBook";
 import { TableView } from "./TableView";
@@ -301,6 +302,12 @@ export function MatchDetail({
       )}
 
       <MatchStats stats={match.stats} players={match.players} live={match.state === "live"} />
+
+      <MatchOdds
+        odds={match.odds}
+        players={match.players}
+        mids={[match.books[0]?.mid ?? null, match.books[1]?.mid ?? null]}
+      />
 
       <Panel
         title="Order book"
