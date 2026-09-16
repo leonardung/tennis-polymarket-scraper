@@ -17,6 +17,7 @@ screenshots/
 
 # Captures belong to the host, mounted in at /data.
 data/
+evidence-data/
 
 .claude/
 .dockerignore

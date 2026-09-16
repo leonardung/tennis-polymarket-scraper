@@ -301,7 +301,7 @@ class Poller:
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
 
-    def refresh(self) -> None:
+    def refresh(self, tick_id: int | None = None) -> None:
         # The day card is what turns a market into a Flashscore id, so it is
         # read here rather than on the tick. A board that cannot be loaded at
         # all keeps the previous one: stale ids still point at the right
@@ -380,7 +380,21 @@ class Poller:
         self._state = {m.condition_id: m.state for m in kept}
 
         self.store.upsert_markets(kept)
-        self.store.record_score_events(ScoreRow.of(m) for m in kept)
+        # A score the refresh writes off the day card is not a capture-tick read,
+        # so it did not go through the score poll and would otherwise be stored
+        # with a NULL receipt. Carry the board response's own clock across from
+        # the pairing instead of inventing one. A match the board could not name
+        # has no feed behind it and keeps its NULL honestly.
+        self.store.record_score_events(
+            (
+                replace(
+                    ScoreRow.of(m),
+                    received_ts=m.pairing.received_ts if m.pairing else None,
+                )
+                for m in kept
+            ),
+            tick_id=tick_id,
+        )
         self._schedule_next_start(skipped)
 
         # Only say "live" when that is what is being tracked; with
@@ -1052,7 +1066,7 @@ class Poller:
 
             if self._refresh_due(last_refresh):
                 try:
-                    self.refresh()
+                    self.refresh(tick_id=tick_id)
                 except Exception as exc:  # noqa: BLE001
                     log.error("refresh failed (%s), keeping previous market list", exc)
                 last_refresh = time.monotonic()

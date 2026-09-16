@@ -211,12 +211,13 @@ class FakeFlashscore:
         return {i: self.stats_by_id[i] for i in wanted if i in self.stats_by_id}
 
 
-def _board(*matches: tuple, tour: str = "atp") -> object:
+def _board(*matches: tuple, tour: str = "atp", received_ts: float | None = None) -> object:
     """Build a ScoreBoard the way parse_board would, from (players, status, sets).
 
     Each entry is ``(home, away, status_code, [(games, games), ...])`` with the
     status code Flashscore's `AC` key uses -- 17 for "set 1 in play", 3 for
-    finished, and so on.
+    finished, and so on. ``received_ts`` stands in for the day-card response
+    clock ``Flashscore.board`` stamps on every match it parses.
     """
     from polymarket.scores import BoardMatch, Reading, ScoreBoard, SetScore, name_tokens
     from polymarket.scores import _STATUS
@@ -236,6 +237,7 @@ def _board(*matches: tuple, tour: str = "atp") -> object:
                 away_tokens=name_tokens(away),
                 starts_at=None,
                 reading=Reading(state, period, tuple(SetScore(*s) for s in sets)),
+                received_ts=received_ts,
             )
         )
     return ScoreBoard(built)
@@ -1348,6 +1350,143 @@ def test_score_poll() -> None:
 
             poller.refresh()
             check("refreshing clears the pending flag", poller._state_changed is False)
+
+
+def test_board_score_receipt() -> None:
+    """The day card's own response clock is the receipt a refresh writes.
+
+    Three things matter. The clock must come off the real HTTP boundary and be
+    taken before the payload is parsed, not from whenever the row is logged. A
+    payload-only override has no HTTP boundary, so it keeps NULL rather than
+    borrowing our clock. And a match the board never named has no feed behind it
+    at all.
+    """
+    print("\nboard score receipt")
+    import httpx
+
+    from polymarket import scores as scores_mod
+    from polymarket.poller import Poller
+    from polymarket.telemetry import observations
+
+    # --- the measured acquisition path: a real transport, so the completion
+    # clock is captured before `parse_board` ever sees the bytes.
+    feed = scores_mod.Flashscore(days=(0,))
+    feed._client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text=DAY_FEED, request=request)
+        )
+    )
+    parsed_at: dict[str, float] = {}
+    real_parse = scores_mod.parse_board
+
+    def observed_parse(raw: str):
+        parsed_at["at"] = time.time()
+        return real_parse(raw)
+
+    scores_mod.parse_board = observed_parse
+    try:
+        board = feed.board()
+    finally:
+        scores_mod.parse_board = real_parse
+
+    board_obs = [o for o in observations(feed) if o.feed == "board"]
+    check("the day card is measured once", len(board_obs) == 1)
+    check(
+        "the receipt is taken before the payload is parsed",
+        board_obs[0].received_ts <= parsed_at["at"],
+    )
+    check(
+        "and is the response clock, not a logging time",
+        board_obs[0].request_ts <= board_obs[0].received_ts,
+    )
+    check("every parsed match carries that clock", board.matches["Qi0f7iu1"].received_ts == board_obs[0].received_ts)
+
+    feed.days = (0, 1)
+    overlapping = feed.board()
+    two_days = [o for o in observations(feed) if o.feed == "board"][-2:]
+    check("overlapping cards keep one fixture", len(overlapping) == len(board))
+    check(
+        "the chosen first copy keeps its own response clock",
+        overlapping.matches["Qi0f7iu1"].received_ts == two_days[0].received_ts,
+    )
+    feed.days = (0,)
+
+    # --- a payload-only override cannot establish a boundary: no observation
+    # is invented and no receipt is borrowed from the caller.
+    override = scores_mod.Flashscore(days=(0,))
+    override._get = lambda feed_name: DAY_FEED
+    overridden = override.board()
+    check("an override still parses the day card", len(overridden) == 3)
+    check("but invents no receipt", all(m.received_ts is None for m in overridden.matches.values()))
+    check("and records no measured request", not [o for o in observations(override) if o.feed == "board"])
+
+    api = FakeAPI(
+        [
+            _event(
+                "Cincinnati Open: Arthur Fery vs Alex de Minaur",
+                "atp-fery-deminaur-2026-08-16",
+                [
+                    (
+                        "Cincinnati Open: Arthur Fery vs Alex de Minaur",
+                        ["Arthur Fery", "Alex de Minaur"],
+                        True,
+                    )
+                ],
+            )
+        ]
+    )
+    api.books = lambda token_ids: {}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with Store(Path(tmp) / "r.db") as store:
+            poller = Poller(api, store, scores=feed)
+            poller.refresh(tick_id=4242)
+            row = store.conn.execute(
+                "SELECT state, tick_id, received_ts FROM score_events"
+            ).fetchone()
+            last = [o for o in observations(feed) if o.feed == "board"][-1]
+            check("the refresh row is the live board reading", row[0] == "live")
+            check("it keeps the measured receipt", row[2] == last.received_ts)
+            check("and the tick it was captured in", row[1] == 4242)
+            check(
+                "board reads are not written to feed_polls",
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM feed_polls WHERE feed = 'board'"
+                ).fetchone()[0] == 0,
+            )
+            retained = poller.board.matches["Qi0f7iu1"].received_ts
+
+            def fail_board(*args, **kwargs):
+                raise httpx.ConnectError("offline fixture")
+
+            feed._send = fail_board
+            poller.refresh(tick_id=4243)
+            check(
+                "a failed refresh retains the original board receipt",
+                poller.board.matches["Qi0f7iu1"].received_ts == retained,
+            )
+            check(
+                "and never relabels the stored score with a new receipt",
+                store.conn.execute("SELECT received_ts FROM score_events").fetchone()[0] == retained,
+            )
+
+        with Store(Path(tmp) / "o.db") as store:
+            poller = Poller(api, store, scores=override)
+            poller.refresh(tick_id=7)
+            row = store.conn.execute(
+                "SELECT state, received_ts FROM score_events"
+            ).fetchone()
+            check("an override board still records the state", row is not None and row[0] == "live")
+            check("but no receipt is fabricated for it", row[1] is None)
+
+        with Store(Path(tmp) / "u.db") as store:
+            unpaired = Poller(api, store, scores=FakeFlashscore(), live_only=False)
+            unpaired.refresh(tick_id=9)
+            row = store.conn.execute(
+                "SELECT tick_id, received_ts FROM score_events"
+            ).fetchone()
+            check("an unpaired match still records its state", row is not None)
+            check("and keeps a NULL receipt", row[1] is None)
 
 
 def test_score_cadence() -> None:
@@ -2874,6 +3013,7 @@ if __name__ == "__main__":
     test_score_events()
     test_score_poll_targeting()
     test_score_poll()
+    test_board_score_receipt()
     test_score_cadence()
     test_score_poll_isolation()
     test_update_scores()

@@ -33,11 +33,23 @@ from .config import (
     TRADES_PAGE,
 )
 from .discovery import discover
+from .evidence import (
+    DEFAULT_INTERVAL as EVIDENCE_INTERVAL,
+    DEFAULT_MAX_REQUESTS,
+    DEFAULT_REQUEST_PAUSE,
+    DEFAULT_TIMEOUT as EVIDENCE_TIMEOUT,
+    EvidenceCollector,
+    EvidenceStore,
+    OFFICIAL_DOCUMENTS,
+    protocol_settings,
+)
+from .evidence_chain import RPC_URL
 from .poller import Poller
 from .scores import Flashscore
 from .store import Store, TradeRow
 
 DEFAULT_DB = "data/tennis.db"
+DEFAULT_EVIDENCE_DB = "data/exploratory-evidence.db"
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -142,6 +154,31 @@ def cmd_run(args: argparse.Namespace) -> int:
             "every tick" if args.every_tick else "on change",
         )
         poller.run()
+    return 0
+
+
+def cmd_evidence(args: argparse.Namespace) -> int:
+    settings = protocol_settings(
+        interval=args.interval,
+        timeout=args.timeout,
+        request_pause=args.request_pause,
+        max_requests=args.max_requests,
+    )
+    with EvidenceStore(args.output, args.db, settings) as store:
+        collector = EvidenceCollector(
+            args.db,
+            store,
+            timeout=args.timeout,
+            request_pause=args.request_pause,
+            max_requests=args.max_requests,
+        )
+        logging.info(
+            "collecting exploratory raw evidence from %s into %s; cycles target %.0fs",
+            args.db,
+            args.output,
+            args.interval,
+        )
+        collector.run(interval=args.interval, once=args.once)
     return 0
 
 
@@ -511,6 +548,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.set_defaults(func=cmd_run, needs_network=True)
 
+    p_evidence = sub.add_parser(
+        "evidence", parents=[common], help="collect raw exploratory fee and resolution evidence"
+    )
+    p_evidence.add_argument("--output", default=DEFAULT_EVIDENCE_DB)
+    p_evidence.add_argument("--once", action="store_true", help="run one bounded cycle and exit")
+    p_evidence.add_argument("--interval", type=float, default=EVIDENCE_INTERVAL)
+    p_evidence.add_argument("--timeout", type=float, default=EVIDENCE_TIMEOUT)
+    p_evidence.add_argument("--request-pause", type=float, default=DEFAULT_REQUEST_PAUSE)
+    p_evidence.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
+    p_evidence.set_defaults(func=cmd_evidence, needs_network=True)
+
     p_stats = sub.add_parser(
         "stats", parents=[common], help="summarize what has been captured"
     )
@@ -591,6 +639,8 @@ def main(argv: list[str] | None = None) -> int:
                 urlparse(CLOB).hostname or "",
                 urlparse(DATA_API).hostname or "",
                 urlparse(FLASHSCORE_HOST).hostname or "",
+                *(urlparse(url).hostname or "" for url in OFFICIAL_DOCUMENTS),
+                urlparse(RPC_URL).hostname or "",
             ],
             args.dns,
         )

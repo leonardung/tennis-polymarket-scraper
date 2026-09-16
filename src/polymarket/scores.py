@@ -57,7 +57,7 @@ from typing import Iterable, Sequence
 
 import httpx
 
-from .telemetry import measured_request
+from .telemetry import measured_request, received_at
 
 from .config import (
     FLASHSCORE_DAYS,
@@ -320,6 +320,11 @@ class BoardMatch:
     away_tokens: frozenset[str]
     starts_at: float | None
     reading: Reading
+    # When the day-card response this match came from was received. It rides the
+    # match through pairing so a score written off the board carries the same
+    # kind of receipt as one read from the per-match feed, rather than a NULL
+    # that cannot be told from a row written before receipts existed.
+    received_ts: float | None = None
 
     @property
     def label(self) -> str:
@@ -339,6 +344,9 @@ class Paired:
     # False when the two players' names fit each other's side just as well, so
     # which way round the score goes cannot be told from the names alone.
     oriented: bool = True
+    # When the day-card response behind this reading was received, if it came
+    # from the board rather than a per-match read.
+    received_ts: float | None = None
 
     def render(self, reading: Reading) -> str | None:
         """A reading of this match as a score line, in the market's player order.
@@ -737,6 +745,7 @@ class ScoreBoard:
             reading=best[2].reading,
             label=best[2].label,
             oriented=oriented,
+            received_ts=best[2].received_ts,
         )
 
 
@@ -811,12 +820,42 @@ class Flashscore:
         answer -- a Monday between tournaments has no tour matches on it -- and
         the caller has to be able to tell that from the feed being unreachable,
         because one should replace what it knows and the other should not.
+
+        Every match carries the clock of the day-card response it came from, so
+        a caller writes the provider's receipt rather than the time it happened
+        to log. The day caches can be minutes old and a match can appear on two
+        overlapping day cards; the first copy keeps its own (earliest) response
+        clock, and a board retained through a failed refresh keeps the clocks it
+        was originally given.
         """
         matches: list[BoardMatch] = []
         failure: Exception | None = None
         for day in self.days:
+            feed = f"f_{SPORT}_{day}_{self.tz}_en_1"
             try:
-                matches += parse_board(self._get(f"f_{SPORT}_{day}_{self.tz}_en_1"))
+                # The day card is measured like the per-match feeds so a score
+                # written from it carries the response clock, captured before
+                # decoding. A payload-only override (a fake that answers without
+                # an HTTP boundary) has no such clock and stays NULL rather than
+                # borrowing the moment it was read; the receipt is the provider's
+                # response, not our logging time.
+                #
+                # The observations this records are consumed by `received_at`
+                # here and are deliberately not persisted to `feed_polls`: that
+                # table is keyed by condition id, and a day card is one response
+                # covering many matches rather than a per-match read. The score
+                # row keeps the receipt, which is what the store needs.
+                if getattr(self._get, "__func__", None) is not Flashscore._get:
+                    raw = self._get(feed)
+                    received = None
+                else:
+                    raw = measured_request(
+                        self, "board", [str(day)],
+                        lambda: self._send(feed), self._text,
+                        lambda value, _target: bool(value),
+                    )
+                    received = received_at(self, str(day), ("board",))
+                matches += [replace(match, received_ts=received) for match in parse_board(raw)]
             except (httpx.HTTPError, ValueError) as exc:
                 log.warning("score feed: day %+d unavailable (%s)", day, exc)
                 failure = exc

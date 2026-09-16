@@ -13,6 +13,7 @@ wheels/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+evidence-data/
 
 # Dashboard front end. The build output under
 # src/polymarket/dashboard/static/ IS committed -- installing the package must
