@@ -7,7 +7,8 @@ map, data flow, invariants).
 ## What it is
 
 A research capture tool. It records the Polymarket order book for every
-tour-level (250 and above) ATP and WTA singles match **while it is being
+tour-level (250 and above) ATP and WTA singles match, and every ATP Challenger,
+**while it is being
 played** — every 5 seconds, 10 levels deep on each side — into SQLite, with the
 live score and the match statistics read on the same tick. Their individual
 timestamps say when each sequential read happened; their shared `tick_id` is
@@ -110,7 +111,7 @@ discover`.
 ## How to verify a change
 
 ```bash
-uv run python tests/test_offline.py     # 655 checks, no network
+uv run python tests/test_offline.py     # 674 checks, no network
 ```
 
 `tests/test_offline.py` is a **plain script, not pytest** — a flat list of
@@ -273,9 +274,11 @@ Other conventions:
 ## Out of scope / deliberately absent
 
 - **Trading, orders, wallets, auth** — never add these without being asked.
-- **Doubles, Challengers, WTA 125s, ITF, juniors, qualifying** (qualifying is
-  behind an opt-in flag). The three gates in `discovery.py` enforce this. ATP and
-  WTA tour level are both **in** scope, since 2026-08-24.
+- **Doubles, WTA 125s, ITF, juniors, qualifying** (qualifying is behind an
+  opt-in flag). The three gates in `discovery.py` enforce this. ATP and WTA tour
+  level are both **in** scope, since 2026-08-24, and **ATP Challengers since
+  2026-09-22** (the user asked for them; `--no-challengers` drops them). The WTA
+  125s are one entry in `config.CHALLENGER_TOURS` away if they are wanted.
 - **`flashscore-scraper/`** is a standalone package with its own README and CLI.
   Nothing in `src/polymarket/` imports it; `scores.py` is the trimmed, capture-
   oriented reimplementation. Changing one does **not** change the other — decide

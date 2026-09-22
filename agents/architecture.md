@@ -27,7 +27,7 @@ src/polymarket/            the package; `polymarket` console script -> cli.main
   config.py                all tunables + the two tournament whitelists + regexes
   api.py                   Polymarket: Gamma (catalog), CLOB (books) and Data API (trades) HTTP client
   book.py                  Snapshot dataclass; parse_book() normalises a raw book
-  discovery.py             TennisMarket; the three gates that pick tour-level singles
+  discovery.py             TennisMarket; the three gates that pick tour-level and Challenger singles
   scores.py                Flashscore feeds, pairing, Ratchet/StatRatchet. The subtlest file here.
   tennisexplorer.py        the bookmaker-odds page scraper and its own pairing board
   poller.py                Poller: the capture loop (tick, score poll, stats poll, odds poll, refresh)
@@ -44,7 +44,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, MatchStats, MatchOdds,
                            TimeSeriesChart, OrderBook, Sparkline, TableView
-tests/test_offline.py      655 assertions, no network, plain `python` script
+tests/test_offline.py      674 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -182,10 +182,21 @@ Three independent gates, in order:
    slug prefix is the only reliable ATP/WTA signal — match events carry generic
    tags. This is what separates the two draws at combined events like Cincinnati,
    and it decides which calendar gate 2 searches.
-2. The tournament name (event title up to the first `:`) must hit that tour's
-   calendar — `config.ATP_TOURNAMENTS` or `WTA_TOURNAMENTS` — via
-   `match_tournament(name, tour)`. This is what drops Challengers and WTA 125s,
-   which use the same slug prefixes. `EXCLUDE` and `QUALIFYING` filter further.
+2. The tournament name (event title up to the first `:`) is looked up on that
+   tour's calendar — `config.ATP_TOURNAMENTS` or `WTA_TOURNAMENTS` — via
+   `match_tournament(name, tour)`. A hit is tour level. A miss is the tier below
+   (Challengers, WTA 125s share the slug prefixes): kept as
+   `config.challenger(name, tour)`, tier `challenger`, if the tour is in
+   `challenger_tours` (`config.CHALLENGER_TOURS`, ATP only by default;
+   `--no-challengers` empties it), dropped otherwise. A numbered name
+   (`CHALLENGER_WEEK`, "Buenos Aires 2") is never looked up — no tour event has
+   one. `EXCLUDE` and `QUALIFYING` filter further.
+
+   The name can still be wrong about the tier: an unnumbered Challenger in a
+   tour city ("Shanghai" in September) hits the Masters. The pairing corrects
+   it — `Paired.tournament` is the card's own filing, and `apply_score` →
+   `_retier` takes the tier from it (a Challenger keeps Polymarket's name);
+   `discover` then drops a re-tiered Challenger whose tour is not captured.
 3. The market must be tradeable (`acceptingOrders and active and not closed and
    not archived`).
 
@@ -239,7 +250,15 @@ Three mechanisms, each load-bearing:
   reclassified as a winner, a serve speed landing late), and whether that is
   worth a row is `record_stat_events`'s question, not the ratchet's.
 - **Pairing.** `ScoreBoard.pair(tour, tournament, players, start_time)` matches by
-  tour and tournament **and both players at once**, comparing folded token sets
+  tour and tournament **and both players at once**. Matches not on a calendar —
+  every `CHALLENGER MEN/WOMEN - SINGLES` heading (`CHALLENGER_HEADINGS`, never
+  looked up on a calendar: "Buenos Aires 3" would hit the Argentina Open) and
+  any uncalendared tour event — sit in one **pool per tour** and pair on the two
+  players alone, because Polymarket and Flashscore number a city's Challenger
+  weeks differently ("Buenos Aires 2" vs "Buenos Aires 3"). The pool is also
+  the fallback when a calendar name finds nothing in its own draw; the draw is
+  always tried first, so a tour match whose players also appear in a Challenger
+  pairs to the tour match. Names are compared as folded token sets
   (`name_tokens`: accent-folded, punctuation-split, single letters dropped since
   Flashscore abbreviates first names; `_PARTICLES` drops bare "de"/"van"). Ties
   are broken by more shared tokens, then by proximity to the market's start time.

@@ -394,7 +394,7 @@ def test_discovery() -> None:
             "wta-playerc-playerd-2026-08-16",
             [("Contrexeville: Player C vs Player D", ["Player C", "Player D"], True)],
         ),
-        # atp slug prefix, but a Challenger -> below ATP 250
+        # atp slug prefix, but a Challenger -> below ATP 250, kept as one
         _event(
             "Sion: Player A vs Player B",
             "atp-playera-playerb-2026-08-16",
@@ -425,8 +425,8 @@ def test_discovery() -> None:
     ]
 
     kept, _ = discover(FakeAPI(events), _both_tours_board())
-    check("both moneylines kept", len(kept) == 2)
-    atp = [m for m in kept if m.tour == "atp"]
+    check("both moneylines and the challenger kept", len(kept) == 3)
+    atp = [m for m in kept if m.tour == "atp" and m.tier != "challenger"]
     wta = [m for m in kept if m.tour == "wta"]
     check("right match", atp[0].question.startswith("Cincinnati Open: Botic"))
     check("tournament", atp[0].tournament == "Cincinnati Open")
@@ -442,18 +442,25 @@ def test_discovery() -> None:
     check("tiered on the wta calendar", wta[0].tier == "wta_1000")
     check("paired against the wta half of the board", wta[0].pairing is not None)
     check("with the wta score, not the atp one", wta[0].score == "2-1")
-    check("challenger excluded", not any("Sion" in m.question for m in kept))
+    sion = [m for m in kept if "Sion" in m.question]
+    check("challenger kept", len(sion) == 1)
+    check("tiered as a challenger", sion[0].tier == "challenger")
+    check("under polymarket's name for it", sion[0].tournament == "Sion")
     check("wta 125 excluded", not any("Contrexeville" in m.question for m in kept))
     check("doubles excluded", not any("Doubles" in m.question for m in kept))
     check("itf excluded", not any("ITF" in m.question for m in kept))
     check("outright excluded", not any("Will Carlos" in m.question for m in kept))
 
     only_atp, _ = discover(FakeAPI(events), _both_tours_board(), tours=("atp",))
-    check("one tour can be asked for on its own", len(only_atp) == 1)
-    check("and it is that one", only_atp[0].tour == "atp")
+    check("one tour can be asked for on its own", len(only_atp) == 2)
+    check("and it is that one", all(m.tour == "atp" for m in only_atp))
+
+    tour_only, _ = discover(FakeAPI(events), _both_tours_board(), challenger_tours=())
+    check("challengers can be turned off", len(tour_only) == 2)
+    check("and it is the challenger that goes", not any("Sion" in m.question for m in tour_only))
 
     everything, _ = discover(FakeAPI(events), _both_tours_board(), all_markets=True)
-    check("all-markets picks up derivatives", len(everything) == 4)
+    check("all-markets picks up derivatives", len(everything) == 5)
     check(
         "derivatives typed",
         sorted({m.market_type for m in everything}) == ["derivative", "moneyline"],
@@ -475,6 +482,66 @@ def test_discovery() -> None:
         "qualifying opt-in works",
         len(discover(FakeAPI([qual]), None, include_qualifying=True)[0]) == 1,
     )
+
+
+def test_challengers() -> None:
+    print("\nchallengers")
+    from polymarket.scores import parse_board
+
+    card = parse_board(
+        "ZA÷ATP - SINGLES: Cincinnati (USA), hard¬~"
+        "AA÷Qi0f7iu1¬AD÷1786969800¬AB÷2¬AC÷17¬"
+        "AE÷Lehecka J.¬WU÷lehecka-jiri¬AF÷Berrettini M.¬WV÷berrettini-matteo¬BA÷1¬BB÷0¬~"
+        # Polymarket's "Buenos Aires 2" is this card's "Buenos Aires 3".
+        "ZA÷CHALLENGER MEN - SINGLES: Buenos Aires 3 (Argentina), clay¬~"
+        "AA÷ba3match¬AD÷1786969800¬AB÷2¬AC÷17¬"
+        "AE÷Villanueva G.¬WU÷villanueva-gonzalo¬AF÷Justo G. I.¬WV÷justo-guido-ivan¬BA÷4¬BB÷2¬~"
+        # A Challenger in a tour city, weeks before the Masters there.
+        "ZA÷CHALLENGER MEN - SINGLES: Shanghai (China), hard¬~"
+        "AA÷shachal1¬AD÷1786969800¬AB÷2¬AC÷17¬"
+        "AE÷Binda A.¬WU÷binda-alexandr¬AF÷Hsieh C.¬WV÷hsieh-cheng-peng¬BA÷2¬BB÷3¬~"
+        # The same two players as the Cincinnati match, one tier down.
+        "ZA÷CHALLENGER MEN - SINGLES: Sion (Sui), hard¬~"
+        "AA÷chal1234¬AD÷1786969800¬AB÷2¬AC÷17¬"
+        "AE÷Lehecka J.¬WU÷lehecka-jiri¬AF÷Berrettini M.¬WV÷berrettini-matteo¬BA÷0¬BB÷1¬~"
+    )
+    from polymarket.scores import ScoreBoard
+
+    board = ScoreBoard(card)
+
+    def event(title, slug, players):
+        return _event(title, slug, [(title, players, True)])
+
+    events = [
+        event("Buenos Aires 2: Gonzalo Villanueva vs Guido Justo", "atp-villanu-justo-2026-09-21",
+              ["Gonzalo Villanueva", "Guido Justo"]),
+        event("Shanghai: Alexandr Binda vs Cheng-Peng Hsieh", "atp-binda-hsieh-2026-09-06",
+              ["Alexandr Binda", "Cheng-Peng Hsieh"]),
+        event("Cincinnati Open: Jiri Lehecka vs Matteo Berrettini", "atp-lehecka-berrett-2026-08-16",
+              ["Jiri Lehecka", "Matteo Berrettini"]),
+    ]
+    kept, skipped = discover(FakeAPI(events), board)
+    by = {m.question.split(":")[0]: m for m in kept}
+    check("all three kept", len(kept) == 3)
+
+    ba = by["Buenos Aires 2"]
+    check("a numbered week is not the argentina open", ba.tier == "challenger")
+    check("and keeps polymarket's name", ba.tournament == "Buenos Aires 2")
+    check("paired across the two numbering schemes", ba.pairing is not None and ba.pairing.id == "ba3match")
+    check("with its live score", ba.state == "live" and ba.score == "4-2")
+
+    sha = by["Shanghai"]
+    check("a challenger named like a masters is paired", sha.pairing is not None and sha.pairing.id == "shachal1")
+    check("and re-tiered by the card", sha.tier == "challenger")
+    check("under polymarket's name, not the calendar's", sha.tournament == "Shanghai")
+
+    cin = by["Cincinnati Open"]
+    check("the tour match still pairs inside its own draw", cin.pairing.id == "Qi0f7iu1")
+    check("and stays tour level", cin.tier == "masters")
+
+    tour_only, skipped = discover(FakeAPI(events), board, challenger_tours=())
+    check("without challengers only the tour match is kept", [m.question.split(":")[0] for m in tour_only] == ["Cincinnati Open"])
+    check("the city-named challenger is reported as one", any(s.reason == "challenger" and "Shanghai" in s.title for s in skipped))
 
 
 def test_live_filter() -> None:
@@ -935,10 +1002,15 @@ def test_score_feed() -> None:
     from polymarket.scores import Reading, SetScore, parse_board, parse_reading
 
     board = parse_board(DAY_FEED)
-    check("only tour-level singles is read", len(board) == 3)
-    check("a challenger with the same players is skipped", all(m.id != "chal1234" for m in board))
+    check("tour-level and challenger singles are read", len(board) == 4)
 
-    finished, interrupted, women = board
+    finished, interrupted, chal, women = board
+    # A Challenger heading is never looked up on a calendar: "Buenos Aires 3"
+    # would otherwise read as the Argentina Open.
+    check("the challenger is read", chal.id == "chal1234")
+    check("on its own tier", chal.tournament.tier == "challenger")
+    check("named from its heading", chal.tournament.name == "Sion")
+    check("and on the men's side", chal.tour == "atp")
     check("id read", finished.id == "Qi0f7iu1")
     check("players read", (finished.home, finished.away) == ("Lehecka J.", "Berrettini M."))
     check("tournament resolved to the ATP calendar", finished.tournament.name == "Cincinnati Open")
@@ -1053,7 +1125,7 @@ def test_score_feed() -> None:
         return DAY_FEED
 
     half._get = flaky
-    check("one bad day still yields the others", len(half.board()) == 3)
+    check("one bad day still yields the others", len(half.board()) == 4)
     quiet.close(), down.close(), half.close()
 
 
@@ -1478,7 +1550,7 @@ def test_board_score_receipt() -> None:
     override = scores_mod.Flashscore(days=(0,))
     override._get = lambda feed_name: DAY_FEED
     overridden = override.board()
-    check("an override still parses the day card", len(overridden) == 3)
+    check("an override still parses the day card", len(overridden) == 4)
     check("but invents no receipt", all(m.received_ts is None for m in overridden.matches.values()))
     check("and records no measured request", not [o for o in observations(override) if o.feed == "board"])
 
@@ -3378,6 +3450,7 @@ if __name__ == "__main__":
     test_book()
     test_filters()
     test_discovery()
+    test_challengers()
     test_live_filter()
     test_store()
     test_migration()

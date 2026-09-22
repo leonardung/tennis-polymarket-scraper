@@ -51,6 +51,7 @@ from .config import (
     STALE_AFTER,
     STALE_WARN_EVERY,
     START_GRACE,
+    CHALLENGER_TOURS,
     TOURS,
     TRADES_PAGE,
     TRADES_TICK_PAGES,
@@ -265,6 +266,7 @@ class Poller:
         scores: Flashscore | None = None,
         odds: TennisExplorer | None = None,
         tours: Sequence[str] = TOURS,
+        challenger_tours: Sequence[str] = CHALLENGER_TOURS,
     ) -> None:
         self.api = api
         self.store = store
@@ -288,6 +290,7 @@ class Poller:
         self.all_markets = all_markets
         self.include_qualifying = include_qualifying
         self.tours = tuple(tours)
+        self.challenger_tours = tuple(challenger_tours)
         self.live_only = live_only
         self.only_changes = only_changes
         self.record_stats = record_stats
@@ -354,6 +357,7 @@ class Poller:
             include_qualifying=self.include_qualifying,
             live_only=self.live_only,
             tours=self.tours,
+            challenger_tours=self.challenger_tours,
         )
         tracked: dict[str, Tracked] = {}
         for market in kept:

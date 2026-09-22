@@ -1,7 +1,7 @@
 # Polymarket ATP and WTA tennis capture
 
 Records the Polymarket order book for every tour-level (250 and above) ATP and
-WTA singles match **while it is being played**, every 5 seconds, 10 levels deep on
+WTA singles match, and every ATP Challenger, **while it is being played**, every 5 seconds, 10 levels deep on
 each side, into SQLite — with the live score and the match statistics read on the
 same tick, so a price, the point it moved on, and the aces count behind it all
 share a `tick_id` while retaining their individual read timestamps. The trade
@@ -56,6 +56,7 @@ triggers an early refresh.
 | `--all-markets` | off | also capture set winner and games/sets over-under |
 | `--include-qualifying` | off | also capture qualifying rounds |
 | `--tour TOUR` | `both` | capture one circuit only: `atp`, `wta` or `both` |
+| `--no-challengers` | off | tour level only: drop the ATP Challengers |
 | `--include-upcoming` | off | also poll matches that haven't started yet |
 | `--every-tick` | off | write every tick, even when the book hasn't moved |
 | `--no-stats` | off | don't record match statistics (see [Match statistics](#match-statistics)) |
@@ -240,10 +241,20 @@ doesn't need a Node toolchain. After changing anything in `frontend/src`, run
 
 ## Which matches are captured
 
-Tour level only, both circuits: Grand Slams, the two Finals, Masters 1000 and WTA
-1000, ATP/WTA 500 and 250. Singles, main draw. Challengers, WTA 125s, ITF,
-doubles and qualifying are excluded. `--tour atp` or `--tour wta` narrows the
-capture to one circuit.
+Tour level on both circuits — Grand Slams, the two Finals, Masters 1000 and WTA
+1000, ATP/WTA 500 and 250 — plus the ATP Challenger tour. Singles, main draw.
+WTA 125s, ITF, doubles and qualifying are excluded. `--tour atp` or `--tour wta`
+narrows the capture to one circuit; `--no-challengers` drops the Challengers.
+
+Tour events are a calendar in `config.py`; Challengers cannot be (a hundred-odd a
+year), so an `atp-` match whose tournament is *not* on the calendar is taken as
+one and stored with tier `challenger` under Polymarket's name for it ("Buenos
+Aires 2"). A numbered week is never read as the tour event in that city. A
+Challenger in a tour city that is not numbered ("Shanghai" in September) does
+match the calendar by name, and is corrected by the score pairing: Flashscore
+files it under `CHALLENGER MEN - SINGLES`, and the market is re-tiered to match.
+Adding `"wta"` to `config.CHALLENGER_TOURS` would take the WTA 125s on the same
+terms.
 
 A combined event — Cincinnati, Indian Wells, the slams — runs both draws under
 one tournament name, and nothing in the Polymarket payload distinguishes them
@@ -338,8 +349,11 @@ minute, since a refresh pages the whole tennis catalog.
 
 Pairing a market to a Flashscore match is by tour and tournament and by **both**
 players at once. The day card heads each block with the circuit — `ATP -
-SINGLES`, `WTA - SINGLES` — which is both what keeps a Challenger or a WTA 125
-out and what tells the two draws of a combined event apart. Polymarket writes "Alex de Minaur" where Flashscore writes "De Minaur
+SINGLES`, `WTA - SINGLES`, `CHALLENGER MEN - SINGLES` — which is what tells the
+two draws of a combined event apart and a Challenger from the tour event in the
+same city. Challengers are paired on the two players alone, across every
+Challenger on the card, because the two sources number a city's weeks
+differently: Polymarket's "Buenos Aires 2" is Flashscore's "Buenos Aires 3". Polymarket writes "Alex de Minaur" where Flashscore writes "De Minaur
 A." and `de-minaur-alex`, so names are compared as folded token sets, ignoring
 initials and bare particles — every Dutch player shares a "van". Requiring both
 sides to agree is what makes a wrong pairing cost two coincidences rather than
@@ -856,7 +870,7 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 655 checks, no network needed
+uv run python tests/test_offline.py   # 674 checks, no network needed
 ```
 
 ## Measured response availability and poll health

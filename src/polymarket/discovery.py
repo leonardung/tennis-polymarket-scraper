@@ -1,4 +1,4 @@
-"""Find tour-level (250+) singles tennis match markets on Polymarket.
+"""Find tour-level (250+) and Challenger singles tennis match markets on Polymarket.
 
 Both tours are captured. The filter is three independent gates, in order:
 
@@ -7,12 +7,21 @@ Both tours are captured. The filter is three independent gates, in order:
 2. the tournament name (the event title up to the first colon) must be on that
    tour's calendar in ``config.ATP_TOURNAMENTS`` / ``WTA_TOURNAMENTS``
                                                               -> 250 or above;
+   or, off the calendar, the tour must be in ``challenger_tours``
+                                                              -> Challenger;
 3. the market must be open and accepting orders               -> actually tradeable.
 
 Gate 1 is what tells the two draws apart at a combined event like Cincinnati,
 where both share a tournament name and nothing else in the payload distinguishes
-them. Gate 2 is what drops the Challenger circuit and the WTA 125s, which share
-the ``atp`` and ``wta`` slug prefixes with the tour proper.
+them. Gate 2 is what tells the tour from the tier below it, which shares the
+``atp`` and ``wta`` slug prefixes: the ATP Challengers are kept by default, the
+WTA 125s dropped (``config.CHALLENGER_TOURS``).
+
+Gate 2 reads a name, and a name can be wrong about the tier: a Challenger held
+in a tour city ("Shanghai" in September) reads as the tour event there. The
+Flashscore pairing is what settles it -- the day card files every match under
+its real circuit -- so ``apply_score`` re-tiers a market it pairs, and
+``discover`` drops one that turns out to be a Challenger nobody asked for.
 
 Whether a match that passes is being played comes from Flashscore rather than
 from Polymarket -- ``scores.py`` explains why -- so ``discover`` takes a
@@ -30,12 +39,16 @@ import httpx
 
 from .api import Polymarket
 from .config import (
+    CHALLENGER_TIER,
+    CHALLENGER_TOURS,
+    CHALLENGER_WEEK,
     EXCLUDE,
     MATCH_SLUG,
     OVERDUE_WINDOW,
     QUALIFYING,
     TENNIS_TAG_ID,
     TOURS,
+    challenger,
     match_tournament,
 )
 from .scores import Paired, ScoreBoard
@@ -125,6 +138,8 @@ def apply_score(market: TennisMarket, board: ScoreBoard) -> bool:
         market.tour, market.tournament, market.outcomes, parse_iso(market.start_time)
     )
     market.pairing = paired
+    if paired is not None:
+        _retier(market, paired)
     if paired is None:
         market.state = unpaired_state(market.start_time)
         market.period = market.score = market.game = None
@@ -136,6 +151,25 @@ def apply_score(market: TennisMarket, board: ScoreBoard) -> bool:
     market.game = paired.game
     market.serving = paired.server
     return True
+
+
+def _retier(market: TennisMarket, paired: Paired) -> None:
+    """Take the tier from the circuit Flashscore files the match under.
+
+    Only a disagreement between two known tiers is acted on. A match on the
+    card's tour heading but missing from the calendar (``tournament`` None)
+    says the calendar is behind, not which entry it should have been.
+    """
+    found = paired.tournament
+    if found is None or found.tier == market.tier:
+        return
+    if found.tier == CHALLENGER_TIER:
+        # Polymarket's name, not the card's: the two number a city's weeks
+        # differently, and the market's own title is what a reader searches by.
+        market.tournament = _tournament_of(market.event_title)
+    else:
+        market.tournament = found.name
+    market.tier = found.tier
 
 
 @dataclass
@@ -183,6 +217,7 @@ def markets_from_event(
     all_markets: bool = False,
     include_qualifying: bool = False,
     tours: Sequence[str] = TOURS,
+    challenger_tours: Sequence[str] = CHALLENGER_TOURS,
 ) -> tuple[list[TennisMarket], list[Skipped]]:
     """Apply the three gates to a single event and build the markets it yields.
 
@@ -204,9 +239,12 @@ def markets_from_event(
         return kept, skipped  # a tour not being captured, ITF, or doubles
 
     name = _tournament_of(title)
-    tournament = match_tournament(name, tour)
+    # A numbered week is never tour-level, whatever city it is in.
+    tournament = None if CHALLENGER_WEEK.search(name) else match_tournament(name, tour)
     if tournament is None:
-        return kept, skipped  # Challenger, WTA 125, or unrecognised event
+        if tour not in challenger_tours or not name:
+            return kept, skipped  # a tier below the tour that is not being captured
+        tournament = challenger(name, tour)
     if EXCLUDE.search(title):
         skipped.append(Skipped(title, slug, "non-tour format"))
         return kept, skipped
@@ -271,6 +309,7 @@ def discover(
     live_only: bool = False,
     max_pages: int = 60,
     tours: Sequence[str] = TOURS,
+    challenger_tours: Sequence[str] = CHALLENGER_TOURS,
 ) -> tuple[list[TennisMarket], list[Skipped]]:
     """Return (markets to capture, notable skips).
 
@@ -279,6 +318,8 @@ def discover(
     ``live_only`` keeps only matches that are actually being played, which is
     the board's verdict -- pass one, or every match reads as not started.
     ``tours`` narrows the capture to one circuit; by default it is both.
+    ``challenger_tours`` says which of them also has its Challenger tier
+    captured; an empty one is tour level only.
     """
     board = board if board is not None else ScoreBoard()
     kept: list[TennisMarket] = []
@@ -293,10 +334,15 @@ def discover(
             all_markets=all_markets,
             include_qualifying=include_qualifying,
             tours=tours,
+            challenger_tours=challenger_tours,
         )
         skipped.extend(missed)
         for market in found:
             paired = apply_score(market, board)
+            if market.tier == CHALLENGER_TIER and market.tour not in challenger_tours:
+                # Named like a tour event, filed as a Challenger by the card.
+                skipped.append(Skipped(market.event_title, market.event_slug, "challenger"))
+                continue
             if market.state != "upcoming":
                 if paired:
                     read += 1

@@ -60,6 +60,7 @@ import httpx
 from .telemetry import measured_request, received_at
 
 from .config import (
+    CHALLENGER_TIER,
     FLASHSCORE_DAYS,
     FLASHSCORE_HOST,
     FLASHSCORE_SIGN,
@@ -70,6 +71,7 @@ from .config import (
     STATS_OVERALL,
     STATS_TIMEOUT,
     Tournament,
+    challenger,
     match_tournament,
 )
 
@@ -88,14 +90,19 @@ HEADERS = {
 }
 
 # Flashscore heads each tournament's matches with a name, and the prefix names
-# the circuit exactly: tour-level singles is one of these two, while a
-# Challenger comes through as "CHALLENGER MEN - SINGLES" and the women's second
-# tier as "WTA 125 - SINGLES". That is the same distinction discovery makes on
-# the Polymarket side, and the reason a Challenger with a tour player in it
-# cannot be mistaken for the real thing.
+# the circuit exactly: tour-level singles is one of the first two, while a
+# Challenger comes through as "CHALLENGER MEN - SINGLES" and the women's 125
+# series as "CHALLENGER WOMEN - SINGLES". That is the same distinction discovery
+# makes on the Polymarket side, and the reason a Challenger with a tour player
+# in it cannot be mistaken for the real thing -- nor a Challenger in a tour city
+# ("Shanghai" in September) for the tour event there.
 TOUR_HEADINGS: dict[str, str] = {
     "ATP - SINGLES": "atp",
     "WTA - SINGLES": "wta",
+}
+CHALLENGER_HEADINGS: dict[str, str] = {
+    "CHALLENGER MEN - SINGLES": "atp",
+    "CHALLENGER WOMEN - SINGLES": "wta",
 }
 
 
@@ -105,6 +112,20 @@ def heading_tour(heading: str) -> str | None:
         if heading.startswith(prefix):
             return tour
     return None
+
+
+def heading_challenger(heading: str) -> str | None:
+    """Which tour's Challenger circuit a header belongs to, if either."""
+    for prefix, tour in CHALLENGER_HEADINGS.items():
+        if heading.startswith(prefix):
+            return tour
+    return None
+
+
+def heading_name(heading: str) -> str:
+    """The event's own name out of a header: "...: Genova 2 (Italy), clay" -> "Genova 2"."""
+    name = heading.split(":", 1)[-1]
+    return name.split("(", 1)[0].split(",", 1)[0].strip()
 
 # Detailed status (`AC`) -> (state, period). The period vocabulary is the one
 # the database already stores -- S1..S5 while a set is being played, FT/RET/WO
@@ -347,6 +368,10 @@ class Paired:
     # When the day-card response behind this reading was received, if it came
     # from the board rather than a per-match read.
     received_ts: float | None = None
+    # The event Flashscore files the match under -- a calendar entry, a
+    # Challenger, or None for a tour event missing from the calendar. It is
+    # what corrects a market whose name alone put it on the wrong tier.
+    tournament: Tournament | None = None
 
     def render(self, reading: Reading) -> str | None:
         """A reading of this match as a score line, in the market's player order.
@@ -414,12 +439,14 @@ def _read_sets(blocks: Sequence[dict[str, str]]) -> tuple[SetScore, ...]:
 
 
 def parse_board(raw: str) -> list[BoardMatch]:
-    """Read a day feed into the tour-level singles matches it lists, both tours.
+    """Read a day feed into the singles matches it lists, both tours and both tiers.
 
     A ``ZA`` block is a tournament header and applies to the matches after it;
     an ``AA`` block is a match. The header is also what says which tour the
     matches under it belong to, which is what the tournament name is then
-    looked up against -- the two calendars share most of their names.
+    looked up against -- the two calendars share most of their names. A
+    Challenger header is never looked up: "Buenos Aires 3" would hit the
+    Argentina Open. It gets a tournament of its own tier instead.
     """
     matches: list[BoardMatch] = []
     heading = ""
@@ -430,14 +457,19 @@ def parse_board(raw: str) -> list[BoardMatch]:
         if "AA" not in block or "AE" not in block:
             continue
         tour = heading_tour(heading)
-        if tour is None:
-            continue
+        if tour is not None:
+            tournament = match_tournament(heading, tour)
+        else:
+            tour = heading_challenger(heading)
+            if tour is None:
+                continue
+            tournament = challenger(heading_name(heading), tour)
         status = _read_status(block) or ("upcoming", None)
         matches.append(
             BoardMatch(
                 id=block.get("AA", ""),
                 tour=tour,
-                tournament=match_tournament(heading, tour),
+                tournament=tournament,
                 home=block.get("AE", "?"),
                 away=block.get("AF", "?"),
                 # The slug carries the full first name where the display name
@@ -646,7 +678,7 @@ def parse_stats(raw: str) -> StatReading | None:
 
 
 class ScoreBoard:
-    """A day's tour-level matches, indexed for pairing with Polymarket markets.
+    """A day's singles matches, indexed for pairing with Polymarket markets.
 
     Pairing is by tour and tournament and by both players at once. Neither
     alone is enough -- surnames repeat across the draw and two players meet
@@ -654,6 +686,15 @@ class ScoreBoard:
     practice, and requiring both sides to agree is what makes a wrong pairing
     cost two independent coincidences rather than one. The tour is part of the
     key because a combined event puts two draws under one name.
+
+    Everything not on a calendar -- the Challengers, and any tour event the
+    calendar is missing -- goes in one pool per tour and is paired on the two
+    players alone, because Polymarket and Flashscore do not agree on those
+    names ("Buenos Aires 2" is "Buenos Aires 3" on the card). The pool is also
+    the fallback for a calendar name that finds nothing in its own draw, which
+    is how a Challenger held in a tour city is found at all. Two players meeting
+    on two circuits inside the board's three days does not happen; if it did,
+    the start time separates them, and a true tie is refused as below.
     """
 
     def __init__(self, matches: Iterable[BoardMatch] = ()) -> None:
@@ -664,10 +705,13 @@ class ScoreBoard:
             if match.id:
                 self.matches.setdefault(match.id, match)
         self._by_tournament: dict[tuple[str, str], list[BoardMatch]] = {}
+        self._pool: dict[str, list[BoardMatch]] = {}
         for match in self.matches.values():
-            if match.tournament is not None:
+            if match.tournament is not None and match.tournament.tier != CHALLENGER_TIER:
                 key = (match.tour, match.tournament.name)
                 self._by_tournament.setdefault(key, []).append(match)
+            else:
+                self._pool.setdefault(match.tour, []).append(match)
 
     def __len__(self) -> int:
         return len(self.matches)
@@ -689,25 +733,9 @@ class ScoreBoard:
             return None
         first, second = (name_tokens(p) for p in players)
 
-        scored: list[tuple[int, float, BoardMatch, bool]] = []
-        for candidate in self._by_tournament.get((tour, tournament), ()):
-            for flip in (False, True):
-                home, away = candidate.home_tokens, candidate.away_tokens
-                if flip:
-                    home, away = away, home
-                agree = _distinctive(first & home), _distinctive(second & away)
-                if not agree[0] or not agree[1]:
-                    continue
-                # More shared name parts is a better read; among equals, the
-                # match nearest the market's start time wins, which separates
-                # two meetings of the same pair inside the board's few days.
-                apart = (
-                    abs(candidate.starts_at - start_time)
-                    if start_time and candidate.starts_at
-                    else float("inf")
-                )
-                scored.append((len(agree[0]) + len(agree[1]), -apart, candidate, flip))
-
+        scored = self._score(self._by_tournament.get((tour, tournament), ()), first, second, start_time)
+        if not scored:
+            scored = self._score(self._pool.get(tour, ()), first, second, start_time)
         if not scored:
             return None
         scored.sort(key=lambda row: (-row[0], -row[1]))
@@ -746,7 +774,36 @@ class ScoreBoard:
             label=best[2].label,
             oriented=oriented,
             received_ts=best[2].received_ts,
+            tournament=best[2].tournament,
         )
+
+    @staticmethod
+    def _score(
+        candidates: Iterable[BoardMatch],
+        first: frozenset[str],
+        second: frozenset[str],
+        start_time: float | None,
+    ) -> list[tuple[int, float, BoardMatch, bool]]:
+        """Every way these two players fit one of these matches, with how well."""
+        scored: list[tuple[int, float, BoardMatch, bool]] = []
+        for candidate in candidates:
+            for flip in (False, True):
+                home, away = candidate.home_tokens, candidate.away_tokens
+                if flip:
+                    home, away = away, home
+                agree = _distinctive(first & home), _distinctive(second & away)
+                if not agree[0] or not agree[1]:
+                    continue
+                # More shared name parts is a better read; among equals, the
+                # match nearest the market's start time wins, which separates
+                # two meetings of the same pair inside the board's few days.
+                apart = (
+                    abs(candidate.starts_at - start_time)
+                    if start_time and candidate.starts_at
+                    else float("inf")
+                )
+                scored.append((len(agree[0]) + len(agree[1]), -apart, candidate, flip))
+        return scored
 
 
 class Flashscore:
@@ -808,7 +865,7 @@ class Flashscore:
         )
 
     def board(self) -> ScoreBoard:
-        """The tour-level singles card, both tours, across the configured days.
+        """The singles card, both tours and both tiers, across the configured days.
 
         Three days rather than one: the feed buckets matches by local date, so a
         night session lands on either side of the boundary depending on where it

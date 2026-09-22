@@ -353,6 +353,33 @@ WTA_TOURNAMENTS: tuple[Tournament, ...] = (
     _wta("Chennai", "wta_250", "chennai"),
 )
 
+# The second tier, captured beside the tour: the ATP Challenger circuit. It
+# cannot be a calendar like the two above -- a hundred-odd events a year, most of
+# them in a city that hosts nothing else, and Polymarket numbers a city's second
+# and third weeks ("Buenos Aires 2") on a scheme Flashscore does not share (the
+# same week is "Buenos Aires 3" there). So a Challenger is recognised the other
+# way round: a head-to-head on this tour whose name is NOT on its calendar. The
+# WTA's equivalent is the 125 series, slugged "wta"; adding "wta" here captures
+# it on exactly the same terms.
+CHALLENGER_TOURS: tuple[str, ...] = ("atp",)
+CHALLENGER_TIER = "challenger"
+
+# A numbered week -- "Buenos Aires 2", "Genova 2" -- is a city's second or third
+# Challenger of the season. No tour-level event carries one, so a number is what
+# stops "Buenos Aires 2" from being read as the Argentina Open.
+CHALLENGER_WEEK = re.compile(r"\s\d+$")
+
+
+def challenger(name: str, tour: str) -> Tournament:
+    """A Challenger under the name Polymarket gives it, which is all there is.
+
+    No patterns: nothing is ever looked up against one. Pairing it with
+    Flashscore goes by the two players instead, since the two sources do not
+    agree on the name.
+    """
+    return Tournament(name, CHALLENGER_TIER, tour, ())
+
+
 # Every tour-level event on either calendar. Nothing filters on this -- it is
 # the whole whitelist, for anything that wants to report on it.
 TOURNAMENTS: tuple[Tournament, ...] = ATP_TOURNAMENTS + WTA_TOURNAMENTS
@@ -378,7 +405,8 @@ MATCH_SLUG = re.compile(
 
 # A tour prefix names the circuit, NOT its level -- Challengers are slugged "atp"
 # (Sion, Kingston, Todi...) and the 125s "wta". The calendars above are what
-# enforce "250 or above" on each side.
+# tell the tour from the tier below it; CHALLENGER_TOURS decides whether that
+# tier is captured or dropped.
 QUALIFYING = re.compile(r"\bqualif\w*\b", re.I)
 
 # Non-tour formats that can still appear under a tour-level tournament name.

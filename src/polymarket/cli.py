@@ -18,6 +18,7 @@ from . import resolver
 from .api import Polymarket
 from .config import (
     BOOK_DEPTH,
+    CHALLENGER_TOURS,
     CLOB,
     DATA_API,
     FINAL_STATS_DELAY,
@@ -67,6 +68,11 @@ def _tours(args: argparse.Namespace) -> tuple[str, ...]:
     return TOURS if args.tour == "both" else (args.tour,)
 
 
+def _challenger_tours(args: argparse.Namespace) -> tuple[str, ...]:
+    """Which of those circuits also has its Challenger tier captured."""
+    return () if args.no_challengers else tuple(t for t in CHALLENGER_TOURS if t in _tours(args))
+
+
 def cmd_discover(args: argparse.Namespace) -> int:
     with Polymarket() as api, Flashscore() as scores:
         kept, skipped = discover(
@@ -76,6 +82,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
             include_qualifying=args.include_qualifying,
             live_only=args.live_only,
             tours=_tours(args),
+            challenger_tours=_challenger_tours(args),
         )
 
     if args.json:
@@ -108,7 +115,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
         if len(skipped) > 20:
             print(f"  ... and {len(skipped) - 20} more")
     if not kept:
-        print("  nothing matched -- no tour-level matches open right now,")
+        print("  nothing matched -- no tour-level or Challenger matches open right now,")
         print("  or a tournament is missing from the calendars in config.py")
     print()
     return 0
@@ -146,6 +153,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             heartbeat=args.heartbeat,
             stale_after=args.stale_after,
             tours=_tours(args),
+            challenger_tours=_challenger_tours(args),
         )
         logging.info(
             "capturing depth-%d %s books, scores%s%s%s into %s: every %.0fs while a match "
@@ -654,6 +662,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=("atp", "wta", "both"),
         default="both",
         help="which circuit to capture (default: both)",
+    )
+    common.add_argument(
+        "--no-challengers",
+        action="store_true",
+        help="tour level only: drop the ATP Challenger matches captured by default",
     )
     common.add_argument(
         "--dns",
