@@ -111,7 +111,7 @@ discover`.
 ## How to verify a change
 
 ```bash
-uv run python tests/test_offline.py     # 674 checks, no network
+uv run python tests/test_offline.py     # 677 checks, no network
 ```
 
 `tests/test_offline.py` is a **plain script, not pytest** — a flat list of

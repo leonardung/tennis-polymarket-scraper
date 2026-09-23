@@ -972,8 +972,9 @@ class Poller:
         with a backlog and a tick is five seconds long.
         """
         now = time.time() if now is None else now
+        given_up = [cid for cid, tries in self._final_tries.items() if tries >= _FINAL_STATS_TRIES]
         pending = self.store.matches_awaiting_set_stats(
-            now, FINAL_STATS_DELAY, FINAL_STATS_WINDOW, FINAL_STATS_BATCH
+            now, FINAL_STATS_DELAY, FINAL_STATS_WINDOW, FINAL_STATS_BATCH, exclude=given_up
         )
         written = 0
         for condition_id, match_id, flip, question in pending:

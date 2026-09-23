@@ -7,7 +7,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Collection, Iterable, Sequence
 
 from .book import Snapshot
 from .config import BOOK_DEPTH, STATISTICS
@@ -755,7 +755,12 @@ class Store:
         return len(rows)
 
     def matches_awaiting_set_stats(
-        self, now: float, delay: float, window: float, limit: int
+        self,
+        now: float,
+        delay: float,
+        window: float,
+        limit: int,
+        exclude: Collection[str] = (),
     ) -> list[tuple[str, str, int, str]]:
         """Matches that ended long enough ago to collect their final statistics.
 
@@ -777,11 +782,19 @@ class Store:
         A match whose pairing could not be oriented is left out. Its statistics
         exist, but there is no way to say which player each column belongs to,
         and a mirrored row is worse than no row.
+
+        `exclude` is the caller's list of matches it has given up on, and it is
+        applied *before* the limit, not after. A walkover never gets a row, so
+        it stays in this queue for the whole window, oldest first; filtered
+        afterwards, `limit` of them fill every batch and nothing behind them is
+        ever read -- which is what happened on 2026-09-23, when four cancelled
+        matches held the queue for a day.
         """
+        skip = tuple(exclude)
         return [
             (str(cid), str(fid), int(flip), str(question or cid))
             for cid, fid, flip, question in self.conn.execute(
-                """
+                f"""
                 SELECT m.condition_id, m.flashscore_id, m.flashscore_flip, m.question
                 FROM markets m
                 JOIN (
@@ -794,10 +807,11 @@ class Store:
                   AND NOT EXISTS (
                       SELECT 1 FROM set_stats s WHERE s.condition_id = m.condition_id
                   )
+                  AND m.condition_id NOT IN ({", ".join("?" * len(skip))})
                 ORDER BY e.ended
                 LIMIT ?
                 """,
-                (now - delay, now - window, limit),
+                (now - delay, now - window, *skip, limit),
             )
         ]
 

@@ -2446,6 +2446,27 @@ def test_final_stats() -> None:
             check("a match with nothing to collect is dropped after a few tries",
                   poller._final_tries[cid] == 3)
 
+            # Given-up matches must not hold the queue. A walkover never gets a
+            # row, so it stays pending for its whole window; if the limit were
+            # applied before leaving them out, a batch-full of them would block
+            # every match that finished after them.
+            store.record_score_events([ScoreRow("0xlater", "ended", "FT", "6-1, 6-1")])
+            store.conn.execute(
+                "INSERT INTO markets (condition_id, question, flashscore_id, flashscore_flip) "
+                "VALUES ('0xlater', 'Later match', 'fs-later', 0)")
+            store.conn.execute(
+                "UPDATE score_events SET ts = ts + 60 WHERE condition_id = '0xlater'")
+            check("with room for one, the given-up match fills the batch",
+                  [d[0] for d in store.matches_awaiting_set_stats(later + 120, 3600.0, 86400.0, 1)] == [cid])
+            check("left out before the limit, the next match is reached",
+                  [d[0] for d in store.matches_awaiting_set_stats(
+                      later + 120, 3600.0, 86400.0, 1, exclude=[cid])] == ["0xlater"])
+            feed.stats_by_id["fs-later"] = reading
+            poller.collect_final_stats(later + 120)
+            check("and the collector gets to it past the given-up one",
+                  store.conn.execute(
+                      "SELECT COUNT(*) FROM set_stats WHERE condition_id = '0xlater'").fetchone()[0] == 3)
+
 
 def test_stats_poll() -> None:
     print("\nstatistics poll")

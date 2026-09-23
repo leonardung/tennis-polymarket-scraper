@@ -870,7 +870,7 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 674 checks, no network needed
+uv run python tests/test_offline.py   # 677 checks, no network needed
 ```
 
 ## Measured response availability and poll health

@@ -44,7 +44,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, MatchStats, MatchOdds,
                            TimeSeriesChart, OrderBook, Sparkline, TableView
-tests/test_offline.py      674 assertions, no network, plain `python` script
+tests/test_offline.py      677 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -152,7 +152,11 @@ Each iteration, in order:
    with a stored `flashscore_id`, an oriented `flashscore_flip`, and no
    `set_stats` rows yet. `FINAL_STATS_BATCH`=4 at a time. The queue is a query
    over the database rather than a timer in memory, so a restart does not lose
-   it and re-running writes one row per period rather than two.
+   it and re-running writes one row per period rather than two. A match with
+   nothing to collect (walkover, cancellation) is given up after three tries and
+   passed back as `exclude`, which the query applies **before** its `LIMIT` --
+   such a match never gets a row, so filtered afterwards a batch-full of them
+   holds the head of the queue for the whole window (it did, 2026-09-23).
 7. **`_refresh_due()`** — refresh when the interval elapses, **or** when a match
    changed state (rate-limited to `MIN_REFRESH_GAP`=60s, since a refresh pages
    the whole tennis catalog), **or** at `_next_start`, the scheduled start of the
