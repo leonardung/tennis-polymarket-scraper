@@ -54,9 +54,13 @@ export interface Overview {
   generated_at: number;
   last_tick: number | null;
   capturing: boolean;
+  /** Every match, unfiltered; the tab badges use /api/counts under the filters. */
   counts: Record<MatchState, number>;
   tours: string[];
   tournaments: string[];
+  /** The same tournament names split by tour; a combined event is under both. */
+  tournaments_by_tour: Record<string, string[]>;
+  /** Live and upcoming only -- finished matches come a page at a time from /api/past. */
   matches: MatchSummary[];
 }
 

@@ -1,4 +1,4 @@
-import type { MatchDetail, MatchSeries, Overview, PastPage, Pulse } from "./types";
+import type { MatchDetail, MatchSeries, MatchState, Overview, PastPage, Pulse } from "./types";
 
 export class ApiError extends Error {}
 
@@ -18,6 +18,15 @@ async function getJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
 }
 
 export const fetchOverview = (signal?: AbortSignal) => getJSON<Overview>("/api/overview", signal);
+
+export const fetchCounts = (
+  query: { tour: string; tournament: string; search: string },
+  signal?: AbortSignal,
+) =>
+  getJSON<Record<MatchState, number>>(
+    `/api/counts?${new URLSearchParams({ tour: query.tour, tournament: query.tournament, search: query.search.trim() })}`,
+    signal,
+  );
 
 export function fetchPast(
   query: { offset: number; limit: number; tour: string; tournament: string; search: string; sort: string },

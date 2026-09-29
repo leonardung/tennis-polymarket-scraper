@@ -44,7 +44,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, MatchStats, MatchOdds,
                            TimeSeriesChart, OrderBook, Sparkline, TableView
-tests/test_offline.py      692 assertions, no network, plain `python` script
+tests/test_offline.py      697 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -353,11 +353,12 @@ deletions strand, then brings `markets` back in step. Reachable as
 ## Dashboard back end (`dashboard/app.py`, `queries.py`)
 
 `build_app(db)` returns a FastAPI app with one sqlite connection **per thread**
-(`threading.local`) opened `file:…?mode=ro`. Five endpoints:
+(`threading.local`) opened `file:…?mode=ro`. Six endpoints:
 
 | Endpoint | Returns |
 |---|---|
-| `GET /api/overview` | tab counts, tour/tournament filter lists for **every** match; cards (latest prices, sparkline, capture span `first_ts`/`last_ts`, no row count) for **live and upcoming only** |
+| `GET /api/overview` | tab counts, tour/tournament filter lists for **every** match; cards (latest prices, sparkline, capture span `first_ts`/`last_ts`, no row count) for **live and upcoming only**; `tournaments_by_tour` narrows the tournament filter to the picked tour (a combined event is under both) |
+| `GET /api/counts?tour=&tournament=&search=` | `{live, upcoming, past}` under the list's filters, for the tab badges; reads `markets` only |
 | `GET /api/past?offset=&limit=&tour=&tournament=&search=&sort=` | one page of finished-match cards, filtered and sorted server-side: `{total, offset, limit, matches}`. `limit` ≤ `PAGE_LIMIT`=200; the UI asks for 48 |
 | `GET /api/pulse` | `{last_ts}` — the cheap poll target, one seek on `books_by_ts` |
 | `GET /api/match/{cid}` | metadata, both ladders, oriented last trade, full `score_events`, `stats` (`match_stats`: the latest `stat_events` row plus every `set_stats` period, kept apart rather than merged), and `odds` (`match_odds`: the newest Home/Away line per bookmaker, or an empty shape) |
@@ -425,6 +426,15 @@ Docker image has no Node in it.
   and keeps the last value — the Past tab's `/api/past` only runs while that tab
   is on screen, and a filter change resets it to page 1.
 - **Routing** is `window.location.hash`: `#tab/live`, `#match/<condition_id>`.
+  A list route carries the list's state as a query —
+  `#tab/past?tour=atp&tournament=Bari&q=zverev&sort=move&page=3`, defaults
+  omitted — and the URL is its **only** store: `App` reads filters and page out
+  of the route (`readQuery`/`writeQuery`), never `useState`. Filter edits
+  navigate with `replace` (no back-step per keystroke); page and tab changes
+  push. A match route has no list state, so `App` remembers the last list route
+  and the match page's Back returns to it. `_matcher` in `queries.py` (counts,
+  past) and `filterMatches` in `App.tsx` (live/upcoming) are the same filter —
+  change both together.
 - **`TimeSeriesChart`** wraps Lightweight Charts. Its central problem:
   **Lightweight Charts spaces points by index, not by time**, which is wrong for
   data sampled every 5s in play and every 5 min otherwise. `toUniformGrid()`

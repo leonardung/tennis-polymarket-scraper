@@ -236,8 +236,46 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
         # this list, and picking a name does not decide which draw.
         "tours": sorted({m["tour"] for m, _ in markets if m["tour"]}),
         "tournaments": sorted({m["tournament"] for m, _ in markets if m["tournament"]}),
+        # The same names split by draw, so picking a tour narrows the tournament
+        # list to that tour's events. A combined event appears under both.
+        "tournaments_by_tour": {
+            tour: sorted({m["tournament"] for m, _ in markets if m["tour"] == tour and m["tournament"]})
+            for tour in sorted({m["tour"] for m, _ in markets if m["tour"]})
+        },
         "matches": matches,
     }
+
+
+def _matcher(tour: str, tournament: str, search: str):
+    """The card list's filters as a predicate over a `markets` row.
+
+    Tour and tournament are exact; search is a case-insensitive substring of the
+    question or either player. Mirrors filterMatches() in App.tsx, which applies
+    the same filters to the live and upcoming cards in the browser.
+    """
+    needle = search.strip().lower()
+
+    def keep(market: sqlite3.Row) -> bool:
+        if tour and market["tour"] != tour:
+            return False
+        if tournament and market["tournament"] != tournament:
+            return False
+        if needle:
+            text = " ".join(filter(None, (market["question"], market["outcome_0"], market["outcome_1"])))
+            return needle in text.lower()
+        return True
+
+    return keep
+
+
+def counts(conn: sqlite3.Connection, tour: str = "", tournament: str = "", search: str = "") -> dict[str, int]:
+    """How many matches each tab holds under the given filters -- `markets` only."""
+    keep = _matcher(tour, tournament, search)
+    tally = {"live": 0, "upcoming": 0, "past": 0}
+    for market, state in _classified(conn, time.time()):
+        if keep(market):
+            tally[state] += 1
+    return tally
 
 
 def _sort_key(sort: str):
@@ -270,25 +308,12 @@ def past(
     other orders rank on prices or capture span, which means building every
     filtered card first; that is still seeks, not scans.
     """
-    now = time.time()
-    needle = search.strip().lower()
     points = _has_points(conn)
     limit = max(1, min(limit, PAGE_LIMIT))
     offset = max(0, offset)
 
-    rows = []
-    for market, state in _classified(conn, now):
-        if state != "past":
-            continue
-        if tour and market["tour"] != tour:
-            continue
-        if tournament and market["tournament"] != tournament:
-            continue
-        if needle:
-            text = " ".join(filter(None, (market["question"], market["outcome_0"], market["outcome_1"])))
-            if needle not in text.lower():
-                continue
-        rows.append(market)
+    keep = _matcher(tour, tournament, search)
+    rows = [m for m, state in _classified(conn, time.time()) if state == "past" and keep(m)]
 
     # Last captured first, ties by id, so a page boundary never lands between
     # equals differently on the next request; the other orders are stable on top

@@ -80,7 +80,9 @@ writing. It polls for new snapshots every 5 seconds, so a live match updates in
 front of you; leave it open beside the capture. **Past** is paged, 48 matches at
 a time, most recently captured first, with the filters and sort applied across
 all of them — a season's worth of finished matches is never sent to the browser
-at once.
+at once. The filters and the page live in the URL, so a reload, the back button
+or a shared link keeps them; picking a tour narrows the tournament list to that
+tour's events, and the tab badges count only what the filters let through.
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -873,7 +875,7 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 692 checks, no network needed
+uv run python tests/test_offline.py   # 697 checks, no network needed
 ```
 
 ## Measured response availability and poll health

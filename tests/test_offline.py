@@ -2044,6 +2044,14 @@ def test_dashboard_series() -> None:
         check("past search is case-insensitive", queries.past(conn, search="MATCH 2")["total"] == 1)
         check("past filters by tour", queries.past(conn, tour="wta")["total"] == 0)
         check("every sort pages the same set", all(queries.past(conn, sort=s)["total"] == 4 for s in queries.SORTS))
+        # The tab badges count under the filters, with the same predicate past() pages with.
+        check("counts cover every tab", queries.counts(conn) == view["counts"])
+        check("counts follow the search", queries.counts(conn, search="match 2") == {"live": 0, "upcoming": 0, "past": 1})
+        check("counts follow the tour", sum(queries.counts(conn, tour="wta").values()) == 0)
+        check("past total and past count agree",
+              queries.counts(conn, tour="atp")["past"] == queries.past(conn, tour="atp")["total"])
+        check("tournaments are listed per tour",
+              view["tournaments_by_tour"] == {"atp": view["tournaments"]})
         with sqlite3.connect(path) as raw:
             raw.execute("DELETE FROM markets WHERE condition_id LIKE '0xpast%'")
             raw.execute("DELETE FROM books WHERE condition_id LIKE '0xpast%'")

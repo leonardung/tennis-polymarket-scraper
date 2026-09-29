@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { fetchOverview, fetchPast } from "./api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { fetchCounts, fetchOverview, fetchPast } from "./api";
 import { Filters, type FilterState, Pager, Tabs, TopBar } from "./components/Chrome";
 import { MatchCard } from "./components/MatchCard";
 import { MatchDetail } from "./components/MatchDetail";
@@ -18,6 +18,36 @@ const EMPTY: Record<MatchState, string> = {
 // card grid ends on a full row at the common widths.
 const PAST_PAGE = 48;
 
+const SORTS = ["natural", "move", "span", "spread"];
+const NO_FILTERS: FilterState = { tour: "", tournament: "", search: "", sort: "natural" };
+
+/** The list's filters and page, out of a list route's query string. */
+function readQuery(query: string): { filters: FilterState; page: number } {
+  const params = new URLSearchParams(query);
+  const sort = params.get("sort") ?? "";
+  const page = Number.parseInt(params.get("page") ?? "", 10);
+  return {
+    filters: {
+      tour: params.get("tour") ?? "",
+      tournament: params.get("tournament") ?? "",
+      search: params.get("q") ?? "",
+      sort: SORTS.includes(sort) ? sort : "natural",
+    },
+    page: Number.isFinite(page) && page > 1 ? page - 1 : 0,
+  };
+}
+
+/** The inverse of readQuery; defaults are left out so a plain tab stays `#tab/live`. */
+function writeQuery(filters: FilterState, page: number): string {
+  const params = new URLSearchParams();
+  if (filters.tour) params.set("tour", filters.tour);
+  if (filters.tournament) params.set("tournament", filters.tournament);
+  if (filters.search) params.set("q", filters.search);
+  if (filters.sort !== "natural") params.set("sort", filters.sort);
+  if (page > 0) params.set("page", String(page + 1));
+  return params.toString();
+}
+
 export function App() {
   const { palette, isDark, toggle } = useTheme();
   const version = useDataVersion();
@@ -25,29 +55,61 @@ export function App() {
   const overview = useAsync((signal) => fetchOverview(signal), [version]);
   useTicker();
 
-  const [filters, setFilters] = useState<FilterState>({
-    tour: "",
-    tournament: "",
-    search: "",
-    sort: "natural",
-  });
   // Chosen once, when the first payload says which tabs have anything in them;
   // re-picking on every poll would move the ground under the reader.
   const [chosenTab, setChosenTab] = useState<MatchState | null>(null);
-  const [pastOffset, setPastOffset] = useState(0);
 
-  const counts = overview.data?.counts ?? { live: 0, upcoming: 0, past: 0 };
+  const allCounts = overview.data?.counts ?? { live: 0, upcoming: 0, past: 0 };
 
   useEffect(() => {
     if (chosenTab || !overview.data) return;
-    setChosenTab(counts.live ? "live" : counts.upcoming ? "upcoming" : "past");
-  }, [overview.data, chosenTab, counts.live, counts.upcoming]);
+    setChosenTab(allCounts.live ? "live" : allCounts.upcoming ? "upcoming" : "past");
+  }, [overview.data, chosenTab, allCounts.live, allCounts.upcoming]);
 
-  const routeTab = route.kind === "list" ? route.tab : null;
+  // The URL is the list's state: tab, filters and page all live in the hash.
+  // A match route has none of its own, so the last list route is remembered
+  // and the match page's Back returns to exactly that list.
+  const lastList = useRef<{ tab: MatchState | null; query: string }>({ tab: null, query: "" });
+  const routeTab = route.kind === "list" ? route.tab : lastList.current.tab;
   const tab: MatchState =
     routeTab === "live" || routeTab === "upcoming" || routeTab === "past"
       ? routeTab
       : (chosenTab ?? "live");
+  const query = route.kind === "list" ? route.query : lastList.current.query;
+  useEffect(() => {
+    if (route.kind === "list") lastList.current = { tab, query };
+  }, [route.kind, tab, query]);
+
+  const { filters, page } = useMemo(() => readQuery(query), [query]);
+  const pastOffset = page * PAST_PAGE;
+  const goList = useCallback(
+    (next: { tab?: MatchState; filters?: FilterState; page?: number }, replace = false) =>
+      navigate(
+        {
+          kind: "list",
+          tab: next.tab ?? tab,
+          query: writeQuery(next.filters ?? filters, next.page ?? page),
+        },
+        { replace },
+      ),
+    [navigate, tab, filters, page],
+  );
+
+  // The tournament list follows the tour: with ATP picked, only ATP events.
+  const tournaments = useMemo(() => {
+    if (!overview.data) return [];
+    return filters.tour
+      ? (overview.data.tournaments_by_tour[filters.tour] ?? [])
+      : overview.data.tournaments;
+  }, [overview.data, filters.tour]);
+
+  // The badges count under the filters, from `markets` alone. Only the fields
+  // that decide membership are keys -- a sort change moves nothing between tabs.
+  const filtered = useAsync(
+    (signal) => fetchCounts(filters, signal),
+    [version, filters.tour, filters.tournament, filters.search],
+  );
+  const counts = filtered.data ?? allCounts;
 
   // The overview carries live and upcoming cards only. Finished matches -- the
   // bulk of a season, and growing -- are filtered, sorted and paged by the
@@ -60,13 +122,13 @@ export function App() {
   );
 
   // A page can empty out under the reader (a narrower filter, a match leaving
-  // the tab); step back to the last page that still has something on it.
+  // the tab, a stale link); step back to the last page that still has something.
   const pastTotal = past.data?.total ?? 0;
   useEffect(() => {
-    if (pastOffset > 0 && pastOffset >= pastTotal && past.data) {
-      setPastOffset(Math.max(0, Math.ceil(pastTotal / PAST_PAGE) - 1) * PAST_PAGE);
+    if (route.kind === "list" && isPast && page > 0 && pastOffset >= pastTotal && past.data) {
+      goList({ page: Math.max(0, Math.ceil(pastTotal / PAST_PAGE) - 1) }, true);
     }
-  }, [pastOffset, pastTotal, past.data]);
+  }, [route.kind, isPast, page, pastOffset, pastTotal, past.data, goList]);
 
   const inTab = useMemo(
     () => (overview.data?.matches ?? []).filter((m) => m.state === tab),
@@ -77,7 +139,7 @@ export function App() {
     [isPast, past.data, inTab, filters],
   );
 
-  const tabTotal = isPast ? counts.past : inTab.length;
+  const tabTotal = allCounts[tab];
   const shown = isPast ? pastTotal : visible.length;
   const summary =
     tabTotal === 0 || (isPast && !past.data)
@@ -88,8 +150,10 @@ export function App() {
   const current = isPast ? past : overview;
 
   const changeFilters = (next: FilterState) => {
-    setFilters(next);
-    setPastOffset(0);
+    // A tournament the newly picked tour does not hold would filter to nothing.
+    const held = next.tour ? (overview.data?.tournaments_by_tour[next.tour] ?? []) : null;
+    if (next.tournament && held && !held.includes(next.tournament)) next = { ...next, tournament: "" };
+    goList({ filters: next, page: 0 }, true);
   };
 
   return (
@@ -102,17 +166,14 @@ export function App() {
       />
       <Filters
         tours={overview.data?.tours ?? []}
-        tournaments={overview.data?.tournaments ?? []}
+        tournaments={tournaments}
         value={filters}
         onChange={changeFilters}
+        onReset={() => goList({ filters: NO_FILTERS, page: 0 }, true)}
         naturalLabel={isPast ? "Last captured" : "Start time"}
         summary={summary}
       />
-      <Tabs
-        active={tab}
-        counts={counts}
-        onSelect={(next) => navigate({ kind: "list", tab: next })}
-      />
+      <Tabs active={tab} counts={counts} onSelect={(next) => goList({ tab: next, page: 0 })} />
 
       <main>
         {route.kind === "match" ? (
@@ -120,7 +181,7 @@ export function App() {
             conditionId={route.id}
             palette={palette}
             version={version}
-            onBack={() => navigate({ kind: "list", tab })}
+            onBack={() => goList({})}
           />
         ) : (
           <section>
@@ -139,7 +200,7 @@ export function App() {
                 limit={past.data.limit}
                 total={past.data.total}
                 onPage={(offset) => {
-                  setPastOffset(offset);
+                  goList({ page: Math.floor(offset / PAST_PAGE) });
                   window.scrollTo({ top: 0 });
                 }}
               />

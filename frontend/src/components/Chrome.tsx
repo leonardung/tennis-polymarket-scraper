@@ -64,6 +64,7 @@ export function Filters({
   tournaments,
   value,
   onChange,
+  onReset,
   summary,
   naturalLabel,
 }: {
@@ -71,6 +72,8 @@ export function Filters({
   tournaments: string[];
   value: FilterState;
   onChange: (next: FilterState) => void;
+  /** Back to no filters and the default order. */
+  onReset: () => void;
   summary: string;
   /** What the default order is on this tab: start time, or last capture on Past. */
   naturalLabel: string;
@@ -132,7 +135,14 @@ export function Filters({
         </select>
       </label>
 
-      <div className="filter-note">{summary}</div>
+      <div className="filter-note">
+        {summary}
+        {(value.tour || value.tournament || value.search || value.sort !== "natural") && (
+          <button type="button" className="ghost-btn" onClick={onReset}>
+            Clear
+          </button>
+        )}
+      </div>
     </div>
   );
 }

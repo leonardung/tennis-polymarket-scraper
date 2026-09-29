@@ -86,17 +86,31 @@ export function useAsync<T>(
   return state;
 }
 
-export type Route = { kind: "list"; tab: string | null } | { kind: "match"; id: string };
+/** A list route carries the list's filters and page as a query string --
+ * `#tab/past?tour=atp&q=zverev&page=3` -- so a reload or a shared link keeps them. */
+export type Route =
+  | { kind: "list"; tab: string | null; query: string }
+  | { kind: "match"; id: string };
 
 function parseHash(): Route {
   const hash = window.location.hash.replace(/^#/, "");
   if (hash.startsWith("match/")) return { kind: "match", id: hash.slice("match/".length) };
-  if (hash.startsWith("tab/")) return { kind: "list", tab: hash.slice("tab/".length) };
-  return { kind: "list", tab: null };
+  const [path = "", query = ""] = hash.split("?", 2);
+  if (path.startsWith("tab/")) return { kind: "list", tab: path.slice("tab/".length), query };
+  return { kind: "list", tab: null, query };
 }
 
-/** Hash routing, so reload and the browser's back button both behave. */
-export function useRoute(): [Route, (route: Route) => void] {
+function formatHash(route: Route): string {
+  if (route.kind === "match") return `match/${route.id}`;
+  return `tab/${route.tab ?? "live"}${route.query ? `?${route.query}` : ""}`;
+}
+
+/** Hash routing, so reload and the browser's back button both behave.
+ *
+ * `replace` rewrites the current history entry instead of adding one -- for
+ * filter edits, so typing a search does not leave one back-step per keystroke.
+ */
+export function useRoute(): [Route, (route: Route, options?: { replace?: boolean }) => void] {
   const [route, setRoute] = useState<Route>(parseHash);
 
   useEffect(() => {
@@ -105,10 +119,17 @@ export function useRoute(): [Route, (route: Route) => void] {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
 
-  const navigate = useCallback((next: Route) => {
-    const hash = next.kind === "match" ? `match/${next.id}` : `tab/${next.tab ?? "live"}`;
-    if (window.location.hash.replace(/^#/, "") === hash) setRoute(next);
-    else window.location.hash = hash;
+  const navigate = useCallback((next: Route, options: { replace?: boolean } = {}) => {
+    const hash = formatHash(next);
+    if (window.location.hash.replace(/^#/, "") === hash) {
+      setRoute(next);
+    } else if (options.replace) {
+      // replaceState fires no hashchange, so the route is set by hand.
+      window.history.replaceState(window.history.state, "", `#${hash}`);
+      setRoute(next);
+    } else {
+      window.location.hash = hash;
+    }
   }, []);
 
   return [route, navigate];
