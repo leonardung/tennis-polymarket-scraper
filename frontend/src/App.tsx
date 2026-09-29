@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchOverview } from "./api";
-import { Filters, type FilterState, Tabs, TopBar } from "./components/Chrome";
+import { fetchOverview, fetchPast } from "./api";
+import { Filters, type FilterState, Pager, Tabs, TopBar } from "./components/Chrome";
 import { MatchCard } from "./components/MatchCard";
 import { MatchDetail } from "./components/MatchDetail";
 import { useAsync, useDataVersion, useRoute, useTicker } from "./hooks";
@@ -13,6 +13,10 @@ const EMPTY: Record<MatchState, string> = {
     "No scheduled matches recorded yet — run the capture with --include-upcoming to poll them before they start.",
   past: "No finished matches recorded yet.",
 };
+
+// Finished matches are served a page at a time; a multiple of 2, 3 and 4 so the
+// card grid ends on a full row at the common widths.
+const PAST_PAGE = 48;
 
 export function App() {
   const { palette, isDark, toggle } = useTheme();
@@ -30,6 +34,7 @@ export function App() {
   // Chosen once, when the first payload says which tabs have anything in them;
   // re-picking on every poll would move the ground under the reader.
   const [chosenTab, setChosenTab] = useState<MatchState | null>(null);
+  const [pastOffset, setPastOffset] = useState(0);
 
   const counts = overview.data?.counts ?? { live: 0, upcoming: 0, past: 0 };
 
@@ -44,22 +49,48 @@ export function App() {
       ? routeTab
       : (chosenTab ?? "live");
 
+  // The overview carries live and upcoming cards only. Finished matches -- the
+  // bulk of a season, and growing -- are filtered, sorted and paged by the
+  // server, and only fetched while their tab is on screen.
+  const isPast = tab === "past";
+  const past = useAsync(
+    (signal) => fetchPast({ ...filters, offset: pastOffset, limit: PAST_PAGE }, signal),
+    [version, filters, pastOffset],
+    isPast && route.kind === "list",
+  );
+
+  // A page can empty out under the reader (a narrower filter, a match leaving
+  // the tab); step back to the last page that still has something on it.
+  const pastTotal = past.data?.total ?? 0;
+  useEffect(() => {
+    if (pastOffset > 0 && pastOffset >= pastTotal && past.data) {
+      setPastOffset(Math.max(0, Math.ceil(pastTotal / PAST_PAGE) - 1) * PAST_PAGE);
+    }
+  }, [pastOffset, pastTotal, past.data]);
+
   const inTab = useMemo(
     () => (overview.data?.matches ?? []).filter((m) => m.state === tab),
     [overview.data, tab],
   );
-  const visible = useMemo(() => sortMatches(filterMatches(inTab, filters), filters.sort, tab), [
-    inTab,
-    filters,
-    tab,
-  ]);
+  const visible = useMemo(
+    () => (isPast ? (past.data?.matches ?? []) : sortMatches(filterMatches(inTab, filters), filters.sort, tab)),
+    [isPast, past.data, inTab, filters, tab],
+  );
 
+  const tabTotal = isPast ? counts.past : inTab.length;
+  const shown = isPast ? pastTotal : visible.length;
   const summary =
-    inTab.length === 0
+    tabTotal === 0 || (isPast && !past.data)
       ? ""
-      : visible.length === inTab.length
-        ? `${inTab.length} match${inTab.length === 1 ? "" : "es"}`
-        : `${visible.length} of ${inTab.length}`;
+      : shown === tabTotal
+        ? `${tabTotal} match${tabTotal === 1 ? "" : "es"}`
+        : `${shown} of ${tabTotal}`;
+  const current = isPast ? past : overview;
+
+  const changeFilters = (next: FilterState) => {
+    setFilters(next);
+    setPastOffset(0);
+  };
 
   return (
     <>
@@ -73,7 +104,7 @@ export function App() {
         tours={overview.data?.tours ?? []}
         tournaments={overview.data?.tournaments ?? []}
         value={filters}
-        onChange={setFilters}
+        onChange={changeFilters}
         summary={summary}
       />
       <Tabs
@@ -92,7 +123,7 @@ export function App() {
           />
         ) : (
           <section>
-            <div className={overview.refetching ? "cards is-refetching" : "cards"}>
+            <div className={current.refetching ? "cards is-refetching" : "cards"}>
               {visible.map((match) => (
                 <MatchCard
                   key={match.condition_id}
@@ -101,13 +132,24 @@ export function App() {
                 />
               ))}
             </div>
+            {isPast && past.data && (
+              <Pager
+                offset={past.data.offset}
+                limit={past.data.limit}
+                total={past.data.total}
+                onPage={(offset) => {
+                  setPastOffset(offset);
+                  window.scrollTo({ top: 0 });
+                }}
+              />
+            )}
             {visible.length === 0 && (
               <p className="empty">
-                {overview.error
-                  ? `Cannot read the capture database — ${overview.error}`
-                  : !overview.data
+                {current.error
+                  ? `Cannot read the capture database — ${current.error}`
+                  : !current.data
                     ? "Loading…"
-                    : inTab.length
+                    : tabTotal
                       ? "Nothing matches those filters."
                       : EMPTY[tab]}
               </p>

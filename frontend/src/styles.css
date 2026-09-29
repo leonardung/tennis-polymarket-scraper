@@ -126,6 +126,7 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
   padding: 4px 9px; cursor: pointer;
 }
 .ghost-btn:hover { background: var(--wash); color: var(--text-primary); }
+.ghost-btn:disabled { opacity: 0.4; cursor: default; background: none; color: var(--text-secondary); }
 
 /* ---------------------------------------------------------------- filters */
 
@@ -182,6 +183,12 @@ main { padding: 20px 24px 56px; }
   transition: opacity 0.15s ease;
 }
 .cards.is-refetching { opacity: 0.55; }  /* hold the frame; never a skeleton flash */
+
+.pager {
+  display: flex; align-items: center; justify-content: center; gap: 14px; flex-wrap: wrap;
+  padding: 20px 0 0;
+}
+.pager-label { font-size: 13px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 
 .card {
   background: var(--surface-1);

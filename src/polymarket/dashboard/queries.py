@@ -109,137 +109,117 @@ def classify(state: str | None, start_time: str | None, last_seen: float | None,
 # ---------------------------------------------------------------- overview
 
 
-# The newest row for each (match, player).
-#
-# Written as a seek rather than the obvious ROW_NUMBER() window: partitioning
-# reads every row in the table, which at a season's scale costs seconds on a
-# view that refreshes every few seconds. Driving from `markets` and correlating
-# on MAX(ts) turns it into two index lookups per match against books_by_outcome.
-#
-# CROSS JOIN, not JOIN: it is the only part of this that is load-bearing. Left
-# free to reorder, SQLite makes `books` the outer loop and scans the whole table
-# anyway -- the same cost the window function had. CROSS JOIN pins `markets`
-# first, which is what makes the lookups seeks.
-_LATEST_BOOKS = """
-WITH sides(outcome_index) AS (VALUES (0), (1))
-SELECT b.condition_id, b.outcome_index, b.outcome, b.ts,
-       b.best_bid, b.best_ask, b.mid, b.spread, b.market_last_trade
-FROM markets m
-CROSS JOIN sides s
-CROSS JOIN books b
-  ON b.condition_id = m.condition_id
- AND b.outcome_index = s.outcome_index
- AND b.ts = (
-        SELECT MAX(x.ts) FROM books x
-        WHERE x.condition_id = m.condition_id AND x.outcome_index = s.outcome_index
-    )
+# Everything a card needs is read per match, as index seeks: the newest book per
+# player (books_by_outcome, walked backwards), the capture span (two seeks on
+# books_by_market), the sparkline tail, and the newest point score. Nothing here
+# aggregates over `books` -- a COUNT(*) or GROUP BY across it walks a >1 GB index,
+# tens of seconds on a cold page cache, and the overview is refetched on every
+# tick. The snapshot count lives in match_detail, where it is one match's range.
+# Per match rather than set-based so a page of past matches costs only its page.
+_LATEST_BOOK = """
+SELECT ts, outcome_index, outcome, best_bid, best_ask, mid, spread, market_last_trade
+FROM books WHERE condition_id = ? AND outcome_index = ?
+ORDER BY ts DESC LIMIT 1
 """
 
-# When each match's capture began and last wrote, as two seeks per match on
-# books_by_market. Deliberately not `COUNT(*) ... GROUP BY condition_id`: the
-# count is a range scan per match, so summed over the list it reads the whole
-# index -- about 1.4 GB at 7.7 M rows, tens of seconds on a cold page cache, and
-# the overview is refetched on every tick. MIN and MAX stay in separate
-# subqueries because SQLite only turns a lone MIN or MAX into a single seek.
-# The snapshot count is per match in match_detail, where it costs one range.
+# MIN and MAX in separate subqueries: SQLite only turns a lone MIN or MAX into
+# a single seek; together they would scan the match's range.
 _SPAN = """
-SELECT m.condition_id,
-       (SELECT MIN(b.ts) FROM books b WHERE b.condition_id = m.condition_id) AS first_ts,
-       (SELECT MAX(b.ts) FROM books b WHERE b.condition_id = m.condition_id) AS last_ts
-FROM markets m
+SELECT (SELECT MIN(ts) FROM books WHERE condition_id = :cid) AS first_ts,
+       (SELECT MAX(ts) FROM books WHERE condition_id = :cid) AS last_ts
 """
 
-# The tail of one player's mid, for a card sparkline. Run per match: a backward
-# index walk stopping after `limit` rows beats any single query that has to rank
-# every row in the table to find each match's last few.
+# The tail of one player's mid, for a card sparkline.
 _SPARK = """
 SELECT mid FROM books
 WHERE condition_id = ? AND outcome_index = 0
 ORDER BY ts DESC LIMIT ?
 """
 
+# `markets` keeps only the set score, so the points on a card come from the tail
+# of `score_events` -- (condition_id, ts) is its primary key.
+_LATEST_POINTS = "SELECT game FROM score_events WHERE condition_id = ? ORDER BY ts DESC LIMIT 1"
 
-# Where each match stands inside the game being played. `markets` keeps only the
-# set score, so the points have to come from the tail of `score_events` -- one
-# seek per match, since (condition_id, ts) is that table's primary key.
-_LATEST_POINTS = """
-SELECT e.condition_id, e.game
-FROM markets m
-CROSS JOIN score_events e
-  ON e.condition_id = m.condition_id
- AND e.ts = (
-        SELECT MAX(x.ts) FROM score_events x WHERE x.condition_id = m.condition_id
-    )
-"""
+# How many finished matches /api/past returns at most in one page.
+PAGE_LIMIT = 200
+
+SORTS = ("natural", "move", "span", "spread")
 
 
-def _latest_points(conn: sqlite3.Connection) -> dict[str, str | None]:
-    """The current points per match, empty against a database without them.
-
-    `score_events` and its `game` column both arrived after the first captures,
-    so an older file shows cards with no points rather than failing to load.
-    """
+def _has_points(conn: sqlite3.Connection) -> bool:
+    """`score_events` and its `game` column both arrived after the first captures,
+    so an older file shows cards with no points rather than failing to load."""
     if not _has_table(conn, "score_events"):
-        return {}
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(score_events)")}
-    if "game" not in columns:
-        return {}
-    return {r["condition_id"]: r["game"] for r in conn.execute(_LATEST_POINTS)}
+        return False
+    return "game" in {row[1] for row in conn.execute("PRAGMA table_info(score_events)")}
+
+
+def _card(
+    conn: sqlite3.Connection, market: sqlite3.Row, state: str, points: bool, spark_points: int
+) -> dict[str, Any]:
+    """One match card, from the market row plus a handful of seeks."""
+    cid = market["condition_id"]
+    books = {}
+    for i in (0, 1):
+        row = conn.execute(_LATEST_BOOK, (cid, i)).fetchone()
+        if row is not None:
+            books[i] = row
+    span = conn.execute(_SPAN, {"cid": cid}).fetchone()
+    spark = [r["mid"] for r in reversed(conn.execute(_SPARK, (cid, spark_points)).fetchall())]
+    game = None
+    if points:
+        row = conn.execute(_LATEST_POINTS, (cid,)).fetchone()
+        game = row["game"] if row else None
+
+    return {
+        "condition_id": cid,
+        "question": market["question"],
+        "tour": market["tour"],
+        "tournament": market["tournament"],
+        "tier": market["tier"],
+        "market_type": market["market_type"],
+        "players": [market["outcome_0"], market["outcome_1"]],
+        "feed_state": market["state"],
+        "state": state,
+        "period": market["period"],
+        "score": market["score"],
+        "game": game,
+        "start_time": market["start_time"],
+        "start_epoch": _epoch(market["start_time"]),
+        "last_seen": market["last_seen"],
+        "prices": [_price_summary(books.get(i)) for i in (0, 1)],
+        "last_trade": _oriented_last_trade(books),
+        "first_ts": span["first_ts"],
+        "last_ts": span["last_ts"],
+        "spark": spark,
+        "move": _move(spark),
+    }
+
+
+def _classified(conn: sqlite3.Connection, now: float) -> list[tuple[sqlite3.Row, str]]:
+    """Every market with its tab. Reads `markets` only -- a few hundred rows."""
+    return [
+        (m, classify(m["state"], m["start_time"], m["last_seen"], now))
+        for m in conn.execute("SELECT * FROM markets")
+    ]
 
 
 def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any]:
+    """Counts and filter lists for every match; cards for live and upcoming only.
+
+    Finished matches are the bulk of a season's list and grow without bound, so
+    their cards are served a page at a time by `past()` instead.
+    """
     now = time.time()
+    markets = _classified(conn, now)
+    points = _has_points(conn)
 
-    latest: dict[str, dict[int, sqlite3.Row]] = {}
-    for row in conn.execute(_LATEST_BOOKS):
-        latest.setdefault(row["condition_id"], {})[row["outcome_index"]] = row
-
-    span = {r["condition_id"]: r for r in conn.execute(_SPAN) if r["last_ts"] is not None}
-    points = _latest_points(conn)
-
-    sparks: dict[str, list[float | None]] = {}
-    for cid in span:
-        rows = conn.execute(_SPARK, (cid, spark_points)).fetchall()
-        sparks[cid] = [r["mid"] for r in reversed(rows)]
-
-    matches = []
-    for market in conn.execute("SELECT * FROM markets"):
-        cid = market["condition_id"]
-        books = latest.get(cid, {})
-        cover = span.get(cid)
-        prices = [_price_summary(books.get(i)) for i in (0, 1)]
-        spark = sparks.get(cid, [])
-
-        matches.append(
-            {
-                "condition_id": cid,
-                "question": market["question"],
-                "tour": market["tour"],
-                "tournament": market["tournament"],
-                "tier": market["tier"],
-                "market_type": market["market_type"],
-                "players": [market["outcome_0"], market["outcome_1"]],
-                "feed_state": market["state"],
-                "state": classify(market["state"], market["start_time"], market["last_seen"], now),
-                "period": market["period"],
-                "score": market["score"],
-                "game": points.get(cid),
-                "start_time": market["start_time"],
-                "start_epoch": _epoch(market["start_time"]),
-                "last_seen": market["last_seen"],
-                "prices": prices,
-                "last_trade": _oriented_last_trade(books),
-                "first_ts": cover["first_ts"] if cover else None,
-                "last_ts": cover["last_ts"] if cover else None,
-                "spark": spark,
-                "move": _move(spark),
-            }
-        )
-
-    last_tick = conn.execute("SELECT MAX(ts) FROM books").fetchone()[0]
     counts = {"live": 0, "upcoming": 0, "past": 0}
-    for match in matches:
-        counts[match["state"]] += 1
+    for _, state in markets:
+        counts[state] += 1
+
+    matches = [_card(conn, m, state, points, spark_points) for m, state in markets if state != "past"]
+    last_tick = conn.execute("SELECT MAX(ts) FROM books").fetchone()[0]
 
     return {
         "generated_at": now,
@@ -249,10 +229,72 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
         # Tournament names are shared across the two draws of a combined event,
         # so the two filters are independent: picking a tour does not shorten
         # this list, and picking a name does not decide which draw.
-        "tours": sorted({m["tour"] for m in matches if m["tour"]}),
-        "tournaments": sorted({m["tournament"] for m in matches if m["tournament"]}),
+        "tours": sorted({m["tour"] for m, _ in markets if m["tour"]}),
+        "tournaments": sorted({m["tournament"] for m, _ in markets if m["tournament"]}),
         "matches": matches,
     }
+
+
+def _sort_key(sort: str):
+    """Descending keys, mirroring sortMatches() in App.tsx for the other tabs."""
+    if sort == "move":
+        return lambda c: abs(c["move"] or 0.0)
+    if sort == "span":
+        return lambda c: c["last_ts"] - c["first_ts"] if c["first_ts"] is not None and c["last_ts"] is not None else -1.0
+    if sort == "spread":
+        return lambda c: max((p["spread"] for p in c["prices"] if p and p["spread"] is not None), default=-1.0)
+    raise ValueError(sort)
+
+
+def past(
+    conn: sqlite3.Connection,
+    offset: int = 0,
+    limit: int = 48,
+    tour: str = "",
+    tournament: str = "",
+    search: str = "",
+    sort: str = "natural",
+    spark_points: int = 100,
+) -> dict[str, Any]:
+    """One page of finished matches, filtered and sorted before it is cut.
+
+    The filters are the card list's own (tour, tournament, a case-insensitive
+    substring of the question or either player) and run on `markets` alone. The
+    default order -- newest first -- needs nothing else, so only the page's cards
+    are built. The other orders rank on prices or capture span, which means
+    building every filtered card first; that is still seeks, not scans.
+    """
+    now = time.time()
+    needle = search.strip().lower()
+    points = _has_points(conn)
+    limit = max(1, min(limit, PAGE_LIMIT))
+    offset = max(0, offset)
+
+    rows = []
+    for market, state in _classified(conn, now):
+        if state != "past":
+            continue
+        if tour and market["tour"] != tour:
+            continue
+        if tournament and market["tournament"] != tournament:
+            continue
+        if needle:
+            text = " ".join(filter(None, (market["question"], market["outcome_0"], market["outcome_1"])))
+            if needle not in text.lower():
+                continue
+        rows.append(market)
+
+    # Newest first, ties by id, so a page boundary never lands between equals
+    # differently on the next request; the other orders are stable on top of it.
+    rows.sort(key=lambda m: (_epoch(m["start_time"]) or 0.0, m["condition_id"]), reverse=True)
+    if sort == "natural":
+        cards = [_card(conn, m, "past", points, spark_points) for m in rows[offset : offset + limit]]
+    else:
+        every = [_card(conn, m, "past", points, spark_points) for m in rows]
+        every.sort(key=_sort_key(sort), reverse=True)
+        cards = every[offset : offset + limit]
+
+    return {"total": len(rows), "offset": offset, "limit": limit, "matches": cards}
 
 
 def _price_summary(row: sqlite3.Row | None) -> dict[str, Any] | None:

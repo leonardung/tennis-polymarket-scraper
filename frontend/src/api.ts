@@ -1,4 +1,4 @@
-import type { MatchDetail, MatchSeries, Overview, Pulse } from "./types";
+import type { MatchDetail, MatchSeries, Overview, PastPage, Pulse } from "./types";
 
 export class ApiError extends Error {}
 
@@ -18,6 +18,21 @@ async function getJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
 }
 
 export const fetchOverview = (signal?: AbortSignal) => getJSON<Overview>("/api/overview", signal);
+
+export function fetchPast(
+  query: { offset: number; limit: number; tour: string; tournament: string; search: string; sort: string },
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams({
+    offset: String(query.offset),
+    limit: String(query.limit),
+    tour: query.tour,
+    tournament: query.tournament,
+    search: query.search.trim(),
+    sort: query.sort,
+  });
+  return getJSON<PastPage>(`/api/past?${params}`, signal);
+}
 
 export const fetchPulse = (signal?: AbortSignal) => getJSON<Pulse>("/api/pulse", signal);
 

@@ -77,7 +77,9 @@ uv run polymarket dashboard --port 9000 --no-open
 
 Three tabs — **Live**, **Upcoming**, **Past** — over the same database `run` is
 writing. It polls for new snapshots every 5 seconds, so a live match updates in
-front of you; leave it open beside the capture.
+front of you; leave it open beside the capture. **Past** is paged, 48 matches at
+a time, with the filters and sort applied across all of them — a season's worth
+of finished matches is never sent to the browser at once.
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -870,7 +872,7 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 680 checks, no network needed
+uv run python tests/test_offline.py   # 691 checks, no network needed
 ```
 
 ## Measured response availability and poll health

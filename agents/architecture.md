@@ -44,7 +44,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, MatchStats, MatchOdds,
                            TimeSeriesChart, OrderBook, Sparkline, TableView
-tests/test_offline.py      680 assertions, no network, plain `python` script
+tests/test_offline.py      691 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -353,11 +353,12 @@ deletions strand, then brings `markets` back in step. Reachable as
 ## Dashboard back end (`dashboard/app.py`, `queries.py`)
 
 `build_app(db)` returns a FastAPI app with one sqlite connection **per thread**
-(`threading.local`) opened `file:…?mode=ro`. Four endpoints:
+(`threading.local`) opened `file:…?mode=ro`. Five endpoints:
 
 | Endpoint | Returns |
 |---|---|
-| `GET /api/overview` | every match with latest prices, sparkline, capture span (`first_ts`/`last_ts`, no row count), tab classification |
+| `GET /api/overview` | tab counts, tour/tournament filter lists for **every** match; cards (latest prices, sparkline, capture span `first_ts`/`last_ts`, no row count) for **live and upcoming only** |
+| `GET /api/past?offset=&limit=&tour=&tournament=&search=&sort=` | one page of finished-match cards, filtered and sorted server-side: `{total, offset, limit, matches}`. `limit` ≤ `PAGE_LIMIT`=200; the UI asks for 48 |
 | `GET /api/pulse` | `{last_ts}` — the cheap poll target, one seek on `books_by_ts` |
 | `GET /api/match/{cid}` | metadata, both ladders, oriented last trade, full `score_events`, `stats` (`match_stats`: the latest `stat_events` row plus every `set_stats` period, kept apart rather than merged), and `odds` (`match_odds`: the newest Home/Away line per bookmaker, or an empty shape) |
 | `GET /api/match/{cid}/series?points=&since=` | both players on one shared forward-filled grid |
@@ -369,11 +370,21 @@ returns `static/index.html`; `/static` is mounted at the built bundle.
 
 **No whole-table aggregate on a polled path.** `/api/overview` is refetched on
 every tick and `/api/pulse` every 5s, against a `books` table of millions of
-rows. Every overview query is per-match seeks driven from `markets`; `COUNT(*)`
+rows. Every card query (`_card()`: `_LATEST_BOOK`, `_SPAN`, `_SPARK`,
+`_LATEST_POINTS`) is an index seek per match, checked against `EXPLAIN QUERY
+PLAN` in the tests; `COUNT(*)`
 over `books` (globally or `GROUP BY condition_id`) walks a >1 GB index — ~1s
 warm, tens of seconds on a cold page cache, which is what made the first load
 of the dashboard slow until 2026-09-29. The snapshot count lives only in
 `match_detail`, where it is one match's range.
+
+**Past matches are paged.** They are most of a season's list and grow without
+bound, so `overview()` counts them but builds no card for them; `past()` filters
+on `markets` alone, orders newest-first by `start_time` (ties by id, so pages
+are stable), and builds cards only for the requested page. The other sorts
+(`move`, `span`, `spread`) rank on card fields, so they build every filtered card
+first — still seeks. `_sort_key` mirrors `sortMatches()` in `App.tsx`, which
+still sorts live/upcoming client-side; change both together.
 
 Three reconstructions live in `queries.py` (server side, because they depend on
 how the capture writes, not on how a chart draws):
@@ -408,7 +419,9 @@ Docker image has no Node in it.
   only when `last_ts` moves; the heavy endpoints are keyed on that
   counter. This exists because a chart re-render throws away the reader's zoom.
 - **`useAsync`** keeps the previous value on screen while refetching
-  (`refetching` flag, not a spinner swap).
+  (`refetching` flag, not a spinner swap). Its `enabled` flag suspends fetching
+  and keeps the last value — the Past tab's `/api/past` only runs while that tab
+  is on screen, and a filter change resets it to page 1.
 - **Routing** is `window.location.hash`: `#tab/live`, `#match/<condition_id>`.
 - **`TimeSeriesChart`** wraps Lightweight Charts. Its central problem:
   **Lightweight Charts spaces points by index, not by time**, which is wrong for

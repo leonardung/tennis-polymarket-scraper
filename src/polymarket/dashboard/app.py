@@ -1,4 +1,4 @@
-"""The dashboard's HTTP layer: a static page plus four read-only JSON endpoints."""
+"""The dashboard's HTTP layer: a static page plus five read-only JSON endpoints."""
 
 from __future__ import annotations
 
@@ -53,6 +53,20 @@ def build_app(db: str | Path) -> FastAPI:
         """
         last_ts = conn().execute("SELECT MAX(ts) FROM books").fetchone()[0]
         return {"last_ts": last_ts}
+
+    @app.get("/api/past")
+    def api_past(
+        offset: int = Query(0, ge=0),
+        limit: int = Query(48, ge=1, le=queries.PAGE_LIMIT),
+        tour: str = "",
+        tournament: str = "",
+        search: str = "",
+        sort: str = Query("natural", pattern="^(" + "|".join(queries.SORTS) + ")$"),
+    ) -> dict[str, Any]:
+        """One page of finished matches; the overview carries only their count."""
+        return queries.past(
+            conn(), offset=offset, limit=limit, tour=tour, tournament=tournament, search=search, sort=sort
+        )
 
     @app.get("/api/match/{condition_id}")
     def api_match(condition_id: str) -> dict[str, Any]:

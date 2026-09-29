@@ -185,6 +185,14 @@ export interface MatchSeries {
   decimated: boolean;
 }
 
+/** One page of finished matches from /api/past, filtered and sorted server-side. */
+export interface PastPage {
+  total: number;
+  offset: number;
+  limit: number;
+  matches: MatchSummary[];
+}
+
 export interface Pulse {
   last_ts: number | null;
 }

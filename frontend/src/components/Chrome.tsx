@@ -140,6 +140,42 @@ const TABS: { key: MatchState; label: string }[] = [
   { key: "past", label: "Past" },
 ];
 
+/** Previous / next over a server-paged list; renders nothing for a single page. */
+export function Pager({
+  offset,
+  limit,
+  total,
+  onPage,
+}: {
+  offset: number;
+  limit: number;
+  total: number;
+  onPage: (offset: number) => void;
+}) {
+  if (total <= limit) return null;
+  const page = Math.floor(offset / limit) + 1;
+  const pages = Math.ceil(total / limit);
+  return (
+    <nav className="pager" aria-label="Pages">
+      <button type="button" className="ghost-btn" disabled={page <= 1} onClick={() => onPage(offset - limit)}>
+        ← Previous
+      </button>
+      <span className="pager-label">
+        {(offset + 1).toLocaleString()}–{Math.min(offset + limit, total).toLocaleString()} of{" "}
+        {total.toLocaleString()} · page {page} of {pages}
+      </span>
+      <button
+        type="button"
+        className="ghost-btn"
+        disabled={page >= pages}
+        onClick={() => onPage(offset + limit)}
+      >
+        Next →
+      </button>
+    </nav>
+  );
+}
+
 export function Tabs({
   active,
   counts,

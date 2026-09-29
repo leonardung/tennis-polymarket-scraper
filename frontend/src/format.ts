@@ -37,8 +37,10 @@ export function fmtDateTime(ts: number | null | undefined): string {
 
 export function fmtDuration(seconds: number | null | undefined): string {
   if (seconds == null || seconds < 0) return "—";
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.round((seconds % 3600) / 60);
+  // Round to whole minutes first, so 16h 59m 45s reads 17h 00m rather than 16h 60m.
+  const total = Math.round(seconds / 60);
+  const hours = Math.floor(total / 60);
+  const minutes = total % 60;
   if (hours >= 1) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
   if (seconds >= 60) return `${Math.round(seconds / 60)}m`;
   return `${Math.round(seconds)}s`;

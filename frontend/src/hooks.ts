@@ -49,16 +49,22 @@ export interface Async<T> {
   refetching: boolean;
 }
 
-/** Fetch that keeps the previous value visible while the next one loads. */
+/** Fetch that keeps the previous value visible while the next one loads.
+ *
+ * While `enabled` is false nothing is fetched and the last value is kept, so a
+ * view that is not on screen neither polls nor flashes "Loading…" on return.
+ */
 export function useAsync<T>(
   load: (signal: AbortSignal) => Promise<T>,
   deps: readonly unknown[],
+  enabled = true,
 ): Async<T> {
   const [state, setState] = useState<Async<T>>({ data: null, error: null, refetching: false });
   // Kept in a ref so the effect does not re-run when the data it fetched arrives.
   const hasData = useRef(false);
 
   useEffect(() => {
+    if (!enabled) return;
     const controller = new AbortController();
     setState((s) => ({ ...s, refetching: hasData.current }));
 
@@ -75,7 +81,7 @@ export function useAsync<T>(
 
     return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
+  }, [enabled, ...deps]);
 
   return state;
 }
