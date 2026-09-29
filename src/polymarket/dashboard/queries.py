@@ -248,13 +248,16 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
 
 
 def _tournaments(markets: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
-    """Tournament names with a start date, newest first -- this week's events on top.
+    """Tournament names with a start date and tier, newest first.
 
     The date is the earliest scheduled slot among the tournament's matches. A slot
     can be wrong for one finished match (a cancelled match keeps a future one),
     but the earliest across a draw is a stable reading of when the event began.
+    `tiers` is one `{tour, tier}` per draw -- a combined event has two, and they
+    can differ (the China Open is an ATP 500 and a WTA 1000).
     """
     start: dict[str, float | None] = {}
+    tiers: dict[str, set[tuple[str, str]]] = {}
     for market in markets:
         name = market["tournament"]
         if not name:
@@ -262,9 +265,19 @@ def _tournaments(markets: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
         slot = _epoch(market["start_time"])
         known = start.get(name)
         start[name] = slot if known is None else (known if slot is None else min(known, slot))
+        held = tiers.setdefault(name, set())
+        if market["tier"]:
+            held.add((market["tour"] or "", market["tier"]))
     ordered = sorted(start.items(), key=lambda item: item[0])
     ordered.sort(key=lambda item: item[1] if item[1] is not None else float("-inf"), reverse=True)
-    return [{"name": name, "start": first} for name, first in ordered]
+    return [
+        {
+            "name": name,
+            "start": first,
+            "tiers": [{"tour": tour, "tier": tier} for tour, tier in sorted(tiers[name])],
+        }
+        for name, first in ordered
+    ]
 
 
 def _matcher(tour: str, tournament: str, search: str):

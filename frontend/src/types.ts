@@ -54,6 +54,8 @@ export interface Tournament {
   name: string;
   /** Epoch seconds of the earliest scheduled match in the draw. */
   start: number | null;
+  /** One per draw: a combined event has an ATP and a WTA tier, which can differ. */
+  tiers: { tour: string; tier: string }[];
 }
 
 export interface Overview {

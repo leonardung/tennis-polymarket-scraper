@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { fmtDay, fmtRelative } from "../format";
+import { fmtDay, fmtRelative, fmtTiers } from "../format";
 import type { MatchState, Overview, Tournament } from "../types";
 
 export function TopBar({
@@ -106,9 +106,11 @@ export function Filters({
           onChange={(e) => onChange({ ...value, tournament: e.target.value })}
         >
           <option value="">All</option>
-          {tournaments.map(({ name, start }) => (
+          {tournaments.map(({ name, start, tiers }) => (
             <option key={name} value={name}>
-              {start != null ? `${fmtDay(start)} · ${name}` : name}
+              {[start != null ? fmtDay(start) : null, name, tiers.length ? fmtTiers(tiers) : null]
+                .filter(Boolean)
+                .join(" · ")}
             </option>
           ))}
         </select>

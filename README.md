@@ -84,7 +84,8 @@ at once. The filters and the page live in the URL, so a reload, the back button
 or a shared link keeps them; picking a tour narrows the tournament list to that
 tour's events, and the tab badges count only what the filters let through.
 Tournaments are listed newest first, each with its start date — the day of its
-first scheduled match — so this week's events are at the top.
+first scheduled match — and its category (`Sep 30 · China Open · ATP 500 / WTA
+1000`), so this week's events are at the top.
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -877,7 +878,7 @@ FROM set_stats f WHERE f.condition_id = '0x...' AND f.period = 'Match';
 - If the API can't be reached, see [DNS.md](DNS.md).
 
 ```bash
-uv run python tests/test_offline.py   # 700 checks, no network needed
+uv run python tests/test_offline.py   # 702 checks, no network needed
 ```
 
 ## Measured response availability and poll health

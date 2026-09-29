@@ -27,6 +27,30 @@ export function fmtClock(ts: number | null | undefined, withSeconds = false): st
   return new Date(ts * 1000).toLocaleTimeString([], options);
 }
 
+const TIER_LABELS: Record<string, string> = {
+  grand_slam: "Grand Slam",
+  masters: "Masters 1000",
+  atp_500: "ATP 500",
+  atp_250: "ATP 250",
+  wta_1000: "WTA 1000",
+  wta_500: "WTA 500",
+  wta_250: "WTA 250",
+};
+
+/** A tournament tier as the tours name it: config.py's tier keys, per tour. */
+export function fmtTier(tier: string, tour: string): string {
+  const circuit = tour.toUpperCase();
+  if (tier === "finals") return `${circuit} Finals`;
+  // The tier below the tour: ATP Challengers, and WTA 125s if they are captured.
+  if (tier === "challenger") return tour === "wta" ? "WTA 125" : "Challenger";
+  return TIER_LABELS[tier] ?? tier;
+}
+
+/** Every draw's tier, once each: "Grand Slam" for the US Open, "ATP 500 / WTA 1000" for Beijing. */
+export function fmtTiers(tiers: { tour: string; tier: string }[]): string {
+  return [...new Set(tiers.map(({ tier, tour }) => fmtTier(tier, tour)))].join(" / ");
+}
+
 /** A calendar day, "Sep 30"; the year only when it is not this one. */
 export function fmtDay(ts: number | null | undefined): string {
   if (ts == null) return "—";

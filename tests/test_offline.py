@@ -2056,14 +2056,22 @@ def test_dashboard_series() -> None:
               view["tournaments"][0]["start"] == queries._epoch("2026-01-01T12:00:00Z"))
         from polymarket.dashboard.queries import _tournaments
         dated = _tournaments([
-            {"tournament": "Old", "start_time": "2026-08-01T10:00:00Z"},
-            {"tournament": "New", "start_time": "2026-09-28T10:00:00Z"},
-            {"tournament": "New", "start_time": "2026-09-27T10:00:00Z"},
-            {"tournament": "Undated", "start_time": None},
+            {"tournament": "Old", "tour": "atp", "tier": "atp_250", "start_time": "2026-08-01T10:00:00Z"},
+            {"tournament": "New", "tour": "atp", "tier": "atp_250", "start_time": "2026-09-28T10:00:00Z"},
+            {"tournament": "New", "tour": "atp", "tier": "atp_250", "start_time": "2026-09-27T10:00:00Z"},
+            {"tournament": "Undated", "tour": "atp", "tier": "atp_250", "start_time": None},
         ])
         check("tournaments run newest first, undated last",
               [t["name"] for t in dated] == ["New", "Old", "Undated"])
         check("and start with their first match", dated[0]["start"] == queries._epoch("2026-09-27T10:00:00Z"))
+        check("a tournament carries its tier", view["tournaments"][0]["tiers"] == [{"tour": "atp", "tier": market.tier}])
+        combined = _tournaments([
+            {"tournament": "China Open", "tour": "wta", "tier": "wta_1000", "start_time": None},
+            {"tournament": "China Open", "tour": "atp", "tier": "atp_500", "start_time": None},
+            {"tournament": "China Open", "tour": "atp", "tier": "atp_500", "start_time": None},
+        ])
+        check("a combined event has one tier per draw",
+              combined[0]["tiers"] == [{"tour": "atp", "tier": "atp_500"}, {"tour": "wta", "tier": "wta_1000"}])
         with sqlite3.connect(path) as raw:
             raw.execute("DELETE FROM markets WHERE condition_id LIKE '0xpast%'")
             raw.execute("DELETE FROM books WHERE condition_id LIKE '0xpast%'")
