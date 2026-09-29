@@ -2003,6 +2003,14 @@ def test_dashboard_series() -> None:
         check("and offers it as a filter", view["tours"] == ["atp"])
         check("detail carries it too", detail["tour"] == "atp")
         check("sparkline carries the mid series", len(view["matches"][0]["spark"]) == 2)
+        # The card's capture span comes from two index seeks; the row count is a
+        # full-index scan across the list and stays on the detail page only.
+        card = view["matches"][0]
+        check("overview carries the capture span",
+              card["first_ts"] == detail["first_ts"] and card["last_ts"] == detail["last_ts"])
+        check("overview does not count snapshots", "snapshots" not in card)
+        plan = " ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + queries._SPAN))
+        check("capture span seeks rather than scans books", "SCAN b" not in plan and "books_by_market" in plan)
         # No score recorded yet: the card has no points to show rather than a
         # stale or invented pair.
         check("no points without a score event", view["matches"][0]["game"] is None)

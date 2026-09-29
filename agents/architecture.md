@@ -44,7 +44,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, MatchStats, MatchOdds,
                            TimeSeriesChart, OrderBook, Sparkline, TableView
-tests/test_offline.py      677 assertions, no network, plain `python` script
+tests/test_offline.py      680 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -357,8 +357,8 @@ deletions strand, then brings `markets` back in step. Reachable as
 
 | Endpoint | Returns |
 |---|---|
-| `GET /api/overview` | every match with latest prices, sparkline, coverage, tab classification |
-| `GET /api/pulse` | `{last_ts, rows}` — the cheap poll target |
+| `GET /api/overview` | every match with latest prices, sparkline, capture span (`first_ts`/`last_ts`, no row count), tab classification |
+| `GET /api/pulse` | `{last_ts}` — the cheap poll target, one seek on `books_by_ts` |
 | `GET /api/match/{cid}` | metadata, both ladders, oriented last trade, full `score_events`, `stats` (`match_stats`: the latest `stat_events` row plus every `set_stats` period, kept apart rather than merged), and `odds` (`match_odds`: the newest Home/Away line per bookmaker, or an empty shape) |
 | `GET /api/match/{cid}/series?points=&since=` | both players on one shared forward-filled grid |
 
@@ -366,6 +366,14 @@ deletions strand, then brings `markets` back in step. Reachable as
 run `Store`'s idempotent migration (a read-only connection cannot create the
 index the per-match lookups seek on). Everything after that is read-only. `/`
 returns `static/index.html`; `/static` is mounted at the built bundle.
+
+**No whole-table aggregate on a polled path.** `/api/overview` is refetched on
+every tick and `/api/pulse` every 5s, against a `books` table of millions of
+rows. Every overview query is per-match seeks driven from `markets`; `COUNT(*)`
+over `books` (globally or `GROUP BY condition_id`) walks a >1 GB index — ~1s
+warm, tens of seconds on a cold page cache, which is what made the first load
+of the dashboard slow until 2026-09-29. The snapshot count lives only in
+`match_detail`, where it is one match's range.
 
 Three reconstructions live in `queries.py` (server side, because they depend on
 how the capture writes, not on how a chart draws):
@@ -397,7 +405,7 @@ committed** — installing the package must not need a Node toolchain, and the
 Docker image has no Node in it.
 
 - **Polling**: `useDataVersion()` polls `/api/pulse` every 5s and bumps a counter
-  only when `(last_ts, rows)` moves; the heavy endpoints are keyed on that
+  only when `last_ts` moves; the heavy endpoints are keyed on that
   counter. This exists because a chart re-render throws away the reader's zoom.
 - **`useAsync`** keeps the previous value on screen while refetching
   (`refetching` flag, not a spinner swap).

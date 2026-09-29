@@ -45,10 +45,14 @@ def build_app(db: str | Path) -> FastAPI:
 
     @app.get("/api/pulse")
     def api_pulse() -> dict[str, Any]:
-        """Cheap poll target: the client refetches only when this moves."""
-        cursor = conn().execute("SELECT MAX(ts), COUNT(*) FROM books")
-        last_ts, rows = cursor.fetchone()
-        return {"last_ts": last_ts, "rows": rows}
+        """Cheap poll target: the client refetches only when this moves.
+
+        MAX(ts) alone is one seek on books_by_ts. A row count would also catch
+        a write at an unchanged timestamp, but COUNT(*) walks a whole index --
+        seconds on a season's capture, every five seconds per open tab.
+        """
+        last_ts = conn().execute("SELECT MAX(ts) FROM books").fetchone()[0]
+        return {"last_ts": last_ts}
 
     @app.get("/api/match/{condition_id}")
     def api_match(condition_id: str) -> dict[str, Any]:

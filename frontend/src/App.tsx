@@ -134,13 +134,18 @@ function widestSpread(match: MatchSummary): number {
   return spreads.length ? Math.max(...spreads) : -1;
 }
 
+/** How long the book has been recorded -- the overview has no row count, which costs a full index scan. */
+function captured(match: MatchSummary): number {
+  return match.first_ts != null && match.last_ts != null ? match.last_ts - match.first_ts : -1;
+}
+
 function sortMatches(matches: MatchSummary[], sort: string, tab: MatchState): MatchSummary[] {
   const sorted = [...matches];
   switch (sort) {
     case "move":
       return sorted.sort((a, b) => Math.abs(b.move ?? 0) - Math.abs(a.move ?? 0));
-    case "snapshots":
-      return sorted.sort((a, b) => b.snapshots - a.snapshots);
+    case "span":
+      return sorted.sort((a, b) => captured(b) - captured(a));
     case "spread":
       return sorted.sort((a, b) => widestSpread(b) - widestSpread(a));
     default:

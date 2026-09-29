@@ -2,6 +2,7 @@ import { Sparkline } from "./Sparkline";
 import {
   fmtClock,
   fmtDateTime,
+  fmtDuration,
   fmtEnding,
   fmtPrice,
   fmtRelative,
@@ -84,7 +85,11 @@ export function MatchCard({ match, onOpen }: { match: MatchSummary; onOpen: () =
             {moved ? `${fmtSigned(match.move)} ${shortName(match.players[0])}` : ""}
           </span>
         </div>
-        <span className="card-stats">{match.snapshots.toLocaleString()} snaps</span>
+        <span className="card-stats">
+          {match.first_ts != null && match.last_ts != null
+            ? `${fmtDuration(match.last_ts - match.first_ts)} captured`
+            : "no book yet"}
+        </span>
       </div>
     </button>
   );

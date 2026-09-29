@@ -135,9 +135,18 @@ CROSS JOIN books b
     )
 """
 
-_COVERAGE = """
-SELECT condition_id, COUNT(*) AS snapshots, MIN(ts) AS first_ts, MAX(ts) AS last_ts
-FROM books GROUP BY condition_id
+# When each match's capture began and last wrote, as two seeks per match on
+# books_by_market. Deliberately not `COUNT(*) ... GROUP BY condition_id`: the
+# count is a range scan per match, so summed over the list it reads the whole
+# index -- about 1.4 GB at 7.7 M rows, tens of seconds on a cold page cache, and
+# the overview is refetched on every tick. MIN and MAX stay in separate
+# subqueries because SQLite only turns a lone MIN or MAX into a single seek.
+# The snapshot count is per match in match_detail, where it costs one range.
+_SPAN = """
+SELECT m.condition_id,
+       (SELECT MIN(b.ts) FROM books b WHERE b.condition_id = m.condition_id) AS first_ts,
+       (SELECT MAX(b.ts) FROM books b WHERE b.condition_id = m.condition_id) AS last_ts
+FROM markets m
 """
 
 # The tail of one player's mid, for a card sparkline. Run per match: a backward
@@ -185,11 +194,11 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
     for row in conn.execute(_LATEST_BOOKS):
         latest.setdefault(row["condition_id"], {})[row["outcome_index"]] = row
 
-    coverage = {r["condition_id"]: r for r in conn.execute(_COVERAGE)}
+    span = {r["condition_id"]: r for r in conn.execute(_SPAN) if r["last_ts"] is not None}
     points = _latest_points(conn)
 
     sparks: dict[str, list[float | None]] = {}
-    for cid in coverage:
+    for cid in span:
         rows = conn.execute(_SPARK, (cid, spark_points)).fetchall()
         sparks[cid] = [r["mid"] for r in reversed(rows)]
 
@@ -197,7 +206,7 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
     for market in conn.execute("SELECT * FROM markets"):
         cid = market["condition_id"]
         books = latest.get(cid, {})
-        cover = coverage.get(cid)
+        cover = span.get(cid)
         prices = [_price_summary(books.get(i)) for i in (0, 1)]
         spark = sparks.get(cid, [])
 
@@ -220,7 +229,6 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
                 "last_seen": market["last_seen"],
                 "prices": prices,
                 "last_trade": _oriented_last_trade(books),
-                "snapshots": cover["snapshots"] if cover else 0,
                 "first_ts": cover["first_ts"] if cover else None,
                 "last_ts": cover["last_ts"] if cover else None,
                 "spark": spark,

@@ -44,7 +44,6 @@ export interface MatchSummary {
   last_seen: number | null;
   prices: [PriceSummary | null, PriceSummary | null];
   last_trade: LastTrade | null;
-  snapshots: number;
   first_ts: number | null;
   last_ts: number | null;
   spark: (number | null)[];
@@ -188,5 +187,4 @@ export interface MatchSeries {
 
 export interface Pulse {
   last_ts: number | null;
-  rows: number;
 }

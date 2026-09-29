@@ -124,7 +124,7 @@ export function Filters({
         <select value={value.sort} onChange={(e) => onChange({ ...value, sort: e.target.value })}>
           <option value="natural">Start time</option>
           <option value="move">Biggest move</option>
-          <option value="snapshots">Most data</option>
+          <option value="span">Longest capture</option>
           <option value="spread">Widest spread</option>
         </select>
       </label>

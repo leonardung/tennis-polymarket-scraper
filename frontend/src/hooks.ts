@@ -5,7 +5,7 @@ const POLL_MS = 5000;
 
 /** A counter that ticks whenever the capture writes something new.
  *
- * /api/pulse is a two-column read; the heavy endpoints are only refetched when
+ * /api/pulse is a one-seek read; the heavy endpoints are only refetched when
  * it moves. That keeps an idle dashboard from re-rendering every five seconds,
  * which matters here because every refetch rebuilds a chart's whole grid -- see
  * TimeSeriesChart's data effect for what it costs to hold a zoom across one.
@@ -21,7 +21,7 @@ export function useDataVersion(): number {
     const poll = async () => {
       try {
         const pulse = await fetchPulse();
-        const key = `${pulse.last_ts}:${pulse.rows}`;
+        const key = String(pulse.last_ts);
         if (!cancelled && previous.current !== key) {
           previous.current = key;
           setVersion((n) => n + 1);
