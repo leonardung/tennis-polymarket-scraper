@@ -65,12 +65,15 @@ export function Filters({
   value,
   onChange,
   summary,
+  naturalLabel,
 }: {
   tours: string[];
   tournaments: string[];
   value: FilterState;
   onChange: (next: FilterState) => void;
   summary: string;
+  /** What the default order is on this tab: start time, or last capture on Past. */
+  naturalLabel: string;
 }) {
   return (
     <div className="filters" role="search">
@@ -122,7 +125,7 @@ export function Filters({
       <label className="field">
         <span className="field-label">Sort</span>
         <select value={value.sort} onChange={(e) => onChange({ ...value, sort: e.target.value })}>
-          <option value="natural">Start time</option>
+          <option value="natural">{naturalLabel}</option>
           <option value="move">Biggest move</option>
           <option value="span">Longest capture</option>
           <option value="spread">Widest spread</option>

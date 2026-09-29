@@ -44,7 +44,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, MatchStats, MatchOdds,
                            TimeSeriesChart, OrderBook, Sparkline, TableView
-tests/test_offline.py      691 assertions, no network, plain `python` script
+tests/test_offline.py      692 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -380,8 +380,10 @@ of the dashboard slow until 2026-09-29. The snapshot count lives only in
 
 **Past matches are paged.** They are most of a season's list and grow without
 bound, so `overview()` counts them but builds no card for them; `past()` filters
-on `markets` alone, orders newest-first by `start_time` (ties by id, so pages
-are stable), and builds cards only for the requested page. The other sorts
+on `markets` alone, orders by **last capture** (`MAX(ts)` per match, one seek
+each; ties by id, so pages are stable) -- the time a finished card displays --
+and builds cards only for the requested page. Not by `start_time`: for a finished
+match Polymarket's slot is often wrong (a cancelled match can keep a future one). The other sorts
 (`move`, `span`, `spread`) rank on card fields, so they build every filtered card
 first — still seeks. `_sort_key` mirrors `sortMatches()` in `App.tsx`, which
 still sorts live/upcoming client-side; change both together.

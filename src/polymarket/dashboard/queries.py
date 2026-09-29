@@ -129,6 +129,11 @@ SELECT (SELECT MIN(ts) FROM books WHERE condition_id = :cid) AS first_ts,
        (SELECT MAX(ts) FROM books WHERE condition_id = :cid) AS last_ts
 """
 
+# When a match's book was last written: what a finished card shows, and what the
+# Past tab orders by. `start_time` is Polymarket's slot, which for a finished
+# match is often wrong -- a cancelled match can keep a slot in the future.
+_LAST_CAPTURE = "SELECT MAX(ts) FROM books WHERE condition_id = ?"
+
 # The tail of one player's mid, for a card sparkline.
 _SPARK = """
 SELECT mid FROM books
@@ -260,9 +265,10 @@ def past(
 
     The filters are the card list's own (tour, tournament, a case-insensitive
     substring of the question or either player) and run on `markets` alone. The
-    default order -- newest first -- needs nothing else, so only the page's cards
-    are built. The other orders rank on prices or capture span, which means
-    building every filtered card first; that is still seeks, not scans.
+    default order -- most recently captured first, the time the card shows --
+    costs one seek per filtered match, and only the page's cards are built. The
+    other orders rank on prices or capture span, which means building every
+    filtered card first; that is still seeks, not scans.
     """
     now = time.time()
     needle = search.strip().lower()
@@ -284,9 +290,11 @@ def past(
                 continue
         rows.append(market)
 
-    # Newest first, ties by id, so a page boundary never lands between equals
-    # differently on the next request; the other orders are stable on top of it.
-    rows.sort(key=lambda m: (_epoch(m["start_time"]) or 0.0, m["condition_id"]), reverse=True)
+    # Last captured first, ties by id, so a page boundary never lands between
+    # equals differently on the next request; the other orders are stable on top
+    # of it. A match with no book at all sorts last.
+    last = {m["condition_id"]: conn.execute(_LAST_CAPTURE, (m["condition_id"],)).fetchone()[0] for m in rows}
+    rows.sort(key=lambda m: (last[m["condition_id"]] or 0.0, m["condition_id"]), reverse=True)
     if sort == "natural":
         cards = [_card(conn, m, "past", points, spark_points) for m in rows[offset : offset + limit]]
     else:

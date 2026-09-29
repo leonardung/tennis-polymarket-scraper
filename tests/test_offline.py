@@ -2009,7 +2009,7 @@ def test_dashboard_series() -> None:
         check("overview carries the capture span",
               card["first_ts"] == detail["first_ts"] and card["last_ts"] == detail["last_ts"])
         check("overview does not count snapshots", "snapshots" not in card)
-        for name in ("_SPAN", "_LATEST_BOOK", "_SPARK", "_LATEST_POINTS"):
+        for name in ("_SPAN", "_LATEST_BOOK", "_SPARK", "_LATEST_POINTS", "_LAST_CAPTURE"):
             sql = getattr(queries, name)
             args = {"cid": ""} if ":cid" in sql else ("",) * sql.count("?")
             plan = [r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql, args)]
@@ -2017,7 +2017,9 @@ def test_dashboard_series() -> None:
                   not any(p.startswith("SCAN") and p != "SCAN CONSTANT ROW" for p in plan))
 
         # Finished matches leave the overview's cards and are paged by past().
-        # Four copies of the market, marked ended at staggered slots.
+        # Four copies of the market, marked ended at staggered slots -- and
+        # captured last in the opposite order, which is the order the tab uses:
+        # a finished match's slot is Polymarket's and often wrong.
         columns = [r[1] for r in conn.execute("PRAGMA table_info(markets)")]
         row = dict(conn.execute("SELECT * FROM markets").fetchone())
         with sqlite3.connect(path) as raw:
@@ -2026,18 +2028,25 @@ def test_dashboard_series() -> None:
                             question=f"Past match {i}", start_time=f"2026-01-0{i + 1}T12:00:00Z")
                 raw.execute(f"INSERT INTO markets ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
                             [copy[c] for c in columns])
+        with Store(path) as store:
+            for i in range(4):
+                store.insert_snapshots(base + 1000 - 100 * i, [
+                    (parse_book(f"past-token-{i}", BOOK), f"0xpast{i}", 0, market.outcomes[0]),
+                ])
         view = queries.overview(conn)
         check("overview counts past matches", view["counts"]["past"] == 4)
         check("but carries no past cards", all(m["state"] != "past" for m in view["matches"]))
         page = queries.past(conn, offset=0, limit=3)
         check("past pages report the filtered total", page["total"] == 4 and len(page["matches"]) == 3)
-        check("past is newest first", [m["condition_id"] for m in page["matches"]] == ["0xpast3", "0xpast2", "0xpast1"])
-        check("the next page holds the rest", [m["condition_id"] for m in queries.past(conn, offset=3, limit=3)["matches"]] == ["0xpast0"])
+        check("past is last captured first, not by slot",
+              [m["condition_id"] for m in page["matches"]] == ["0xpast0", "0xpast1", "0xpast2"])
+        check("the next page holds the rest", [m["condition_id"] for m in queries.past(conn, offset=3, limit=3)["matches"]] == ["0xpast3"])
         check("past search is case-insensitive", queries.past(conn, search="MATCH 2")["total"] == 1)
         check("past filters by tour", queries.past(conn, tour="wta")["total"] == 0)
         check("every sort pages the same set", all(queries.past(conn, sort=s)["total"] == 4 for s in queries.SORTS))
         with sqlite3.connect(path) as raw:
             raw.execute("DELETE FROM markets WHERE condition_id LIKE '0xpast%'")
+            raw.execute("DELETE FROM books WHERE condition_id LIKE '0xpast%'")
         # No score recorded yet: the card has no points to show rather than a
         # stale or invented pair.
         check("no points without a score event", view["matches"][0]["game"] is None)

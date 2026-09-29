@@ -73,8 +73,8 @@ export function App() {
     [overview.data, tab],
   );
   const visible = useMemo(
-    () => (isPast ? (past.data?.matches ?? []) : sortMatches(filterMatches(inTab, filters), filters.sort, tab)),
-    [isPast, past.data, inTab, filters, tab],
+    () => (isPast ? (past.data?.matches ?? []) : sortMatches(filterMatches(inTab, filters), filters.sort)),
+    [isPast, past.data, inTab, filters],
   );
 
   const tabTotal = isPast ? counts.past : inTab.length;
@@ -105,6 +105,7 @@ export function App() {
         tournaments={overview.data?.tournaments ?? []}
         value={filters}
         onChange={changeFilters}
+        naturalLabel={isPast ? "Last captured" : "Start time"}
         summary={summary}
       />
       <Tabs
@@ -181,7 +182,8 @@ function captured(match: MatchSummary): number {
   return match.first_ts != null && match.last_ts != null ? match.last_ts - match.first_ts : -1;
 }
 
-function sortMatches(matches: MatchSummary[], sort: string, tab: MatchState): MatchSummary[] {
+/** Live and upcoming only; Past is sorted by the server (`_sort_key` in queries.py). */
+function sortMatches(matches: MatchSummary[], sort: string): MatchSummary[] {
   const sorted = [...matches];
   switch (sort) {
     case "move":
@@ -191,11 +193,7 @@ function sortMatches(matches: MatchSummary[], sort: string, tab: MatchState): Ma
     case "spread":
       return sorted.sort((a, b) => widestSpread(b) - widestSpread(a));
     default:
-      // Finished matches read best newest-first; everything else soonest-first.
-      return sorted.sort((a, b) =>
-        tab === "past"
-          ? (b.start_epoch ?? 0) - (a.start_epoch ?? 0)
-          : (a.start_epoch ?? 0) - (b.start_epoch ?? 0),
-      );
+      // Soonest first.
+      return sorted.sort((a, b) => (a.start_epoch ?? 0) - (b.start_epoch ?? 0));
   }
 }
