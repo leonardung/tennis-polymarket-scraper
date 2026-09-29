@@ -50,6 +50,12 @@ export interface MatchSummary {
   move: number | null;
 }
 
+export interface Tournament {
+  name: string;
+  /** Epoch seconds of the earliest scheduled match in the draw. */
+  start: number | null;
+}
+
 export interface Overview {
   generated_at: number;
   last_tick: number | null;
@@ -57,9 +63,10 @@ export interface Overview {
   /** Every match, unfiltered; the tab badges use /api/counts under the filters. */
   counts: Record<MatchState, number>;
   tours: string[];
-  tournaments: string[];
-  /** The same tournament names split by tour; a combined event is under both. */
-  tournaments_by_tour: Record<string, string[]>;
+  /** Newest first, each dated by its earliest scheduled match. */
+  tournaments: Tournament[];
+  /** The same list split by tour; a combined event is under both. */
+  tournaments_by_tour: Record<string, Tournament[]>;
   /** Live and upcoming only -- finished matches come a page at a time from /api/past. */
   matches: MatchSummary[];
 }

@@ -27,6 +27,15 @@ export function fmtClock(ts: number | null | undefined, withSeconds = false): st
   return new Date(ts * 1000).toLocaleTimeString([], options);
 }
 
+/** A calendar day, "Sep 30"; the year only when it is not this one. */
+export function fmtDay(ts: number | null | undefined): string {
+  if (ts == null) return "—";
+  const date = new Date(ts * 1000);
+  const options: Intl.DateTimeFormatOptions = { month: "short", day: "numeric" };
+  if (date.getFullYear() !== new Date().getFullYear()) options.year = "numeric";
+  return date.toLocaleDateString([], options);
+}
+
 export function fmtDateTime(ts: number | null | undefined): string {
   if (ts == null) return "—";
   const date = new Date(ts * 1000);

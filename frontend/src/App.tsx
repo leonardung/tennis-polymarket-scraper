@@ -152,7 +152,9 @@ export function App() {
   const changeFilters = (next: FilterState) => {
     // A tournament the newly picked tour does not hold would filter to nothing.
     const held = next.tour ? (overview.data?.tournaments_by_tour[next.tour] ?? []) : null;
-    if (next.tournament && held && !held.includes(next.tournament)) next = { ...next, tournament: "" };
+    if (next.tournament && held && !held.some((t) => t.name === next.tournament)) {
+      next = { ...next, tournament: "" };
+    }
     goList({ filters: next, page: 0 }, true);
   };
 

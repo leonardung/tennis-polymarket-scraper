@@ -44,7 +44,7 @@ frontend/                  React 19 + TS + Vite sources for that bundle
   src/theme.ts             light/dark; reads CSS tokens back out for the canvas charts
   src/components/          Chrome, MatchCard, MatchDetail, MatchStats, MatchOdds,
                            TimeSeriesChart, OrderBook, Sparkline, TableView
-tests/test_offline.py      697 assertions, no network, plain `python` script
+tests/test_offline.py      700 assertions, no network, plain `python` script
 flashscore-scraper/        standalone Flashscore client (NOT imported by src/)
 Dockerfile,                two-stage image; capture + dashboard + cloudflared
 docker-compose.yml
@@ -357,7 +357,7 @@ deletions strand, then brings `markets` back in step. Reachable as
 
 | Endpoint | Returns |
 |---|---|
-| `GET /api/overview` | tab counts, tour/tournament filter lists for **every** match; cards (latest prices, sparkline, capture span `first_ts`/`last_ts`, no row count) for **live and upcoming only**; `tournaments_by_tour` narrows the tournament filter to the picked tour (a combined event is under both) |
+| `GET /api/overview` | tab counts, tour/tournament filter lists for **every** match; cards (latest prices, sparkline, capture span `first_ts`/`last_ts`, no row count) for **live and upcoming only**; `tournaments` / `tournaments_by_tour` are `{name, start}` newest first, `start` being the draw's earliest scheduled match (`_tournaments`); the by-tour list narrows the tournament filter to the picked tour (a combined event is under both) |
 | `GET /api/counts?tour=&tournament=&search=` | `{live, upcoming, past}` under the list's filters, for the tab badges; reads `markets` only |
 | `GET /api/past?offset=&limit=&tour=&tournament=&search=&sort=` | one page of finished-match cards, filtered and sorted server-side: `{total, offset, limit, matches}`. `limit` ≤ `PAGE_LIMIT`=200; the UI asks for 48 |
 | `GET /api/pulse` | `{last_ts}` — the cheap poll target, one seek on `books_by_ts` |

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
-import { fmtRelative } from "../format";
-import type { MatchState, Overview } from "../types";
+import { fmtDay, fmtRelative } from "../format";
+import type { MatchState, Overview, Tournament } from "../types";
 
 export function TopBar({
   overview,
@@ -69,7 +69,7 @@ export function Filters({
   naturalLabel,
 }: {
   tours: string[];
-  tournaments: string[];
+  tournaments: Tournament[];
   value: FilterState;
   onChange: (next: FilterState) => void;
   /** Back to no filters and the default order. */
@@ -106,9 +106,9 @@ export function Filters({
           onChange={(e) => onChange({ ...value, tournament: e.target.value })}
         >
           <option value="">All</option>
-          {tournaments.map((name) => (
+          {tournaments.map(({ name, start }) => (
             <option key={name} value={name}>
-              {name}
+              {start != null ? `${fmtDay(start)} · ${name}` : name}
             </option>
           ))}
         </select>

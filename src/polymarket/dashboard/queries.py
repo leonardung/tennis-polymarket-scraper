@@ -232,18 +232,39 @@ def overview(conn: sqlite3.Connection, spark_points: int = 100) -> dict[str, Any
         "capturing": last_tick is not None and (now - last_tick) < STALE_AFTER,
         "counts": counts,
         # Tournament names are shared across the two draws of a combined event,
-        # so the two filters are independent: picking a tour does not shorten
-        # this list, and picking a name does not decide which draw.
+        # so the two filters are independent: picking a name does not decide
+        # which draw.
         "tours": sorted({m["tour"] for m, _ in markets if m["tour"]}),
-        "tournaments": sorted({m["tournament"] for m, _ in markets if m["tournament"]}),
-        # The same names split by draw, so picking a tour narrows the tournament
-        # list to that tour's events. A combined event appears under both.
+        "tournaments": _tournaments(m for m, _ in markets),
+        # The same list split by draw, so picking a tour narrows the tournament
+        # list to that tour's events. A combined event appears under both, each
+        # dated by its own draw.
         "tournaments_by_tour": {
-            tour: sorted({m["tournament"] for m, _ in markets if m["tour"] == tour and m["tournament"]})
+            tour: _tournaments(m for m, _ in markets if m["tour"] == tour)
             for tour in sorted({m["tour"] for m, _ in markets if m["tour"]})
         },
         "matches": matches,
     }
+
+
+def _tournaments(markets: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+    """Tournament names with a start date, newest first -- this week's events on top.
+
+    The date is the earliest scheduled slot among the tournament's matches. A slot
+    can be wrong for one finished match (a cancelled match keeps a future one),
+    but the earliest across a draw is a stable reading of when the event began.
+    """
+    start: dict[str, float | None] = {}
+    for market in markets:
+        name = market["tournament"]
+        if not name:
+            continue
+        slot = _epoch(market["start_time"])
+        known = start.get(name)
+        start[name] = slot if known is None else (known if slot is None else min(known, slot))
+    ordered = sorted(start.items(), key=lambda item: item[0])
+    ordered.sort(key=lambda item: item[1] if item[1] is not None else float("-inf"), reverse=True)
+    return [{"name": name, "start": first} for name, first in ordered]
 
 
 def _matcher(tour: str, tournament: str, search: str):

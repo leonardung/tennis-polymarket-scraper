@@ -2052,6 +2052,18 @@ def test_dashboard_series() -> None:
               queries.counts(conn, tour="atp")["past"] == queries.past(conn, tour="atp")["total"])
         check("tournaments are listed per tour",
               view["tournaments_by_tour"] == {"atp": view["tournaments"]})
+        check("a tournament is dated by its earliest match",
+              view["tournaments"][0]["start"] == queries._epoch("2026-01-01T12:00:00Z"))
+        from polymarket.dashboard.queries import _tournaments
+        dated = _tournaments([
+            {"tournament": "Old", "start_time": "2026-08-01T10:00:00Z"},
+            {"tournament": "New", "start_time": "2026-09-28T10:00:00Z"},
+            {"tournament": "New", "start_time": "2026-09-27T10:00:00Z"},
+            {"tournament": "Undated", "start_time": None},
+        ])
+        check("tournaments run newest first, undated last",
+              [t["name"] for t in dated] == ["New", "Old", "Undated"])
+        check("and start with their first match", dated[0]["start"] == queries._epoch("2026-09-27T10:00:00Z"))
         with sqlite3.connect(path) as raw:
             raw.execute("DELETE FROM markets WHERE condition_id LIKE '0xpast%'")
             raw.execute("DELETE FROM books WHERE condition_id LIKE '0xpast%'")
